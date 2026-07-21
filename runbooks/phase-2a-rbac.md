@@ -135,6 +135,39 @@ Full captured output: `docs/evidence/phase-2a-rbac/attack-output.txt`.
 
 ---
 
+## Note: layering interaction with Phase 2c (NetworkPolicy)
+
+The HTTP 403 capture above was taken **before Phase 2c existed**. Phase 2c later
+added a `default-deny` egress NetworkPolicy in `demo` with only a DNS carve-out
+(kube-dns:53); it does **not** allow egress to the API server on 443. As a
+result, if you replay the token→API attack **today** the attacker pod cannot even
+reach the API server: the curl times out (`HTTP_STATUS:000`, ~5s) at the
+**network layer, before RBAC ever returns its 403**. The exact 403 in
+`attack-output.txt` is therefore not reproducible while Phase 2c is applied.
+
+To reproduce the RBAC 403 specifically, either:
+
+- replay this demo **before** applying Phase 2c, or
+- temporarily add a scoped API-server egress allow (443 to the API server) so the
+  request reaches the authorization layer.
+
+This is **defense-in-depth working as intended**, not a flaw: the secret-read
+path is now blocked by **two independent layers** — RBAC authorization (403) and
+NetworkPolicy egress default-deny (no route to the API server at all). See
+`docs/evidence/phase-2a-rbac/REPLAY-NOTE.md` for the replay caveat.
+
+Note the RBAC boundary itself remains continuously verifiable, because
+`kubectl auth can-i` is evaluated at the API server via your kubeconfig and does
+**not** traverse the attacker pod's network:
+
+```bash
+kubectl auth can-i list secrets -n demo \
+  --as=system:serviceaccount:demo:developer-sa
+# -> no   (still works today, even with Phase 2c applied)
+```
+
+---
+
 ## 4. Teardown
 
 ```bash
