@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: developer-sa
+  namespace: demo
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    role: developer
+# automountServiceAccountToken left at the default (true): this identity models
+# a real developer/CI credential that DOES mount a token, which the Phase 2a
+# attack demo uses to prove the least-privilege Role blocks reading secrets.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+  namespace: demo
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+# Least privilege: read-only visibility into the workloads a developer needs to
+# inspect. No wildcards, no secrets, no write verbs (create/update/patch/delete).
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-binding
+  namespace: demo
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: developer
+subjects:
+  - kind: ServiceAccount
+    name: developer-sa
+    namespace: demo
