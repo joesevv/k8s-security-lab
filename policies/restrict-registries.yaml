@@ -1,0 +1,39 @@
+# Phase 2b — allow images only from the trusted set: Docker Hub
+# nginxinc/* (the lab's nginx) and curlimages/* (the lab's curl test image).
+# Uses Kyverno's CEL image() library, which normalizes registry-less literals
+# like 'nginxinc/nginx-unprivileged:1.29.8-alpine' to registry
+# 'index.docker.io' (verified on-cluster — NOT 'docker.io').
+# Scoped to the demo namespace only — deliberate lab choice, see runbook.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: restrict-registries
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [demo]
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: allContainers
+      expression: >-
+        object.spec.containers
+        + object.spec.?initContainers.orValue([])
+        + object.spec.?ephemeralContainers.orValue([])
+  validations:
+    - expression: >-
+        variables.allContainers.all(c,
+        image(c.image).registry() == 'index.docker.io'
+        && (image(c.image).repository().startsWith('nginxinc/')
+        || image(c.image).repository().startsWith('curlimages/')))
+      message: >-
+        Image registry not allowed: every container (including init and
+        ephemeral containers) must use an image from Docker Hub nginxinc/* or
+        curlimages/*.

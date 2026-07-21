@@ -1,0 +1,34 @@
+# Phase 2b — deny images tagged :latest or with no tag at all.
+# Kyverno's CEL image() library normalizes a bare image (no tag) to tag
+# 'latest' (verified on-cluster), so one check catches both cases.
+# Scoped to the demo namespace only — deliberate lab choice, see runbook.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: disallow-latest-and-bare-tag
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [demo]
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: allContainers
+      expression: >-
+        object.spec.containers
+        + object.spec.?initContainers.orValue([])
+        + object.spec.?ephemeralContainers.orValue([])
+  validations:
+    - expression: >-
+        variables.allContainers.all(c, image(c.image).tag() != 'latest')
+      message: >-
+        Images must be pinned to an immutable tag: ':latest' and bare (untagged)
+        images are not allowed for any container (including init and ephemeral
+        containers).
