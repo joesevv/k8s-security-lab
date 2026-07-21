@@ -1,0 +1,32 @@
+# The CONTROL: identical to the attacker pod in every way EXCEPT the
+# access=nginx label, which matches the client-egress (30-...) and
+# nginx-ingress (20-...) NetworkPolicies. Same image, same command, same
+# securityContext — the label is the only difference, so any behavior
+# difference between the two pods is attributable to the label-based
+# NetworkPolicies alone.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: authorized
+  namespace: demo
+  labels:
+    app: authorized
+    role: netpol-demo
+    access: "nginx"
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: client
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

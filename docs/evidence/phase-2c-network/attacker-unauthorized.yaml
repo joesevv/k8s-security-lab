@@ -1,0 +1,31 @@
+# The ATTACKER: a curl pod in demo with NO access=nginx label. It is
+# fully Kyverno-compliant (pinned curlimages tag, not privileged, drops
+# ALL caps, restricted securityContext) so it passes admission — the
+# point is that it is blocked at the NETWORK layer, not at admission.
+# Under default-deny, with no access=nginx label, no egress-to-nginx or
+# nginx-ingress rule matches it; only the DNS carve-out applies.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unauth
+  namespace: demo
+  labels:
+    app: unauth
+    role: netpol-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: client
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

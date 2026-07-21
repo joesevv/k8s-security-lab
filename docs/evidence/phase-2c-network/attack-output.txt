@@ -1,0 +1,115 @@
+Phase 2c — NetworkPolicy attack demo (captured 2026-07-21)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, CNI kindnet
+(empirically confirmed to enforce NetworkPolicy on this cluster).
+Policies: 4x networking.k8s.io/v1 NetworkPolicy in the demo namespace
+(network/): default-deny on Ingress+Egress for all pods, a DNS carve-out to
+the kube-system CoreDNS pods on 53/UDP+TCP, and a label-based allow pair —
+nginx accepts ingress only from pods labeled access=nginx on TCP 8080, and
+only those labeled pods get egress to nginx. The two test pods below are
+IDENTICAL (image curlimages/curl:8.11.1, same command, same restricted
+securityContext — both pass the four Kyverno Deny policies at admission)
+except that `authorized` carries the label access=nginx and `unauth` does
+not, so the label is the sole discriminator.
+
+============================================================
+SAFETY SEQUENCE — 00-default-deny applied ALONE first; nginx pods
+unaffected (NetworkPolicy affects connections, not pod lifecycle)
+$ kubectl apply -f network/00-default-deny.yaml && kubectl get pods -n demo
+============================================================
+networkpolicy.networking.k8s.io/default-deny created
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-6d4cf656c9-8fkgn   1/1     Running   0          17m
+nginx-6d4cf656c9-t79g6   1/1     Running   0          17m
+
+Then the allow policies:
+$ kubectl apply -f network/
+networkpolicy.networking.k8s.io/default-deny unchanged
+networkpolicy.networking.k8s.io/allow-dns created
+networkpolicy.networking.k8s.io/allow-nginx-ingress-from-client created
+networkpolicy.networking.k8s.io/allow-client-egress-to-nginx created
+
+============================================================
+THE POLICIES
+$ kubectl get networkpolicy -n demo
+============================================================
+NAME                              POD-SELECTOR   AGE
+allow-client-egress-to-nginx      access=nginx   4m46s
+allow-dns                         <none>         4m46s
+allow-nginx-ingress-from-client   app=nginx      4m46s
+default-deny                      <none>         4m53s
+
+============================================================
+TEST PODS — both admitted by Kyverno (compliant) and Running
+$ kubectl apply -f attacker-unauthorized.yaml -f client-authorized.yaml
+$ kubectl get pods -n demo
+============================================================
+pod/unauth created
+pod/authorized created
+NAME                     READY   STATUS    RESTARTS   AGE
+authorized               1/1     Running   0          4m19s
+nginx-6d4cf656c9-8fkgn   1/1     Running   0          22m
+nginx-6d4cf656c9-t79g6   1/1     Running   0          22m
+unauth                   1/1     Running   0          4m19s
+
+============================================================
+DNS CARVE-OUT WORKS — authorized pod resolves the nginx service name
+$ kubectl exec -n demo authorized -- nslookup nginx.demo.svc.cluster.local
+============================================================
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+Name:	nginx.demo.svc.cluster.local
+Address: 10.96.196.39
+
+
+
+============================================================
+ATTACK — unauthorized pod (no access=nginx label) curls nginx: BLOCKED
+Connection is dropped by NetworkPolicy; curl -m 5 turns the block into a
+5s timeout, HTTP:000 (curl exit 28 = timeout).
+$ kubectl exec -n demo unauth -- curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://nginx.demo.svc.cluster.local/
+============================================================
+HTTP:000 time=5.002630
+command terminated with exit code 28
+(kubectl exit code: 28)
+
+============================================================
+RIGOR — the unauthorized pod CAN still resolve DNS, so its failure
+above is the NetworkPolicy denying the TCP connection, not a DNS failure
+$ kubectl exec -n demo unauth -- nslookup nginx.demo.svc.cluster.local
+============================================================
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+
+Name:	nginx.demo.svc.cluster.local
+Address: 10.96.196.39
+
+
+============================================================
+CONTROL — authorized pod (access=nginx label), SAME command, SAME DNS
+name: ALLOWED, HTTP 200 in milliseconds
+$ kubectl exec -n demo authorized -- curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://nginx.demo.svc.cluster.local/
+============================================================
+HTTP:200 time=0.002270
+command terminated with exit code 23
+(kubectl exit code: 23)
+
+Note: when run through `kubectl exec` from the Windows client, curl here
+reports exit code 23 (write error flushing the final -w line through the
+closing exec stream) even though the request itself succeeded with HTTP:200.
+Running the identical command inside the pod's own shell exits 0:
+$ kubectl exec -n demo authorized -- sh -c 'curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://nginx.demo.svc.cluster.local/; echo shell-rc=$?'
+HTTP:200 time=0.002290
+shell-rc=0
+
+============================================================
+TEARDOWN — test pods removed; only nginx remains
+$ kubectl delete pod unauth authorized -n demo
+$ kubectl get pods -n demo
+============================================================
+pod "unauth" deleted from demo namespace
+pod "authorized" deleted from demo namespace
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-6d4cf656c9-8fkgn   1/1     Running   0          23m
+nginx-6d4cf656c9-t79g6   1/1     Running   0          23m
