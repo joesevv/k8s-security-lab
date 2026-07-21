@@ -56,7 +56,7 @@ tradeoff is deliberate here and kept narrow for the lab.
 helm repo add kyverno https://kyverno.github.io/kyverno/
 helm repo update
 helm search repo kyverno -l | grep -E "1\.18"
-# -> kyverno/kyverno 3.8.2  v1.18.2   (chart minor = app minor + 10)
+# -> kyverno/kyverno 3.8.2  v1.18.2   (chart 3.8.x => app 1.18.x, i.e. app minor = chart minor + 10)
 helm install kyverno kyverno/kyverno --namespace kyverno --create-namespace --version 3.8.2
 for d in $(kubectl -n kyverno get deploy -o name); do kubectl -n kyverno rollout status "$d" --timeout=180s; done
 ```
