@@ -1,0 +1,26 @@
+# Violates ONLY disallow-latest-and-bare-tag: image tagged :latest.
+# Otherwise compliant — allowed registry (nginxinc/*), not privileged,
+# drops ALL capabilities.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-latest-tag
+  namespace: demo
+  labels:
+    app: attack-latest-tag
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: nginxinc/nginx-unprivileged:latest
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

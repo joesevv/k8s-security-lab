@@ -15,7 +15,7 @@ A local kind cluster (1 control-plane + 2 workers) running on Docker Desktop wit
 | Layer | Tool | Attack it blocks | Status |
 | --- | --- | --- | --- |
 | RBAC hardening | Kubernetes RBAC | Privilege escalation via over-broad service account permissions | done |
-| Admission control | Kyverno | Deploying privileged / non-compliant workloads | planned |
+| Admission control | Kyverno | Deploying privileged / non-compliant workloads | done |
 | Network policies | Kubernetes NetworkPolicy | Lateral movement between pods | planned |
 | Secrets management | sealed-secrets | Plaintext secrets committed to Git | planned |
 | Supply chain | GitHub Actions + Trivy + SBOM + cosign | Shipping vulnerable or unsigned images | planned |
@@ -31,6 +31,7 @@ This section will grow one entry per demonstrated attack, each pairing the attac
 | Control | Attack | Evidence |
 | --- | --- | --- |
 | Phase 2a RBAC — least-privilege `developer` Role (get/list/watch pods/services/deployments only) + no-token `nginx-sa` | Token-bearing pod (`developer-sa`) uses its mounted ServiceAccount token to read Secrets via the API | HTTP 403 Forbidden — [`docs/evidence/phase-2a-rbac/`](docs/evidence/phase-2a-rbac/) (attack-output.txt, can-i-matrix.txt); runbook [`runbooks/phase-2a-rbac.md`](runbooks/phase-2a-rbac.md) |
+| Phase 2b admission — 4 Kyverno CEL `ValidatingPolicy` rules in Enforce (no privileged, no `:latest`/bare tags, must drop ALL caps, registry allow-list) scoped to `demo` | Four pods, each violating exactly one rule (privileged, `:latest` tag, empty `capabilities.drop`, `registry.k8s.io` image), applied to the cluster | All four denied at admission by the Kyverno webhook, each rejection naming its policy; compliant nginx still rolls out — [`docs/evidence/phase-2b-admission/`](docs/evidence/phase-2b-admission/) (attack-output.txt, attack-*.yaml); runbook [`runbooks/phase-2b-admission.md`](runbooks/phase-2b-admission.md) |
 
 ## Repo layout
 

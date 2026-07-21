@@ -1,0 +1,28 @@
+# Violates ONLY restrict-registries: registry.k8s.io is not in the allow
+# list (Docker Hub nginxinc/* and curlimages/* only).
+# Otherwise compliant — pinned tag (3.10, not latest), not privileged,
+# drops ALL capabilities.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-bad-registry
+  namespace: demo
+  labels:
+    app: attack-bad-registry
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

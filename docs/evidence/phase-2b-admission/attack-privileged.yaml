@@ -1,0 +1,30 @@
+# Violates ONLY disallow-privileged-containers: privileged: true.
+# Otherwise compliant — allowed registry (curlimages/*), pinned tag, drops ALL.
+# NOTE: allowPrivilegeEscalation is deliberately omitted; the API server
+# rejects privileged=true combined with allowPrivilegeEscalation=false, and
+# this manifest must reach the Kyverno webhook to demonstrate the denial.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-privileged
+  namespace: demo
+  labels:
+    app: attack-privileged
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        privileged: true
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

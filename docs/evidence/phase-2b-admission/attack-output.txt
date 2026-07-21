@@ -1,0 +1,70 @@
+Phase 2b — Kyverno admission control attack demo (captured 2026-07-21)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5
+Kyverno: chart kyverno/kyverno 3.8.2, app v1.18.2
+Policies: 4x policies.kyverno.io/v1 ValidatingPolicy, validationActions [Deny],
+scoped to the demo namespace. Each attack manifest violates exactly ONE policy
+and complies with the other three, so each denial cleanly cites its target
+policy.
+
+Note: the demo namespace also carries Pod Security Admission warn labels, so
+two attempts additionally print a non-blocking "Warning: would violate
+PodSecurity" line. The BLOCK in every case is the Kyverno admission webhook
+denial ("Error from server: ... vpol.validate.kyverno.svc-fail denied the
+request"), which is why the pod is never created.
+
+============================================================
+ATTACK A — attack-privileged.yaml (securityContext.privileged: true)
+$ kubectl apply -f attack-privileged.yaml
+============================================================
+Warning: would violate PodSecurity "restricted:latest": privileged (container "attacker" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "attacker" must set securityContext.allowPrivilegeEscalation=false)
+Error from server: error when creating "attack-privileged.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.
+
+============================================================
+ATTACK B — attack-latest-tag.yaml (image nginxinc/nginx-unprivileged:latest)
+$ kubectl apply -f attack-latest-tag.yaml
+============================================================
+Error from server: error when creating "attack-latest-tag.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-latest-and-bare-tag failed: Images must be pinned to an immutable tag: ':latest' and bare (untagged) images are not allowed for any container (including init and ephemeral containers).
+
+============================================================
+ATTACK C — attack-no-drop-caps.yaml (capabilities.drop: [])
+$ kubectl apply -f attack-no-drop-caps.yaml
+============================================================
+Warning: would violate PodSecurity "restricted:latest": unrestricted capabilities (container "attacker" must set securityContext.capabilities.drop=["ALL"])
+Error from server: error when creating "attack-no-drop-caps.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL".
+
+============================================================
+ATTACK D — attack-bad-registry.yaml (image registry.k8s.io/pause:3.10)
+$ kubectl apply -f attack-bad-registry.yaml
+============================================================
+Error from server: error when creating "attack-bad-registry.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*.
+
+============================================================
+POST-ATTACK STATE — none of the attacker pods exist
+$ kubectl get pods -n demo
+============================================================
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-6d4cf656c9-8fkgn   1/1     Running   0          2m59s
+nginx-6d4cf656c9-t79g6   1/1     Running   0          3m
+
+============================================================
+POSITIVE CONTROL — the compliant nginx admits under Enforce ([Deny])
+Captured during the Audit->Deny flip, immediately after all four policies
+were switched to validationActions [Deny]:
+$ kubectl get validatingpolicy -o custom-columns='NAME:.metadata.name,ACTIONS:.spec.validationActions,READY:.status.conditionStatus.ready'
+$ kubectl rollout restart deploy/nginx -n demo && kubectl rollout status deploy/nginx -n demo --timeout=180s
+============================================================
+NAME                             ACTIONS   READY
+disallow-latest-and-bare-tag     [Deny]    true
+disallow-privileged-containers   [Deny]    true
+require-drop-all-capabilities    [Deny]    true
+restrict-registries              [Deny]    true
+deployment.apps/nginx restarted
+Waiting for deployment "nginx" rollout to finish: 1 out of 2 new replicas have been updated...
+Waiting for deployment "nginx" rollout to finish: 1 old replicas are pending termination...
+deployment "nginx" successfully rolled out
+
+Earlier, under [Audit], the same rollout also succeeded and the per-pod
+Kyverno PolicyReports showed pass=4 fail=0 error=0 for both nginx pods,
+proving the compliant workload passes all four rules (including the registry
+allow-list against the literal image string
+nginxinc/nginx-unprivileged:1.29.8-alpine) before enforcement was enabled.

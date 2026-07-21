@@ -1,0 +1,28 @@
+# Violates ONLY require-drop-all-capabilities: capabilities.drop is an
+# explicit empty list (keeps the container's default capability set).
+# Otherwise compliant — allowed registry (curlimages/*), pinned tag,
+# not privileged.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-no-drop-caps
+  namespace: demo
+  labels:
+    app: attack-no-drop-caps
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: []
