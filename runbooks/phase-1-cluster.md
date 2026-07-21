@@ -18,9 +18,11 @@ v1.35.5.
   (`kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95`):
   this is the v1.35.5 image published for the kind v0.32.0 release, so the pull
   is byte-identical on every host and cannot drift to another build.
-- **nginx image `nginxinc/nginx-unprivileged:1.29.8-alpine`**: pinned to an exact
-  patch (never `latest` or a bare major). `1.29.8` was the newest 1.29.x tag on
-  Docker Hub at the time; the unprivileged image runs non-root and listens on
+- **nginx image `nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56a…`**:
+  pinned by digest for immutability (the exact image bytes cannot drift). The
+  `1.29.8-alpine` tag is retained alongside the digest for readability and to
+  satisfy the no-`latest`/no-bare-tag policy. `1.29.8` was the newest 1.29.x tag
+  on Docker Hub at the time; the unprivileged image runs non-root and listens on
   8080, which is what the restricted securityContext requires.
 
 ---
@@ -114,21 +116,29 @@ seclab-worker2         Ready    <none>          31s   v1.35.5   172.18.0.3    De
 kubectl apply -f workloads/nginx/
 kubectl rollout status deploy/nginx -n demo --timeout=180s
 ```
-Purpose: create the `demo` namespace, the hardened nginx Deployment (2 replicas),
-and its ClusterIP Service, then wait for the rollout.
+Purpose: create the `demo` namespace, the `nginx-sa` ServiceAccount, the hardened
+nginx Deployment (2 replicas), and its ClusterIP Service, then wait for the
+rollout.
 
-> **Ordering note:** `kubectl apply -f <dir>` processes files alphabetically, so
-> `deployment.yaml` is attempted before `namespace.yaml`. On a first apply into a
-> fresh cluster this fails with `namespaces "demo" not found` (the namespace and
-> service are still created). Simply run `kubectl apply -f workloads/nginx/`
-> again — it is idempotent and the Deployment is created on the second pass. (An
-> alternative is to apply `namespace.yaml` first.)
+> **Ordering note:** `kubectl apply -f <dir>` processes files alphabetically, and
+> the manifests are numbered so that order matches the dependency order:
+> `00-namespace.yaml` → `01-serviceaccount.yaml` → `deployment.yaml` →
+> `service.yaml`. So a single apply into a fresh cluster works in one pass — the
+> `demo` namespace is created before anything that lives in it, and the
+> `nginx-sa` ServiceAccount is created before the Deployment that references it
+> via `serviceAccountName: nginx-sa`. No second apply is needed.
+>
+> `nginx-sa` sets `automountServiceAccountToken: false`, so no API token is
+> projected into the nginx pods (nginx serves static content and needs no
+> Kubernetes API access). The `01-` prefix guarantees the SA exists before the
+> Deployment is admitted.
 
-Observed (second apply):
+Expected on a first apply into a fresh cluster (single pass, in numbered order):
 ```
+namespace/demo created
+serviceaccount/nginx-sa created
 deployment.apps/nginx created
-namespace/demo unchanged
-service/nginx unchanged
+service/nginx created
 
 Waiting for deployment "nginx" rollout to finish: 1 of 2 updated replicas are available...
 deployment "nginx" successfully rolled out
