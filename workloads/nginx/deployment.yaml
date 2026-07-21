@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: demo
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      # Pod-level security context. runAsNonRoot + RuntimeDefault seccomp are
+      # what the future restricted Pod Security / Kyverno policies will demand.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          # nginx-unprivileged listens on 8080 and runs as a non-root user out
+          # of the box. Pinned to an exact patch version (never latest / bare
+          # major) so the image is reproducible and scannable.
+          image: nginxinc/nginx-unprivileged:1.29.8-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          # readOnlyRootFilesystem is on, so the image cannot write its pid file
+          # or proxy cache to the root fs. Give it writable emptyDir volumes.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

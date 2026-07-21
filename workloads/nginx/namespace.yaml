@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    # Warn only for now. Hard enforcement of the restricted profile comes later
+    # via Kyverno; Pod Security admission here just surfaces violations.
+    pod-security.kubernetes.io/warn: restricted

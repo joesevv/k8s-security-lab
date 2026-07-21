@@ -8,7 +8,7 @@ Security is the point of this project, not DevOps. Kubernetes and CI are only th
 
 ## Architecture
 
-A local kind cluster (1 control-plane + 2 workers) running on Docker Desktop with the WSL2 backend, defined entirely as code so the environment is reproducible. Each security layer is added on top of this baseline cluster and exercised with its own attack demo. A diagram will be added later.
+A local kind cluster (1 control-plane + 2 workers) running on Docker Desktop with the WSL2 backend, defined entirely as code so the environment is reproducible. Kubernetes is pinned to v1.35.5 (node image pinned by digest) because the upcoming Kyverno 1.18 admission layer supports Kubernetes 1.33–1.35 only, so the cluster sits at the top of that supported window. Each security layer is added on top of this baseline cluster and exercised with its own attack demo. A diagram will be added later.
 
 ## Security layers
 
@@ -46,4 +46,4 @@ runbooks/            # replayable command logs
 
 ## Status
 
-Project scaffolding, no cluster components deployed yet — 2026-07-21.
+Cluster up — 3 nodes on Kubernetes v1.35.5; hardened nginx target workload (non-root, pinned image, restricted securityContext) running in the `demo` namespace — 2026-07-21.
