@@ -1,0 +1,23 @@
+# kind cluster for k8s-security-lab.
+#
+# Kubernetes is pinned to v1.35.5 on purpose: the next phase installs Kyverno
+# 1.18, which supports Kubernetes 1.33-1.35 only. Staying at the top of that
+# window (1.35) gives the newest supported control plane without breaking
+# Kyverno.
+#
+# The node image is pinned by digest as well as tag. This exact digest is the
+# v1.35.5 image published for the kind v0.32.0 release, so `kind create` pulls a
+# byte-identical node image on every host and cannot drift to a different build.
+#
+# Topology: 1 control-plane + 2 workers. No extraPortMappings and no
+# kubeadmConfigPatches by design — cluster access is via `kubectl port-forward`.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: seclab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+  - role: worker
+    image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+  - role: worker
+    image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95

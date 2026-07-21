@@ -1,0 +1,8 @@
+# Normalize line endings: let Git decide text vs binary, checkout native.
+* text=auto
+
+# Force LF for files that must stay LF regardless of host OS
+# (Kubernetes manifests and shell scripts break with CRLF).
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.sh   text eol=lf
