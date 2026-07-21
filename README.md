@@ -14,7 +14,7 @@ A local kind cluster (1 control-plane + 2 workers) running on Docker Desktop wit
 
 | Layer | Tool | Attack it blocks | Status |
 | --- | --- | --- | --- |
-| RBAC hardening | Kubernetes RBAC | Privilege escalation via over-broad service account permissions | planned |
+| RBAC hardening | Kubernetes RBAC | Privilege escalation via over-broad service account permissions | done |
 | Admission control | Kyverno | Deploying privileged / non-compliant workloads | planned |
 | Network policies | Kubernetes NetworkPolicy | Lateral movement between pods | planned |
 | Secrets management | sealed-secrets | Plaintext secrets committed to Git | planned |
@@ -50,4 +50,4 @@ runbooks/            # replayable command logs
 
 ## Status
 
-Cluster up — 3 nodes on Kubernetes v1.35.5; hardened nginx target workload (non-root, pinned image, restricted securityContext) running in the `demo` namespace — 2026-07-21.
+Cluster up — 3 nodes on Kubernetes v1.35.5; hardened nginx target workload (non-root, pinned image, restricted securityContext) running in the `demo` namespace. Phase 2a RBAC hardening landed — dedicated `nginx-sa` (no token mounted) and a least-privilege `developer` Role, with a captured attack demo showing a token-bearing pod blocked (HTTP 403) from reading Secrets — 2026-07-21.
