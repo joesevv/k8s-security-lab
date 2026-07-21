@@ -15,6 +15,10 @@ spec:
       labels:
         app: nginx
     spec:
+      # Dedicated least-privilege identity. Combined with the SA's
+      # automountServiceAccountToken: false, no API token is projected into the
+      # pod — nginx needs no cluster access.
+      serviceAccountName: nginx-sa
       # Pod-level security context. runAsNonRoot + RuntimeDefault seccomp are
       # what the future restricted Pod Security / Kyverno policies will demand.
       securityContext:
