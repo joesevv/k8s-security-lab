@@ -1,0 +1,13 @@
+# Phase 2a — kubectl auth can-i matrix — captured 2026-07-21T13:29:45Z
+# Subject: system:serviceaccount:demo:developer-sa (unless noted)
+
+kubectl auth can-i list pods -n demo                    yes
+kubectl auth can-i get services -n demo                 yes
+kubectl auth can-i list deployments.apps -n demo        yes
+kubectl auth can-i get secrets -n demo                  no
+kubectl auth can-i list secrets -n demo                 no
+kubectl auth can-i create pods -n demo                  no
+kubectl auth can-i delete pods -n demo                  no
+
+# Context: OLD default SA (system:serviceaccount:demo:default)
+kubectl auth can-i get secrets -n demo (default sa)     no

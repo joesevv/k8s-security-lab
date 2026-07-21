@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attacker
+  namespace: demo
+  labels:
+    app: attacker
+    role: rbac-demo
+spec:
+  # Run as the least-privilege developer identity and DO mount its token, so the
+  # demo exercises the real RBAC boundary: authn succeeds (valid token), authz
+  # fails (Role has no secrets access) -> HTTP 403.
+  serviceAccountName: developer-sa
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  # Restricted securityContext so this pod already complies with the Phase 2b
+  # Pod Security / Kyverno restricted profile that will be enforced later.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      # curl client pinned to an exact patch (never latest / bare major).
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

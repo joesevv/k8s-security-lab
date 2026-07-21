@@ -1,0 +1,21 @@
+# Phase 2a RBAC attack demo — captured 2026-07-21T13:28:56Z
+# Pod: attacker (serviceAccountName: developer-sa, token mounted)
+
+## ATTACK 1: read secrets in namespace demo using the mounted SA token
+$ curl ... https://kubernetes.default.svc/api/v1/namespaces/demo/secrets
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "secrets is forbidden: User \"system:serviceaccount:demo:developer-sa\" cannot list resource \"secrets\" in API group \"\" in the namespace \"demo\"",
+  "reason": "Forbidden",
+  "details": {
+    "kind": "secrets"
+  },
+  "code": 403
+}
+HTTP_STATUS:403
+
+## CONTRAST: same token CAN list pods (proves authn works; it is authz being denied)
+pods list HTTP:200

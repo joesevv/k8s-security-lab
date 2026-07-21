@@ -28,6 +28,10 @@ A local kind cluster (1 control-plane + 2 workers) running on Docker Desktop wit
 
 This section will grow one entry per demonstrated attack, each pairing the attack with the control that blocks it and linking to the captured before/after evidence.
 
+| Control | Attack | Evidence |
+| --- | --- | --- |
+| Phase 2a RBAC — least-privilege `developer` Role (get/list/watch pods/services/deployments only) + no-token `nginx-sa` | Token-bearing pod (`developer-sa`) uses its mounted ServiceAccount token to read Secrets via the API | HTTP 403 Forbidden — [`docs/evidence/phase-2a-rbac/`](docs/evidence/phase-2a-rbac/) (attack-output.txt, can-i-matrix.txt); runbook [`runbooks/phase-2a-rbac.md`](runbooks/phase-2a-rbac.md) |
+
 ## Repo layout
 
 Planned structure (documentation only — directories are added as each layer is built):
