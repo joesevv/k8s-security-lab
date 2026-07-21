@@ -1,0 +1,16 @@
+# Baseline: deny ALL ingress AND egress for every pod in the demo namespace.
+# podSelector {} selects every pod; listing both policyTypes with no
+# ingress/egress rules means nothing is allowed until a later policy
+# explicitly allows it. Applied FIRST, alone, to prove the deny baseline
+# does not disturb running pods (NetworkPolicy affects connections, not
+# pod lifecycle).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress

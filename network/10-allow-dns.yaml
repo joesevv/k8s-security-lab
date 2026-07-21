@@ -1,0 +1,30 @@
+# DNS carve-out: once default-deny egress is on, no pod in demo can reach
+# CoreDNS, so every name lookup fails and even "allowed" connections break
+# at the resolve step. This policy lets ALL demo pods talk to the CoreDNS
+# pods (kube-system, label k8s-app=kube-dns) on 53/UDP and 53/TCP only.
+# Selecting the kube-dns POD works even though clients dial the
+# 10.96.0.10 service VIP: kube-proxy DNATs the VIP to a CoreDNS pod IP
+# before the egress policy is evaluated, and egress "to" selectors match
+# the destination pod IP.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
