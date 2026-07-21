@@ -1,0 +1,33 @@
+# Kubeconfig files
+kubeconfig
+*.kubeconfig
+kind-kubeconfig*
+
+# Environment files
+.env
+.env.*
+
+# Private keys
+*.key
+*.pem
+id_rsa*
+cosign.key
+
+# Sealed-secrets controller private key backups
+sealed-secrets-key*.yaml
+master-key*.yaml
+
+# Unencrypted secret manifests
+*-secret-plain.yaml
+secrets/plain/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Editor dirs
+.vscode/
+
+# Backup / temp files
+*.bak
+*.tmp
