@@ -58,12 +58,12 @@ jobs:
           tags: ghcr.io/joesevv/k8s-security-lab/signed-app:${{ github.sha }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v4.1.2
         with:
           cosign-release: 'v3.0.6'
 
       - name: Trivy scan (report-only)
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/joesevv/k8s-security-lab/signed-app@${{ steps.build.outputs.digest }}
           format: sarif
