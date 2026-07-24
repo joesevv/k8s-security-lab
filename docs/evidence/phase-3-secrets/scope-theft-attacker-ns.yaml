@@ -1,0 +1,20 @@
+# SCOPE-THEFT ATTACK ARTIFACT — Phase 3 secrets (sealed-secrets).
+# NOT a real deliverable: this is the attacker's move. It is a byte-for-byte
+# copy of the committed secrets/demo-app-sealedsecret.yaml ciphertext, with
+# metadata.namespace (and template.metadata.namespace) rewritten from `demo`
+# to `attacker`. The original was sealed with DEFAULT STRICT SCOPE, which
+# binds the RSA-OAEP ciphertext to namespace/name `demo/demo-app-secret`.
+# Applying this into `attacker` must be REFUSED by the controller: no Secret
+# is produced. Evidence: docs/evidence/phase-3-secrets/attack-output.txt.
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: demo-app-secret
+  namespace: attacker
+spec:
+  encryptedData:
+    db-password: AgBQaeyrEVSHVFyi6TYJhCzMb2bOWqvAbq+x5JRH4s+J/p4d6UVzRwCz1HFR2/jPElyVlYN4f7Ky2YX3rK3S6eavSIhFVpnlSSRmC3PY3v172iOGb+TveTJoWYwZHt9SYtAuF3TjNje0Jea120ZSrV1LYLGAsGUt1lmJB+hpI16zB5lsUuW7LEfmcaej2IUR9JYRQ7en6oTg/1PyheeEiOpruUFQqwWnORZ/MuCz4ozrf7N8Rg5jENPSidhjqGyKcU+BP0lGUuDUyUJa4Q4BXyMP4fdFyvVpXVi2OCtryB69gKZ6Skkjx3OUWLXNGzBBLzSPjETXa9K8LJixHFdwr67+99U6ZVCnUueozf4tXOtQwRnoPL/lNSKLwtm8zXnlc9Is07Sn5FjMc+yhYpc3mAxJBiiHEfqXo+OTjsH3ZCEdIFjBfppqAC5vAEDwHTDH0yzMq/JVaqEGiVl1Fx6hhmEqk3HCnmf2J45lfVH9pUCz/OK91t9FsWh/vkvgQYTO16dAeJRcQasAnXz/FfIJCdWE51GXNOn8/j/weleItIvKCBDeOJJezZIqH69Ro9feB704d74rJZ9tK9t5MX/ykCG6QGD2oDnW9WbLKJbceO46nq//fgHIQ+PdK+xrw9GIJM6u3grVJGwnJzKxDlQ9W0cbL/dkVgiJsh/PuLuRxS4DALPLxdVEqPGT3+P1TfZ/2r9B6ht00x+jYEk4Tm9yxPQqH0uwvjjLji8i1YpYlMFn
+  template:
+    metadata:
+      name: demo-app-secret
+      namespace: attacker

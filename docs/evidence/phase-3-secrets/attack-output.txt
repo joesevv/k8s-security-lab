@@ -1,0 +1,182 @@
+Phase 3 — sealed-secrets attack demo (captured 2026-07-23)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5.
+Controller: sealed-secrets chart 2.19.1 / app 0.38.4, running in kube-system
+as Deployment sealed-secrets-controller
+(image docker.io/bitnami/sealed-secrets-controller:0.38.4,
+digest sha256:ab8e4687a97fb097f30ca2f028222f779f231c224555ba05f43d172c61f84497).
+Served SealedSecret apiVersion bitnami.com/v1alpha1 (correct for this
+controller; the lab's "avoid v1alpha1" rule is Kyverno-only).
+
+Threat blocked: "plaintext secrets committed to Git." A normal Secret's
+`data` is base64 ENCODING, not encryption, so committing one leaks the
+credential. A SealedSecret is RSA-encrypted ciphertext, safe to commit, that
+only the in-cluster controller's private key can decrypt.
+
+REDACTION: the real demo credential (namespace demo, Secret demo-app-secret,
+key db-password) is NEVER printed in this file. It lives only in the
+gitignored secrets/plain/demo-app-secret-plain.yaml. Identity is proven by
+SHA-256, not by printing the value. Its SHA-256 is
+2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c.
+
+============================================================
+CONTROLLER INSTALLED & RUNNING — chart 2.19.1, app 0.38.4, kube-system
+$ helm list -n kube-system
+============================================================
+NAME          	NAMESPACE  	REVISION	UPDATED                              	STATUS  	CHART                	APP VERSION
+sealed-secrets	kube-system	1       	2026-07-23 17:40:26.7263997 -0500 CDT	deployed	sealed-secrets-2.19.1	0.38.4
+
+$ kubectl -n kube-system get pods | grep -i sealed
+sealed-secrets-controller-74d5bcfff-pfxql      1/1     Running   0             18s
+
+$ kubectl get crd | grep -i sealed
+sealedsecrets.bitnami.com                               2026-07-23T22:40:26Z
+
+$ kubectl api-resources | grep -i sealed
+sealedsecrets                                    bitnami.com/v1alpha1              true         SealedSecret
+
+$ kubectl -n kube-system get deploy sealed-secrets-controller -o jsonpath='{..image}'
+docker.io/bitnami/sealed-secrets-controller:0.38.4
+$ kubectl -n kube-system get pod -l app.kubernetes.io/name=sealed-secrets -o jsonpath='{..imageID}'
+docker.io/bitnami/sealed-secrets-controller@sha256:ab8e4687a97fb097f30ca2f028222f779f231c224555ba05f43d172c61f84497
+
+============================================================
+SEAL + APPLY — controller materializes the real Secret from the committed
+ciphertext. BOTH the SealedSecret and the Secret exist; the Secret is OWNED
+by the SealedSecret (created by the controller, not committed to Git).
+$ kubectl apply -f secrets/demo-app-sealedsecret.yaml
+$ kubectl get sealedsecret,secret demo-app-secret -n demo
+============================================================
+sealedsecret.bitnami.com/demo-app-secret created
+
+NAME                                       STATUS   SYNCED   AGE
+sealedsecret.bitnami.com/demo-app-secret            True     3s
+
+NAME                     TYPE     DATA   AGE
+secret/demo-app-secret   Opaque   1      3s
+
+$ kubectl get secret demo-app-secret -n demo -o jsonpath='{.metadata.ownerReferences}'
+[{"apiVersion":"bitnami.com/v1alpha1","controller":true,"kind":"SealedSecret","name":"demo-app-secret","uid":"8a10a7c1-68ba-44e8-a980-09a8c8c3207b"}]
+
+Controller log — successful unseal:
+$ kubectl -n kube-system logs deploy/sealed-secrets-controller | grep -iE "demo-app-secret|Unsealed"
+time=2026-07-23T22:42:31.323Z level=INFO msg=Updating key=demo/demo-app-secret
+time=2026-07-23T22:42:31.360Z level=INFO msg="Event(...Namespace:\"demo\", Name:\"demo-app-secret\"...): type: 'Normal' reason: 'Unsealed' SealedSecret unsealed successfully"
+
+============================================================
+ROUND-TRIP PROOF (SHA-256, no plaintext) — the in-cluster decrypted Secret
+equals the intended input. The value is read FROM the gitignored plain file
+in the first command, so it is never typed inline or echoed.
+$ grep 'db-password:' secrets/plain/demo-app-secret-plain.yaml | awk '{print $2}' | base64 -d | sha256sum   # intended input
+$ kubectl get secret demo-app-secret -n demo -o jsonpath='{.data.db-password}' | base64 -d | sha256sum      # in-cluster decrypted
+============================================================
+intended input : 2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c
+in-cluster     : 2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c
+=> MATCH — the controller unsealed exactly the intended credential.
+
+============================================================
+A) BASELINE (the vulnerability) — a normal Secret's `data` is ONLY base64
+ENCODING, trivially reversed. Uses a THROWAWAY value, not the real secret.
+$ kubectl create secret generic example-plain -n demo --from-literal=example-key='hello-not-a-real-secret' --dry-run=client -o yaml | grep 'example-key:'
+$ echo <that-base64> | base64 -d
+============================================================
+  example-key: aGVsbG8tbm90LWEtcmVhbC1zZWNyZXQ=
+$ echo aGVsbG8tbm90LWEtcmVhbC1zZWNyZXQ= | base64 -d
+hello-not-a-real-secret
+
+=> base64 != encryption. This is exactly why a plaintext Secret in Git is a
+full compromise, and why the sealed artifact below is different.
+
+============================================================
+B) CONTROL HOLDS — the REAL ciphertext from the committed
+secrets/demo-app-sealedsecret.yaml (spec.encryptedData.db-password),
+base64-decoded, is BINARY GARBAGE, not the value. Offline recovery is
+impossible: the fetched cert is a PUBLIC key (encrypt-only); the private key
+is a Secret in kube-system that never leaves the cluster.
+$ <encryptedData.db-password> | base64 -d | xxd | head
+============================================================
+00000000: 0200 5069 ecab 1154 8754 5ca2 e936 0984  ..Pi...T.T\..6..
+00000010: 2ccc 6f66 ce5a abc0 6eaf b1e4 9447 e2cf  ,.of.Z..n....G..
+00000020: 89fe 9e1d e945 7347 00b3 d471 51db f8cf  .....EsG...qQ...
+00000030: 125c 9595 8378 7fb2 b2d9 85f7 acad d2e9  .\...x..........
+00000040: e6af 4888 4556 99e5 4924 660b 73d8 defd  ..H.EV..I$f.s...
+00000050: 7bda 2386 6fe4 ef79 3268 598c 191e df52  {.#.o..y2hY....R
+00000060: 62d0 2e17 74e3 3637 b425 e6b5 db46 52ad  b...t.67.%...FR.
+00000070: 5d4b 60b1 80b0 652d d659 8907 e869 235e  ]K`...e-.Y...i#^
+00000080: b307 996c 52e5 bb2c 47e6 71a7 a3d8 8511  ...lR..,G.q.....
+00000090: f496 1143 b7a7 ea84 e0ff 53f2 85e7 8488  ...C......S.....
+(0200 = the SealedSecret binary envelope header; the rest is RSA-OAEP +
+AES-GCM ciphertext. Nothing here is recoverable without the private key.)
+
+============================================================
+C) STRICT-SCOPE ANTI-THEFT — an attacker copies the committed SealedSecret
+and reseals it into a namespace they control (metadata.namespace demo ->
+attacker; same ciphertext). DEFAULT strict scope binds the ciphertext to
+namespace/name demo/demo-app-secret, so the controller REFUSES to decrypt:
+NO Secret is produced in the attacker namespace.
+$ kubectl create namespace attacker
+$ kubectl apply -f docs/evidence/phase-3-secrets/scope-theft-attacker-ns.yaml
+$ kubectl get sealedsecret,secret demo-app-secret -n attacker
+============================================================
+namespace/attacker created
+sealedsecret.bitnami.com/demo-app-secret created
+
+NAME              STATUS                                      SYNCED   AGE
+demo-app-secret   no key could decrypt secret (db-password)   False    18s
+Error from server (NotFound): secrets "demo-app-secret" not found
+
+$ kubectl get secret demo-app-secret -n attacker
+Error from server (NotFound): secrets "demo-app-secret" not found
+(exit code: 1)
+
+$ kubectl get sealedsecret demo-app-secret -n attacker -o jsonpath='{.status}'
+{"conditions":[{...,"message":"no key could decrypt secret (db-password)","status":"False","type":"Synced"}],"observedGeneration":1}
+
+$ kubectl get events -n attacker | grep -iE "sealed|unseal"
+Warning   ErrUnsealFailed   sealedsecret/demo-app-secret   Failed to unseal: no key could decrypt secret (db-password)
+
+Controller log:
+time=2026-07-23T22:43:32.880Z level=ERROR msg="Error updating, giving up" key=attacker/demo-app-secret error="no key could decrypt secret (db-password)"
+
+Teardown of the attack object:
+$ kubectl delete -f docs/evidence/phase-3-secrets/scope-theft-attacker-ns.yaml
+$ kubectl delete namespace attacker
+sealedsecret.bitnami.com "demo-app-secret" deleted from attacker namespace
+namespace "attacker" deleted
+
+============================================================
+D) NO-PLAINTEXT-IN-GIT (headline) — the credential appears in ZERO
+to-be-committed files. `git grep --untracked` searches tracked AND untracked
+files but SKIPS gitignored ones, i.e. exactly the set that would be
+committed. VAL = the literal credential; B64 = its base64 form (equally
+leakable). Both return zero hits over the committed set.
+============================================================
+Positive control — the base64 value DOES exist, only in the IGNORED plain
+file (proves the search works and the value is confined there):
+$ git grep --no-index -l "$B64"
+secrets/plain/demo-app-secret-plain.yaml
+
+$ git grep --no-index -l "$VAL"      # literal cleartext appears NOWHERE on disk (plain file is base64)
+(exit code: 1 = truly absent as cleartext anywhere)
+
+HEADLINE — committed set is clean for both forms:
+$ git grep --untracked -n "$VAL"
+(exit code: 1 = no match)
+$ git grep --untracked -n "$B64"
+(exit code: 1 = no match)
+$ git grep --untracked -n "$VAL" -- ':!secrets/plain'
+(exit code: 1 = no match)
+
+History is clean too:
+$ git log --all -p -- secrets/ | grep "$VAL"
+(grep exit code: 1 = no match)
+
+The plain files are gitignored (never staged):
+$ git check-ignore secrets/plain/demo-app-secret-plain.yaml secrets/plain/controller-cert.pem
+secrets/plain/demo-app-secret-plain.yaml
+secrets/plain/controller-cert.pem
+
+$ git status --porcelain --ignored | grep -E "secrets|plain"
+?? secrets/
+!! secrets/plain/
+(secrets/ is untracked and will be committed EXCEPT secrets/plain/, which is
+classified !! ignored — the plaintext original and public cert stay local.)
