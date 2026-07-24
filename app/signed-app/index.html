@@ -1,0 +1,23 @@
+<!-- Phase 4 supply-chain demo page. Served by the signed-app image whose
+     provenance CI attests: built, Trivy-scanned, SBOM'd, and cosign
+     keyless-signed via GitHub Actions, then admitted to the cluster only when
+     the Kyverno ImageValidatingPolicy verifies that signature. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>signed-app — supply-chain demo</title>
+</head>
+<body>
+  <h1>signed-app</h1>
+  <p>This is the phase-4 supply-chain demo application for the k8s-security-lab.</p>
+  <p>
+    This image is built, scanned (Trivy), SBOM'd, and
+    <strong>cosign keyless-signed</strong> by GitHub Actions. Kyverno's
+    ImageValidatingPolicy admits it to the cluster <strong>only</strong> when the
+    keyless signature from this repo's workflow identity is verified.
+  </p>
+  <p>If you can read this, the signed image is serving on port 8080 as uid 101 (non-root).</p>
+</body>
+</html>
