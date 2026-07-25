@@ -169,12 +169,100 @@ kubectl run curl-test --rm -i --restart=Never -n demo \
 ```
 Purpose: prove the Service resolves and nginx serves HTTP inside the cluster.
 
-Observed: `200`.
+Observed on a phase-1-only cluster: `200`.
 
-> The `demo` namespace has `pod-security.kubernetes.io/warn: restricted`, so this
-> ad-hoc curl pod (which is not hardened) triggers a PodSecurity **warning** —
-> expected, and confirms the warn label is active. The nginx Deployment itself
-> applies with no such warning because it satisfies the restricted profile.
+> **This step behaves differently once later phases are applied — both
+> behaviors are correct.**
+>
+> - **Phase-1-only cluster:** `demo` carries only
+>   `pod-security.kubernetes.io/warn: restricted`, so the unhardened ad-hoc
+>   pod above is ADMITTED, prints `200`, and emits a PodSecurity **warning**
+>   on stderr — expected, and it confirms the warn label is active. The nginx
+>   Deployment itself applies with no warning because it satisfies restricted.
+> - **Fully-built lab (Phase 2b onward):** `demo` also carries
+>   `pod-security.kubernetes.io/enforce: restricted`, and the four Kyverno
+>   ValidatingPolicies run with `validationActions: [Deny]`. The same
+>   unhardened pod is now **DENIED at admission** and never runs. That is the
+>   layers working as intended, not a regression — but it means the command
+>   above no longer completes this step.
+>
+> Observed today on the fully-built lab — PodSecurity is a built-in admission
+> plugin, so it answers first:
+>
+> ```
+> Error from server (Forbidden): pods "curl-test" is forbidden: violates
+> PodSecurity "restricted:v1.35": allowPrivilegeEscalation != false (container
+> "curl-test" must set securityContext.allowPrivilegeEscalation=false),
+> unrestricted capabilities (container "curl-test" must set
+> securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or
+> container "curl-test" must set securityContext.runAsNonRoot=true),
+> seccompProfile (pod or container "curl-test" must set
+> securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+> ```
+>
+> Kyverno denies it independently of PSA. Running the same `kubectl run` in
+> `demo-kyverno-only` (warn-only PSA, same four policies) shows both layers
+> speaking: the PSA **warning** described above, then
+> `Error from server: admission webhook "vpol.validate.kyverno.svc-fail"`
+> `denied the request: Policy require-drop-all-capabilities failed`.
+
+To complete this step on a fully-built lab, use a hardened curl pod that
+satisfies restricted PSA and all four Kyverno policies (`curlimages/*` is an
+allowed registry, the tag is pinned, non-root, no privilege escalation,
+read-only root filesystem, all capabilities dropped, `RuntimeDefault`
+seccomp):
+
+```bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: curl-test
+  namespace: demo
+  labels:
+    access: "nginx"       # Phase 2c NetworkPolicy: required to reach nginx
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.16.0   # allowed registry + pinned tag
+      command: ["sleep", "300"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+EOF
+# -> pod/curl-test created            (admitted — no Forbidden, no warning)
+
+kubectl wait --for=condition=Ready pod/curl-test -n demo --timeout=120s
+# -> pod/curl-test condition met
+
+MSYS_NO_PATHCONV=1 kubectl exec -n demo curl-test -- \
+  curl -s -o /dev/null -w "%{http_code}\n" http://nginx.demo.svc.cluster.local
+# -> 200
+
+kubectl delete pod curl-test -n demo
+# -> pod "curl-test" deleted from demo namespace
+```
+
+Two things that will bite you here:
+
+- **The `access: "nginx"` label is load-bearing, not cosmetic.** Phase 2c's
+  `network/20-allow-nginx-ingress-from-client.yaml` and
+  `network/30-allow-client-egress-to-nginx.yaml` make that label the sole
+  discriminator between an allowed and a blocked client. The identical pod
+  without it is still admitted, but the curl gets no route: observed `000`
+  with curl exit 28 (timeout).
+- **`MSYS_NO_PATHCONV=1` is a Git Bash wart.** Without it MSYS rewrites the
+  `-o /dev/null` argument into a Windows path and curl fails with
+  `curl: (23) client returned ERROR on write of 896 bytes` even though the
+  `200` is printed. Not needed on Linux/macOS shells.
 
 ---
 

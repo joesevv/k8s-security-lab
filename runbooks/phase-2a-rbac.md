@@ -19,7 +19,7 @@ noted. Kubernetes node image v1.35.5, kubectl v1.36.1.
 
 ## 0. The controls
 
-- **nginx-sa** (`workloads/nginx/serviceaccount.yaml`): a dedicated
+- **nginx-sa** (`workloads/nginx/01-serviceaccount.yaml`): a dedicated
   ServiceAccount for nginx with `automountServiceAccountToken: false`. nginx
   needs no Kubernetes API access, so no token is projected into its pods. This
   shrinks the blast radius — a compromised nginx pod has no cluster credential
