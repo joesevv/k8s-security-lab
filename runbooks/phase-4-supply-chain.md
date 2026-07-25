@@ -168,10 +168,18 @@ kubectl get imagevalidatingpolicy require-keyless-signed-ghcr \
 ```
 
 The policy deliberately lives one directory down, in `policies/supply-chain/`.
-`runbooks/phase-2b-admission.md` drives its Audit/Deny loop over a shallow
-`policies/*.yaml` glob and tears down with `kubectl delete -f policies/`, which
-is non-recursive without `-R`. Neither reaches a subdirectory, so the phase-2b
-commands cannot flip this policy to Audit or delete it. Verified:
+`runbooks/phase-2b-admission.md` selects its Audit targets **by kind** — `for f
+in $(grep -l '^kind: ValidatingPolicy' policies/*.yaml)` — because `policies/`
+also holds a Namespace manifest that must not be piped through `sed`. It tears
+down **by name**: `kubectl delete validatingpolicy disallow-privileged-containers
+disallow-latest-and-bare-tag require-drop-all-capabilities restrict-registries`.
+Neither form descends into `policies/supply-chain/`: the glob is shallow, and
+the delete names only those four. So the phase-2b commands cannot flip this
+policy to Audit or delete it — and even if the file sat directly in `policies/`,
+`kind: ImageValidatingPolicy` matches neither the `^kind: ValidatingPolicy` grep
+nor a `kubectl delete validatingpolicy`. The same holds for the `kubectl delete -f
+policies/` that phase 2b explicitly warns against, since `-f <dir>` is
+non-recursive without `-R`. Verified:
 
 ```bash
 kubectl delete -f policies/ --dry-run=client   # deletes nothing; lists targets
