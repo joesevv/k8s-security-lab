@@ -1,0 +1,8 @@
+
+Verification for ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - Existence of the claims in the transparency log was verified offline
+  - The code-signing certificate was verified using trusted certificate authority certificates
+
+[{"critical":{"identity":{"docker-reference":"ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b"},"image":{"docker-manifest-digest":"sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b"},"type":"https://sigstore.dev/cosign/sign/v1"},"optional":{}}]
