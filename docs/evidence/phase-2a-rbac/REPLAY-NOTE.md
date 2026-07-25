@@ -1,9 +1,13 @@
 # Replay note — Phase 2a RBAC evidence
 
-**When the 403 was captured:** the HTTP 403 in `attack-output.txt` (and the
-`can-i` matrix in `can-i-matrix.txt`) were captured on **2026-07-21, before Phase
-2c (NetworkPolicy) existed**. They are point-in-time, verbatim artifacts and are
-not edited.
+**When the 403 was captured:** the HTTP 403 in `attack-output.txt` and the
+`can-i` matrix in `can-i-matrix.txt` were both first captured on **2026-07-21,
+before Phase 2c (NetworkPolicy) existed** — that timing is what explains the
+HTTP 000 replay described below. `attack-output.txt` is a verbatim
+point-in-time artifact and has not been edited. `can-i-matrix.txt` is **not**
+unedited: it was re-captured on 2026-07-24 to add the `--as=` flag its printed
+commands had omitted, and all its answers are unchanged — see **Original
+captures** at the end of this note for the detail.
 
 ## Why a naive replay today yields HTTP 000 instead of 403
 
@@ -46,7 +50,20 @@ kubectl auth can-i list secrets -n demo \
 # -> no
 ```
 
-## Original captures (do not edit)
+## Original captures
+
+`attack-output.txt` remains an untouched point-in-time capture; do not edit.
+`can-i-matrix.txt` was corrected once, on 2026-07-24 — see below. That
+correction supersedes the "not edited" framing at the top of this note for
+that one file only.
 
 - `attack-output.txt` — verbatim 403 JSON + `pods list HTTP:200` contrast.
-- `can-i-matrix.txt` — verbatim `auth can-i` matrix for `developer-sa`.
+  Untouched point-in-time capture from 2026-07-21.
+- `can-i-matrix.txt` — `auth can-i` matrix for `developer-sa`. **Corrected on
+  2026-07-24.** The original 2026-07-21 capture recorded the correct answers,
+  but its printed command lines omitted the `--as=` flag, so they were not
+  directly replayable: pasted as written against an admin kubeconfig they
+  evaluate the admin, not the ServiceAccount. The file was re-captured with
+  `--as=` and now records the generating loop verbatim plus its real stdout.
+  **The answers are unchanged** — all eight re-observed answers match the
+  2026-07-21 capture. The correction is also documented inside the file itself.

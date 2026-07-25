@@ -1,13 +1,56 @@
-# Phase 2a — kubectl auth can-i matrix — captured 2026-07-21T13:29:45Z
+# Phase 2a — kubectl auth can-i matrix — captured 2026-07-25T01:59:27Z
 # Subject: system:serviceaccount:demo:developer-sa (unless noted)
+#
+# INTEGRITY NOTE — this file was RE-CAPTURED on 2026-07-24 (local time; the UTC
+# stamp above reads 2026-07-25 because UTC had already rolled over). The
+# original 2026-07-21T13:29:45Z capture recorded the correct answers for
+# developer-sa, but the printed command lines OMITTED the --as= flag, so they
+# were not directly replayable: pasted as written against an admin kubeconfig
+# they evaluate the admin instead of developer-sa, and 5 of the 8 lines return
+# the opposite answer. THE ANSWERS ARE UNCHANGED from the 2026-07-21 capture —
+# all 8 re-observed answers match it exactly; only the command lines were
+# corrected.
+#
+# This file now records the generating loop verbatim plus its real, unedited
+# stdout, so any command line below can be copy-pasted as-is and reproduced.
+# The line that gets printed and the command that actually runs are built from
+# the same $q / $SA variables, so they cannot drift apart again.
+#
+# Cluster: kind-seclab. Run with an admin kubeconfig (impersonation via --as=
+# requires it). Requires Phase 2a RBAC applied; unaffected by Phase 2c
+# NetworkPolicy, since can-i is evaluated at the API server.
 
-kubectl auth can-i list pods -n demo                    yes
-kubectl auth can-i get services -n demo                 yes
-kubectl auth can-i list deployments.apps -n demo        yes
-kubectl auth can-i get secrets -n demo                  no
-kubectl auth can-i list secrets -n demo                 no
-kubectl auth can-i create pods -n demo                  no
-kubectl auth can-i delete pods -n demo                  no
+# ---- generating loop (bash) ----
+SA=system:serviceaccount:demo:developer-sa
+for q in "list pods" "get services" "list deployments.apps" "get secrets" \
+         "list secrets" "create pods" "delete pods"; do
+  echo "kubectl auth can-i $q -n demo --as=$SA"
+  kubectl auth can-i $q -n demo --as=$SA
+done
+echo "kubectl auth can-i get secrets -n demo --as=system:serviceaccount:demo:default"
+kubectl auth can-i get secrets -n demo --as=system:serviceaccount:demo:default
 
-# Context: OLD default SA (system:serviceaccount:demo:default)
-kubectl auth can-i get secrets -n demo (default sa)     no
+# ---- captured stdout ----
+kubectl auth can-i list pods -n demo --as=system:serviceaccount:demo:developer-sa
+yes
+kubectl auth can-i get services -n demo --as=system:serviceaccount:demo:developer-sa
+yes
+kubectl auth can-i list deployments.apps -n demo --as=system:serviceaccount:demo:developer-sa
+yes
+kubectl auth can-i get secrets -n demo --as=system:serviceaccount:demo:developer-sa
+no
+kubectl auth can-i list secrets -n demo --as=system:serviceaccount:demo:developer-sa
+no
+kubectl auth can-i create pods -n demo --as=system:serviceaccount:demo:developer-sa
+no
+kubectl auth can-i delete pods -n demo --as=system:serviceaccount:demo:developer-sa
+no
+kubectl auth can-i get secrets -n demo --as=system:serviceaccount:demo:default
+no
+
+# The final entry above is the contrast case: the OLD default SA
+# (system:serviceaccount:demo:default), which also cannot read Secrets.
+#
+# Why --as= matters: dropping it evaluates YOUR admin identity, not the SA.
+#   kubectl auth can-i get secrets -n demo                     -> yes  (admin)
+#   kubectl auth can-i get secrets -n demo --as=...developer-sa -> no   (the SA)
