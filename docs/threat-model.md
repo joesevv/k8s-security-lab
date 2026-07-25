@@ -70,7 +70,10 @@ interesting to write about.
 6. **The Git history.** Distinct from the working tree: a secret committed once
    is committed forever, and history is the asset the phase-3 controls are
    really protecting. `git log --all -p` is part of that phase's proof for
-   exactly this reason.
+   exactly this reason. As of 2026-07-25 this repository is **public**, so the
+   history is world-readable and permanently mirrorable by anyone — the exposure
+   of this asset changed in kind, not in degree. What now guards it, and what
+   does not, is in §6.11.
 
 ---
 
@@ -106,13 +109,27 @@ verified against the transparency log — see
 (`insecureIgnoreTlog: false`, `insecureIgnoreSCT: false`). In CI the signing
 privilege is isolated: every third-party action runs in the `build-scan` job,
 which has **no** `id-token` permission, so a compromised action cannot mint the
-identity the cluster trusts.
+identity the cluster trusts. That last clause is still a **design** claim, read
+off the workflow's `permissions:` block. What run 30174855073 (2026-07-25) added
+is narrower: it was the first execution of the two-job split and both jobs
+passed — `build-scan` (53s) built, scanned and pushed with no `id-token`, and
+`sign` (10s) held `id-token: write` and ran nothing but GHCR login,
+`cosign sign` and a verify self-check. That is evidence the permission is
+genuinely **unnecessary** in `build-scan`, so the split is not paid for in
+broken builds. No step attempted to mint an OIDC token from `build-scan` and was
+refused, so the blocking half was never exercised; see §6.9.
 
 **Not covered:** the signature attests **provenance, not safety** (§6.5), and
 the pinned subject means the boundary is really "who can push to `main`"
-(asset 3 in §2). Branch protection on `main` could not be verified — the GitHub
-branch-protection API returns HTTP 403 for this repository's plan — so treat it
-as **unverified**.
+(asset 3 in §2). That boundary is now checkable — the repository is public, so
+the branch API is no longer plan-gated — and it was checked on 2026-07-25.
+Classic branch protection is absent
+(`GET /repos/joesevv/k8s-security-lab/branches/main/protection` → HTTP 404
+`Branch not protected`), but that endpoint does not see rulesets and a ruleset
+**is** active: `protect-main` applies `non_fast_forward`, `deletion` and
+`pull_request` to the default branch. So a guard exists — it is just
+one-person-satisfiable: zero required approving reviews and no required status
+check. The exact configuration and the residual are in §6.10.
 
 ### 3.3 Pod → API server
 
@@ -248,7 +265,10 @@ pod manifests `attacker-unauthorized.yaml` and `client-authorized.yaml`.
 ### A4 — The repo reader (phase 3, secrets)
 
 **Goal:** recover `demo-app-secret` from the Git repository.
-**Capability assumed:** a full clone, including history. No cluster access.
+**Capability assumed:** none beyond internet access. The repository is public as
+of 2026-07-25, so a full clone including history is available to anyone,
+unauthenticated — A4 is the baseline position of every reader, not a granted
+premise. No cluster access.
 **Stopped at:** cryptography, twice. Base64-decoding the committed
 `encryptedData` yields RSA-OAEP + AES-GCM ciphertext — the fetched cert is
 public and encrypt-only, and the private key never leaves the cluster, so
@@ -280,9 +300,17 @@ denied the request: Policy require-keyless-signed-ghcr failed: Image must be
 cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
 ```
 
-The positive control passes in the same breath: re-applying the signed-app
+The positive control passes in the same breath — but only when the dry run is
+the server-side kind. Re-applying the signed-app
 [`deployment.yaml`](../workloads/signed-app/deployment.yaml) at the real signed
-digest returns `deployment.apps/signed-app unchanged`.
+digest `sha256:7fd13d22…` with `--server-side --dry-run=server` returns
+`deployment.apps/signed-app serverside-applied (server dry run)`. The plain
+`kubectl apply --dry-run=server` an earlier capture used does **not** count: on
+an unchanged object kubectl diffs client-side, computes an empty patch and
+issues only a `GET`, so the `unchanged` it prints never reaches admission at all
+— the `1b) METHODOLOGY CORRECTION` section of the evidence keeps that `-v=8`
+trace. Only the server-side form sends a `PATCH`, which is why the same flag on
+the same object type yields a pass here and the denial above.
 **Evidence:** [`attack-output.txt`](evidence/phase-4-supply-chain/attack-output.txt)
 in [`evidence/phase-4-supply-chain/`](evidence/phase-4-supply-chain/), alongside
 `attack-unsigned-existing-artifact.yaml` (the headline — a resolvable but
@@ -361,7 +389,12 @@ Signature verification is explicitly not a behavioural control.
 
 **6.5 The CVE gate is report-only.** Trivy runs with `exit-code: '0'`
 ([`.github/workflows/supply-chain.yml`](../.github/workflows/supply-chain.yml)),
-so `CRITICAL`/`HIGH` findings are uploaded as SARIF and never fail the build. A
+so `CRITICAL`/`HIGH` findings never fail the build. The SARIF is uploaded with
+`actions/upload-artifact`, not `github/codeql-action/upload-sarif`, so the
+findings are retrievable only by downloading a build artifact: GitHub code
+scanning has never ingested them (`GET /code-scanning/alerts` → HTTP 404
+`no analysis found`, checked 2026-07-25). This pipeline **produces a SARIF
+artifact**; it does not report to the repository's Security tab. A
 signature attests **provenance, not the absence of vulnerabilities**: a signed,
 admitted image may carry a critical CVE and this lab will run it. Making the
 gate blocking is a one-line change; it is left report-only so the pipeline
@@ -392,20 +425,83 @@ co-tenant. `NodeRestriction` is enabled and authorization is `Node,RBAC`
 (verified), but that is kubeadm's default, not a hardening decision this lab
 made.
 
-**6.9 The restructured CI workflow has not executed.** The most recent
-successful run of `supply-chain` had a single job (`build-sign`); the two-job
-`build-scan` / `sign` split that isolates `id-token: write`, the SHA-pinned
-actions and the cosign verify self-check are all committed but **unproven**.
-The signed digest the cluster admits today was produced by the earlier
-single-job version. The isolation argument in §3.2 is a design claim, not yet an
-observed one.
+**6.9 The two-job CI split is proven once; the build is not reproducible.** Run
+`30174855073` (2026-07-25) was the **first ever** execution of the `build-scan` /
+`sign` split. Both jobs succeeded, every step included, and the
+`Verify signature (self-check vs the identity Kyverno pins)` step validated the
+new digest `sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b`
+against certificate-identity
+`https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main`
+and issuer `https://token.actions.githubusercontent.com`, confirming the
+transparency-log entry offline and the code-signing certificate against the
+trusted CA certificates — transcript in
+[`cosign-verify.txt`](evidence/phase-4-supply-chain/cosign-verify.txt). The
+`id-token` isolation in §3.2 is therefore **runnable**: the split builds, scans,
+signs and verifies with `build-scan` holding no `id-token`, which establishes
+that the permission is not needed there. **What that does not buy.** It does not
+make the isolation an observed *control*. Nothing in the run tried to mint an
+OIDC token from `build-scan` and was refused, so "a compromised third-party
+action cannot mint the identity the cluster trusts" is still inferred from the
+`permissions:` block — exactly as readable before the run executed as after it.
+And one green run of one workflow shape is evidence that it works, not that it
+is durable. The build is **not byte-reproducible**: an unchanged application
+produced a different digest from the previous build (`sha256:b4cb133e…` →
+`sha256:7fd13d22…`), which is expected from layer-metadata timestamps but means
+the digest the cluster pins cannot be independently re-derived from source —
+the signature is the only link back to the pipeline. And the `sign` job still
+carries `contents: read` although it runs no checkout; the green run had that
+scope present, so whether it is genuinely removable is untested.
 
-**6.10 The signing identity's trust root is push access to `main`.** The pinned
-subject makes exactly one workflow file on exactly one ref able to produce an
-admissible signature — which is the point — but it also means the real boundary
-is branch permission on `main`. Branch protection could not be verified: the
-GitHub branch-protection API returns HTTP 403 for this repository's plan. Treat
-that control as **not verified**.
+**6.10 The signing identity's trust root is push access to `main`, and the guard
+on `main` is one-person-satisfiable.** The pinned subject makes exactly one
+workflow file on exactly one ref able to produce an admissible signature — which
+is the point — but it also means the real boundary is branch permission on
+`main`. That is now checkable on a public repository, and it was checked on
+2026-07-25. Classic branch protection is absent
+(`GET /repos/joesevv/k8s-security-lab/branches/main/protection` → HTTP 404
+`Branch not protected`), but the classic endpoint does not report rulesets and
+one exists: ruleset `protect-main` (id 19744535, `enforcement: active`,
+`conditions.ref_name.include: ["~DEFAULT_BRANCH"]`, `bypass_actors: []`,
+`current_user_can_bypass: "never"`) with three rules — `non_fast_forward`,
+`deletion` and `pull_request`. Force-push and branch deletion are blocked, and
+per that configuration every change to `main`, the sole admin's included, must
+arrive via a pull request. **The residual.** This was read from the ruleset API,
+not demonstrated by a rejected push. And the rule set is thin where it matters:
+`required_approving_review_count` is **0**, there is no `required_status_checks`
+rule, and there is no `required_signatures` rule. One account can therefore open
+a pull request and merge it seconds later with no second human and with
+`build-scan` / `sign` red — and that merge mints a signature this cluster
+admits. The gate stops an accidental force-push; it does not stop whoever holds
+the one set of credentials. Requiring the `build-scan` and `sign` status checks
+is the cheapest remaining hardening, and it is the one that would actually bind,
+since a review requirement is hollow while `joesevv` is the only collaborator.
+
+**6.11 The repository is public; the GitHub-native controls are partly on.**
+Since 2026-07-25 the entire history is world-readable and permanently
+mirrorable by anyone (asset 6 in §2). Checked the same day on
+`GET /repos/joesevv/k8s-security-lab` → `security_and_analysis`: secret scanning
+is `enabled`, secret-scanning push protection is `enabled`, Dependabot security
+updates are `enabled`, and Dependabot alerts are on
+(`GET /vulnerability-alerts` → HTTP 204); `GET /secret-scanning/alerts` returns
+`[]`. Dependabot version updates are **firing**, not merely configured — PRs
+#1–#3 (2026-07-25) each bump a SHA-pinned action (`docker/login-action`
+3.7.0→4.5.1, `actions/upload-artifact` 4.6.2→7.0.1, `actions/checkout`
+4.4.0→7.0.1), so the tracking half of the pin-plus-track design in
+`.github/dependabot.yml` does detect stale pins and propose exact replacements.
+That is where it stops: all three PRs are still **open**, none is merged, and
+`gh pr checks` reports no checks on any of them, since the workflow triggers
+only on push to `main`. Detection and proposal are demonstrated; the loop has
+never been closed by a merged bump that then built, signed and verified.
+**Still off, and each is a real gap.**
+`secret_scanning_non_provider_patterns` and `secret_scanning_validity_checks`
+are both `disabled`, so a credential in a custom or non-provider format is not
+matched. Private vulnerability reporting is `{"enabled": false}` and there is no
+`SECURITY.md` on `main` (HTTP 404), so a finder has no private disclosure
+channel. `sha_pinning_required` is `false` with `allowed_actions: "all"`, so the
+workflow's SHA pins are a convention this repo keeps, not a rule GitHub
+enforces. And push protection guards only **future** pushes — nothing already
+public can be retracted, the same retroactive property that makes asset 2
+dangerous.
 
 ---
 

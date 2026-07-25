@@ -132,9 +132,13 @@ jobs:
       # call (cosign-installer curls public release URLs, GHCR auth spends the
       # `packages` scope, upload-artifact uses ACTIONS_RUNTIME_TOKEN, and the
       # actions themselves are fetched in "Set up job" before a step runs).
-      # It is KEPT until a real CI run shows this job green without it: the
-      # two-job split has never executed, and a broken signing job costs far
-      # more than one surplus read scope.
+      # It is KEPT because no run has yet shown this job green WITHOUT it. The
+      # two-job split has now executed green once (run 30174855073, 2026-07-25,
+      # its first execution of this shape) - but with contents: read still
+      # granted, so the redundancy above remains an inference, not an
+      # observation. Dropping it is a one-line experiment worth running on a
+      # later push; a broken signing job costs far more than one surplus read
+      # scope.
       contents: read
       packages: write     # cosign PUSHES the signature artifact to GHCR
       id-token: write     # REQUIRED: mint OIDC token for cosign keyless signing

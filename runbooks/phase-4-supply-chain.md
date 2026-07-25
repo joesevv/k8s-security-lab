@@ -21,10 +21,16 @@ footnotes:**
    runs with `exit-code: '0'` — report-only, by deliberate choice — so CVE
    findings never block signing. A vulnerable image is still signed and still
    admitted. Anyone reading "signed" as "safe" has misread the control.
-2. **The current two-job workflow has never run.** The signed artifact this lab
-   admits was produced by an earlier single-job version. The `build-scan` /
-   `sign` split, the SHA-pinned actions and the cosign verify self-check are
-   written but unproven until the next push to `app/signed-app/**`.
+2. **The two-job workflow has now run — exactly once.** Run 30174855073
+   (2026-07-25, commit `b8483c5`) was the FIRST execution of the `build-scan` /
+   `sign` split. Both jobs passed, including the cosign verify self-check
+   against the exact identity the cluster policy pins, and it published a new
+   signed digest `sha256:7fd13d22...` which the cluster now admits. One green
+   run proves the shape works; it does not make it battle-tested. Note also
+   that `app/signed-app/**` was byte-identical between the two builds
+   (`git diff 4428b14 b8483c5 -- app/signed-app` is empty) yet the digest
+   changed — this build is **not reproducible**, so a digest match cannot be
+   used as an independent check on the builder.
 
 ---
 
@@ -122,12 +128,19 @@ pins, so a signature the cluster would reject fails the pipeline instead of
 shipping silently. The transcript uploads with `if: always()` — a FAILED verify
 is precisely the case worth keeping.
 
-**Status, plainly: this two-job shape has not yet run in CI.** The image the
-cluster admits today —
-`signed-app:4428b14a...@sha256:b4cb133e...` — was produced by the earlier
-single `build-sign` job. Consequently
-`docs/evidence/phase-4-supply-chain/cosign-verify.txt` does not exist yet; it
-lands there after the first run of the split workflow.
+**Status, plainly: this two-job shape has now run in CI — once.** Run
+30174855073 (2026-07-25, `push` on `main`, head `b8483c5`) was its first
+execution: `build-scan` green in 53s, `sign` green in 10s, every step
+succeeding including `Verify signature (self-check vs the identity Kyverno
+pins)`. It signed a NEW artifact,
+`signed-app:b8483c58...@sha256:7fd13d22...`, and
+`workloads/signed-app/deployment.yaml` has since been repointed at that digest,
+so the image the cluster admits today is the one this two-job workflow built
+and verified. The previous digest `sha256:b4cb133e...`, from the earlier single
+`build-sign` job, is still signed and still present in GHCR; its cosign
+signature tag is the unsigned artifact section 3b attacks. The self-check
+transcript, downloaded from that run's `cosign-verify` artifact, is at
+`docs/evidence/phase-4-supply-chain/cosign-verify.txt`.
 
 **Known gaps, stated rather than hidden:**
 
@@ -192,10 +205,14 @@ kubectl delete -f policies/ --dry-run=client   # deletes nothing; lists targets
 ```
 
 **Local `cosign verify` is not part of this replay** — cosign is not installed
-on the lab host (`command -v cosign` -> exit 1). The only signature verification
-actually demonstrated anywhere in this lab is in-cluster, at admission
-(section 3). The CI self-check in section 1 is written but has never run, so it
-is not evidence yet.
+on the lab host (`command -v cosign` -> exit 1). Signature verification is
+nevertheless demonstrated in two independent places: in-cluster at admission
+(section 3), and in CI by the self-check in section 1, which ran green in run
+30174855073 against the identical certificate-identity and issuer strings the
+`ImageValidatingPolicy` pins. That transcript is evidence, and it is at
+`docs/evidence/phase-4-supply-chain/cosign-verify.txt`. What is still missing
+is a third verification by a party that is neither the producer nor the
+consumer of the signature.
 
 ---
 
@@ -205,33 +222,80 @@ Frame: an attacker can push to, or already has an image sitting at, the trusted
 GHCR path. Registry allow-listing cannot tell that image from ours. Signature
 verification can.
 
-**3a. POSITIVE CONTROL — the signed image is admitted.** Use `--dry-run=server`,
-not a plain apply: an unchanged object reports `unchanged` as a no-op that can
-short-circuit the webhooks. Server dry-run forces the full admission chain and
-changes nothing.
+**3a. POSITIVE CONTROL — the signed image is admitted.** Use SERVER-SIDE apply
+with a dry run (`--server-side --dry-run=server`), NOT a plain
+`--dry-run=server`. An earlier version of this runbook used the plain form and
+claimed it "forces the full admission chain." That was wrong for an UNCHANGED
+object, and the correction is recorded here rather than quietly dropped:
+kubectl diffs client-side first, and with no diff it computes an empty patch
+and sends no write at all. Traced, the only verb it issues is a GET:
 
 ```bash
-kubectl apply -f workloads/signed-app/deployment.yaml --dry-run=server
-# deployment.apps/signed-app unchanged (server dry run)      (exit 0)
+kubectl apply -f workloads/signed-app/deployment.yaml --dry-run=server -v=8 2>&1 \
+  | grep -E 'round_trippers.*"Request" verb' | grep -v openapi
+# I0725 18:04:41.410182 ... "Request" verb="GET"
+#   url="https://127.0.0.1:61949/apis/apps/v1/namespaces/demo/deployments/signed-app"
+# => one GET, no write, so no webhook is ever consulted. Unfiltered, that same
+#    command still reports `deployment.apps/signed-app unchanged (server dry
+#    run)` at exit 0 — a result that proves NOTHING about admission.
+```
+
+Server-side apply is the repeatable check because it always sends the PATCH
+with `dryRun=All` — the request traverses the whole admission chain whether or
+not the object changed, and the apiserver discards the result:
+
+```bash
+kubectl apply -f workloads/signed-app/deployment.yaml \
+  --server-side --dry-run=server --field-manager=evidence-check -v=8 2>&1 \
+  | grep -E 'round_trippers.*"Request" verb' | grep -v openapi
+# "Request" verb="PATCH" url=".../deployments/signed-app?dryRun=All&fieldManager=evidence-check&fieldValidation=Strict&force=false"
+# (three PATCHes, all dryRun=All — a real request, not a client diff)
+
+kubectl apply -f workloads/signed-app/deployment.yaml \
+  --server-side --dry-run=server --field-manager=evidence-check
+# deployment.apps/signed-app serverside-applied (server dry run)      (exit 0)
 
 kubectl -n demo get pod -l app=signed-app -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'
-# ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:b4cb133e03a5c9b5675119...c141e
-# => the running container is the exact digest cosign signed.
+# ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7fd13d22d934f420...3337b
+# => the running container is the exact digest cosign signed in run 30174855073.
 ```
 
-That the flag really exercises the webhook (rather than skipping it) is proven
-by running the SAME flag against the unsigned manifest from 3b — it is denied:
+`--field-manager=evidence-check` is not cosmetic: the live object is owned by
+`kubectl-client-side-apply`, and the default manager makes kubectl try to
+migrate the `last-applied-configuration` annotation, printing a conflict
+warning (non-fatal, still exit 0). A distinct manager keeps the transcript
+clean. The apply is allowed to co-own the fields only because the values it
+sends MATCH the live ones.
+
+That the flag really reaches the signature webhook is proven on the SAME code
+path, not inferred from a different one: re-apply the same Deployment with the
+same flags and only the image swapped for the unsigned artifact of 3b. Same
+object, same PATCH, one variable — and it is denied:
 
 ```bash
-kubectl apply -f docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml \
-  --dry-run=server
-# ... denied the request: Policy require-keyless-signed-ghcr failed: Image must
-# be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+sed 's|^\( *image: \).*$|\1ghcr.io/joesevv/k8s-security-lab/signed-app:sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e|' \
+    workloads/signed-app/deployment.yaml \
+  | kubectl apply -f - --server-side --force-conflicts --dry-run=server \
+      --field-manager=evidence-check
+# Error from server: admission webhook
+# "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr"
+# denied the request: Policy require-keyless-signed-ghcr failed: Image must be
+# cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+# (exit 1)
 ```
 
+`--force-conflicts` is needed here and only here: changing the image claims a
+field `kubectl-client-side-apply` owns, which returns a 409 conflict BEFORE
+admission runs — and a conflict is not a policy verdict. Forcing ownership
+lets the request reach the webhook. It is still a dry run; nothing is
+persisted, and
+`kubectl -n demo get deploy signed-app -o jsonpath='{..image}'` still reports
+the signed `sha256:7fd13d22...` digest afterwards.
+
 **3b. HEADLINE — an image that REALLY EXISTS and has NO signature is denied.**
-The reference is cosign's own signature artifact for the signed app, published
-under the OCI 1.1 referrers-fallback tag `sha256-<digest-of-the-signed-image>`.
+The reference is cosign's own signature artifact for an earlier signed build of
+this app (digest `sha256:b4cb133e...`, still present in GHCR), published under
+the OCI 1.1 referrers-fallback tag `sha256-<digest-of-the-signed-image>`.
 It is a genuine, pullable manifest under the enforced glob — and, being a
 signature itself, nothing ever signed IT. The registry resolves it, so the
 denial can only come from signature verification:
@@ -250,7 +314,10 @@ explicit non-bare tag, not privileged, drops ALL, runAsNonRoot, no privesc,
 readOnlyRootFilesystem, RuntimeDefault seccomp, `automountServiceAccountToken:
 false`), so signature verification is the only gate left that can deny it.
 
-That the reference is real, not a typo — the repo holds exactly two tags:
+That the reference is real, not a typo — the package holds four tags today: two
+per signed build, the image tag and cosign's referrers-fallback signature tag.
+The anonymous token below works because the GHCR package is public in its own
+right; that is independent of the source repo's visibility:
 
 ```bash
 TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:joesevv/k8s-security-lab/signed-app:pull" \
@@ -259,8 +326,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "https://ghcr.io/v2/joesevv/k8s-security-lab/signed-app/tags/list"
 # {"name":"joesevv/k8s-security-lab/signed-app","tags":[
 #   "4428b14a168491f5e67847ef7ec0ac770b899a05",
-#   "sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e"]}
+#   "sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e",
+#   "b8483c5892a16afb16c1a15aaaa35b3c8436dd65",
+#   "sha256-7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b"]}
 ```
+
+The list grows by two tags with every CI run on a new commit, so a replay
+should check that the attack's target tag
+`sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e` is
+present, not that the list has four entries.
 
 **3c. FAIL-CLOSED — a DIFFERENT property, shown separately.** A reference CI
 never built. The policy cannot even attempt verification, and `failurePolicy:
@@ -299,13 +373,20 @@ sed -e 's|^\( *image: \).*$|\1ghcr.io/joesevv/k8s-security-lab/signed-app:sha256
 
 **3e. NEGATIVE CONTROL — nginx is out of glob and unaffected:**
 
+Same server-side form as 3a, for the same reason — a plain `--dry-run=server`
+on this unchanged Deployment would never leave the client:
+
 ```bash
-kubectl apply -f workloads/nginx/deployment.yaml --dry-run=server
-# deployment.apps/nginx unchanged (server dry run)            (exit 0)
+kubectl apply -f workloads/nginx/deployment.yaml \
+  --server-side --dry-run=server --field-manager=evidence-check
+# deployment.apps/nginx serverside-applied (server dry run)   (exit 0)
 kubectl -n demo get pods -l app=nginx
-# nginx-775678cbbd-mmrxb   1/1   Running   0   69m
-# nginx-775678cbbd-q7ddt   1/1   Running   0   69m
+# nginx-775678cbbd-mmrxb   1/1   Running   0   4h34m
+# nginx-775678cbbd-q7ddt   1/1   Running   0   4h34m
 ```
+
+A full server-side admission pass on an out-of-glob image succeeds and both
+replicas keep running: the gate is scoped, not global.
 
 Full verbatim captures, including the post-attack cluster state:
 `docs/evidence/phase-4-supply-chain/attack-output.txt`.

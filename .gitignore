@@ -31,3 +31,6 @@ Thumbs.db
 # Backup / temp files
 *.bak
 *.tmp
+
+# Local planning scratch notes — working docs, deliberately never committed
+NEXT-SESSION-fable-brief.md
