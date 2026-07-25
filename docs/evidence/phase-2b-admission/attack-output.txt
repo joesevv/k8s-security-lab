@@ -1,70 +1,359 @@
-Phase 2b — Kyverno admission control attack demo (captured 2026-07-21)
-Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5
-Kyverno: chart kyverno/kyverno 3.8.2, app v1.18.2
-Policies: 4x policies.kyverno.io/v1 ValidatingPolicy, validationActions [Deny],
-scoped to the demo namespace. Each attack manifest violates exactly ONE policy
-and complies with the other three, so each denial cleanly cites its target
-policy.
+Phase 2b — admission control attack demo (captured 2026-07-25)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5 (client v1.36.1).
+Kyverno: chart kyverno/kyverno 3.8.2, app v1.18.2, namespace kyverno.
+Controls under test: 4x policies.kyverno.io/v1 ValidatingPolicy in policies/,
+plus 1 ImageValidatingPolicy in policies/supply-chain/, all with
+validationActions [Deny]; and the in-tree Pod Security Admission "restricted"
+profile enforced on the demo namespace.
 
-Note: the demo namespace also carries Pod Security Admission warn labels, so
-two attempts additionally print a non-blocking "Warning: would violate
-PodSecurity" line. The BLOCK in every case is the Kyverno admission webhook
-denial ("Error from server: ... vpol.validate.kyverno.svc-fail denied the
-request"), which is why the pod is never created.
+Threat blocked: "a workload that grants itself node-level power at deploy
+time." Privileged containers, mutable :latest tags, un-dropped or added-back
+Linux capabilities, images from unvetted registries, and hostPath mounts of the
+node root are all container-escape or supply-chain footholds. Admission control
+rejects them BEFORE the object is persisted, so there is no running pod to
+detect, evict or forensicate afterwards.
+
+TWO-NAMESPACE DESIGN — read this before the outputs below.
+Pod Security Admission is an in-process API-server plugin and runs BEFORE
+admission webhooks; when PSA enforce rejects a pod it short-circuits and the
+webhook is never called. The demo namespace carries
+pod-security.kubernetes.io/enforce=restricted, so most of these attack pods
+would be stopped by PSA there and the Kyverno denial would never be observable.
+Namespace demo-kyverno-only therefore carries pod-security.kubernetes.io/warn
+ONLY, with no enforce: the same pods reach the webhook, PSA still prints its
+advisory warning, and the Kyverno denial is the thing that actually fails the
+request. So:
+  demo               -> demonstrates the PSA layer (ATTACK I)
+  demo-kyverno-only  -> demonstrates the Kyverno layer (ATTACKS A-H)
+All five policies select both namespaces.
+
+MATCH SCOPE — the policies reach pod controllers through EXPLICIT resourceRules
+(apps/v1 deployments, statefulsets, daemonsets, replicasets; batch/v1 jobs,
+cronjobs) alongside the pods and pods/ephemeralcontainers resources, plus a
+podSpec CEL variable that resolves the three pod-spec shapes. This is NOT
+Kyverno autogen: spec.autogen.podControllers is a NO-OP on Kyverno 1.18.2 and
+was removed rather than left in place implying coverage it did not provide (see
+commit d9d04d0). ATTACKS F, G and H are the tests that the explicit rules work.
+
+SCRATCH COPIES — the four original attack manifests (A-D) pin
+metadata.namespace: demo, so passing -n demo-kyverno-only conflicts with the
+manifest and kubectl refuses. They were copied OUT OF TREE to $SCRATCH with
+only that one line changed, and applied from there. The committed manifests are
+unmodified; the diffs below prove nothing else differs. ATTACKS E-I are applied
+directly from the committed files. For this capture,
+$SCRATCH=/c/Users/josep/AppData/Local/Temp/claude/C--Users-josep-OneDrive-Desktop-fable-stock-team/38c82d31-c662-4058-ae8e-2cfba8282327/scratchpad/ns-swap
 
 ============================================================
-ATTACK A — attack-privileged.yaml (securityContext.privileged: true)
+POSITIVE CONTROL — the controls are live and enforcing, and the two real
+hardened workloads still admit under them. Four ValidatingPolicies at
+[Deny]+READY, and the phase-4 ImageValidatingPolicy READY as well (5 total).
+$ kubectl get validatingpolicy,imagevalidatingpolicy -o custom-columns='KIND:.kind,NAME:.metadata.name,ACTIONS:.spec.validationActions,READY:.status.conditionStatus.ready'
+$ kubectl get ns demo demo-kyverno-only -o custom-columns='NAME:.metadata.name,ENFORCE:.metadata.labels.pod-security\.kubernetes\.io/enforce,ENFORCE-VER:.metadata.labels.pod-security\.kubernetes\.io/enforce-version,WARN:.metadata.labels.pod-security\.kubernetes\.io/warn'
+============================================================
+KIND                    NAME                             ACTIONS   READY
+ValidatingPolicy        disallow-latest-and-bare-tag     [Deny]    true
+ValidatingPolicy        disallow-privileged-containers   [Deny]    true
+ValidatingPolicy        require-drop-all-capabilities    [Deny]    true
+ValidatingPolicy        restrict-registries              [Deny]    true
+ImageValidatingPolicy   require-keyless-signed-ghcr      [Deny]    true
+
+NAME                ENFORCE      ENFORCE-VER   WARN
+demo                restricted   v1.35         restricted
+demo-kyverno-only   <none>       <none>        restricted
+
+READY=true on all five depends on rbac/kyverno-reports-ephemeralcontainers.yaml.
+Adding the pods/ephemeralcontainers subresource to matchConstraints left the
+reports controller without get/list/watch on it, and all five policies sat at
+READY=false — enforcement worked, reporting did not:
+$ kubectl get clusterrole -l 'rbac.kyverno.io/aggregate-to-reports-controller=true' -o name
+clusterrole.rbac.authorization.k8s.io/kyverno:reports-controller:ephemeralcontainers
+
+------------------------------------------------------------
+CAVEAT ON --dry-run=server FOR AN UNCHANGED OBJECT. A client-side
+`kubectl apply --dry-run=server` against an already-applied, unchanged object
+computes an EMPTY patch, and kubectl returns early without sending it — so no
+admission request is made at all. Verified with -v=8: the only request issued
+is a GET. The "unchanged" line below is therefore NOT evidence that any webhook
+admitted anything.
+$ kubectl apply -f workloads/nginx/deployment.yaml --dry-run=server
+deployment.apps/nginx unchanged (server dry run)
+(exit code: 0)
+$ kubectl apply -f workloads/signed-app/deployment.yaml --dry-run=server
+deployment.apps/signed-app unchanged (server dry run)
+(exit code: 0)
+
+$ kubectl apply -f workloads/nginx/deployment.yaml --dry-run=server -v=8 2>&1 | grep -E "round_trippers" | grep -viE "openapi|discovery"
+I0725 14:38:56.269709   29768 round_trippers.go:632] "Response" status="200 OK" headers=<
+I0725 14:38:56.272867   29768 round_trippers.go:632] "Response" status="200 OK" headers=<
+I0725 14:38:56.293096   29768 round_trippers.go:527] "Request" verb="GET" url="https://127.0.0.1:61949/apis/apps/v1/namespaces/demo/deployments/nginx" headers=<
+I0725 14:38:56.296275   29768 round_trippers.go:632] "Response" status="200 OK" headers=<
+
+=> No PATCH, no POST. Server-side apply is used instead below: it always sends
+the PATCH with dryRun=All, which does traverse the webhook chain.
+------------------------------------------------------------
+
+$ kubectl apply -f workloads/nginx/deployment.yaml --server-side --dry-run=server
+Warning: failed to migrate kubectl.kubernetes.io/last-applied-configuration for Server-Side Apply. This is non-fatal and will be retried next time you apply. Error: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .metadata.annotations.kubectl.kubernetes.io/last-applied-configuration
+deployment.apps/nginx serverside-applied (server dry run)
+(exit code: 0)
+
+$ kubectl apply -f workloads/signed-app/deployment.yaml --server-side --dry-run=server
+Warning: failed to migrate kubectl.kubernetes.io/last-applied-configuration for Server-Side Apply. This is non-fatal and will be retried next time you apply. Error: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .metadata.annotations.kubectl.kubernetes.io/last-applied-configuration
+deployment.apps/signed-app serverside-applied (server dry run)
+(exit code: 0)
+
+(The warning is cosmetic and not a policy result: both Deployments were
+originally created with client-side apply, so kubectl cannot migrate the
+last-applied annotation while under a dry run.)
+
+Proof that this exact request path really is evaluated by Kyverno — the SAME
+object (Deployment demo/nginx, so an UPDATE, not a CREATE), same verb, same
+flags, with only the image line swapped to a disallowed registry:
+$ sed 's|image: nginxinc/nginx-unprivileged:.*|image: registry.k8s.io/pause:3.10|' workloads/nginx/deployment.yaml > $SCRATCH/nginx-tampered.yaml
+$ diff workloads/nginx/deployment.yaml $SCRATCH/nginx-tampered.yaml
+34c34
+<           image: nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+---
+>           image: registry.k8s.io/pause:3.10
+
+$ kubectl apply -f $SCRATCH/nginx-tampered.yaml --server-side --dry-run=server
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.
+(exit code: 1)
+
+=> Compliant spec exit 0, tampered spec exit 1 from the webhook, on an
+identical request path. The positive control above is real, not a short-circuit.
+
+$ kubectl get pods -n demo
+NAME                         READY   STATUS    RESTARTS   AGE
+nginx-775678cbbd-mmrxb       1/1     Running   0          72m
+nginx-775678cbbd-q7ddt       1/1     Running   0          72m
+signed-app-c6dcb45d9-qgft2   1/1     Running   0          72m
+
+============================================================
+NAMESPACE-SWAP PROOF for ATTACKS A-D — the applied copies differ from the
+committed manifests in metadata.namespace and in NOTHING else. Modified
+manifests are never applied silently in this lab.
+$ cd docs/evidence/phase-2b-admission
+$ for f in attack-privileged.yaml attack-latest-tag.yaml attack-no-drop-caps.yaml attack-bad-registry.yaml; do diff $f $SCRATCH/$f; done
+============================================================
+$ diff attack-privileged.yaml $SCRATCH/attack-privileged.yaml
+10c10
+<   namespace: demo
+---
+>   namespace: demo-kyverno-only
+(exit code: 1)
+$ diff attack-latest-tag.yaml $SCRATCH/attack-latest-tag.yaml
+8c8
+<   namespace: demo
+---
+>   namespace: demo-kyverno-only
+(exit code: 1)
+$ diff attack-no-drop-caps.yaml $SCRATCH/attack-no-drop-caps.yaml
+9c9
+<   namespace: demo
+---
+>   namespace: demo-kyverno-only
+(exit code: 1)
+$ diff attack-bad-registry.yaml $SCRATCH/attack-bad-registry.yaml
+9c9
+<   namespace: demo
+---
+>   namespace: demo-kyverno-only
+(exit code: 1)
+
+=> One line changed in each. ATTACKS A-D below are run after cd'ing into
+$SCRATCH, which is why the raw error text quotes the bare filename.
+
+============================================================
+ATTACK A — PRIVILEGED CONTAINER. securityContext.privileged: true hands the
+container the full capability set and, in practice, the node. The pod is
+otherwise fully compliant (allowed registry, pinned tag, drops ALL), so the
+denial can only come from disallow-privileged-containers.
+$ cd $SCRATCH
 $ kubectl apply -f attack-privileged.yaml
 ============================================================
 Warning: would violate PodSecurity "restricted:latest": privileged (container "attacker" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "attacker" must set securityContext.allowPrivilegeEscalation=false)
 Error from server: error when creating "attack-privileged.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.
+(exit code: 1 = denied at admission)
+
+(The "Warning: would violate PodSecurity" line is the warn-only PSA label on
+demo-kyverno-only doing its job. It is advisory and blocks nothing; the Error
+line is what failed the request, and it names the Kyverno policy.)
 
 ============================================================
-ATTACK B — attack-latest-tag.yaml (image nginxinc/nginx-unprivileged:latest)
+ATTACK B — MUTABLE :latest TAG. A :latest image can be repointed at new
+content after review, so what was scanned is not necessarily what runs.
+Everything else complies, so only disallow-latest-and-bare-tag can fire.
 $ kubectl apply -f attack-latest-tag.yaml
 ============================================================
 Error from server: error when creating "attack-latest-tag.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-latest-and-bare-tag failed: Images must be pinned to an immutable tag: ':latest' and bare (untagged) images are not allowed for any container (including init and ephemeral containers).
+(exit code: 1 = denied at admission)
+
+(No PSA warning on this one: the pod is restricted-compliant. An image tag is
+not a Pod Security concern at all — this control is Kyverno's alone.)
 
 ============================================================
-ATTACK C — attack-no-drop-caps.yaml (capabilities.drop: [])
+ATTACK C — CAPABILITIES NOT DROPPED. capabilities.drop is an explicit empty
+list, so the container keeps the runtime's default capability set (CHOWN,
+SETUID, SETGID, NET_RAW and friends). Only require-drop-all-capabilities can
+fire.
 $ kubectl apply -f attack-no-drop-caps.yaml
 ============================================================
 Warning: would violate PodSecurity "restricted:latest": unrestricted capabilities (container "attacker" must set securityContext.capabilities.drop=["ALL"])
-Error from server: error when creating "attack-no-drop-caps.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL".
+Error from server: error when creating "attack-no-drop-caps.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.
+(exit code: 1 = denied at admission)
 
 ============================================================
-ATTACK D — attack-bad-registry.yaml (image registry.k8s.io/pause:3.10)
+ATTACK D — UNVETTED REGISTRY. registry.k8s.io is a real, reputable registry
+and the tag is pinned — the point is that it is not on THIS cluster's allow
+list, which is Docker Hub nginxinc/* and curlimages/* plus this lab's own
+ghcr.io/joesevv/k8s-security-lab/* (the phase-4 signed-app path).
 $ kubectl apply -f attack-bad-registry.yaml
 ============================================================
-Error from server: error when creating "attack-bad-registry.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*.
+Error from server: error when creating "attack-bad-registry.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.
+(exit code: 1 = denied at admission)
 
 ============================================================
-POST-ATTACK STATE — none of the attacker pods exist
+ATTACK E — CAPABILITY ADD-BACK (audit finding A1). The most valuable case in
+this set. The container drops ALL and then adds SYS_ADMIN straight back. The
+kernel applies drop before add, so it really runs with CAP_SYS_ADMIN — a
+mount and escape primitive — while a naive "does drop contain ALL?" check
+reads it as compliant. THIS POD WAS PREVIOUSLY ADMITTED (exit 0) by the older
+policy, which only inspected capabilities.drop; that prior result is recorded
+in commit d9d04d0 and was NOT re-run in this capture. The CEL now also
+requires capabilities.add to be empty or absent.
+$ cd /c/Users/josep/k8s-security-lab
+$ kubectl apply -f docs/evidence/phase-2b-admission/attack-add-back-caps.yaml
+============================================================
+Warning: would violate PodSecurity "restricted:latest": unrestricted capabilities (container "attacker" must not include "SYS_ADMIN" in securityContext.capabilities.add)
+Error from server: error when creating "docs/evidence/phase-2b-admission/attack-add-back-caps.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.
+(exit code: 1 = denied at admission)
+
+=> Closed. drop: [ALL] together with add: [SYS_ADMIN] is now denied at apply.
+
+============================================================
+ATTACK F — PRIVILEGED DEPLOYMENT (audit finding A3). The pod template is
+ATTACK A's spec verbatim; only the controller wrapper differs. This is the
+test that the policies see POD CONTROLLERS, not just bare Pods.
+BEFORE THE FIX this returned exit 0 — ADMITTED. kubectl printed
+"deployment.apps/... created" and the operator saw success; the denial surfaced
+only later and invisibly, as a FailedCreate event on the ReplicaSet, when the
+controller tried to create the pod. Adding spec.autogen.podControllers did not
+change that — it is a NO-OP on Kyverno 1.18.2 (status.autogen stayed empty).
+Both prior results are recorded in commit d9d04d0 and were NOT re-run in this
+capture. What fixed it is the explicit apps/v1 resourceRule plus the podSpec
+CEL variable.
+$ kubectl apply -f docs/evidence/phase-2b-admission/attack-privileged-deployment.yaml
+============================================================
+Warning: would violate PodSecurity "restricted:latest": privileged (container "attacker" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "attacker" must set securityContext.allowPrivilegeEscalation=false)
+Error from server: error when creating "docs/evidence/phase-2b-admission/attack-privileged-deployment.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.
+(exit code: 1 = denied at admission)
+
+=> exit 0 (admitted, failing silently in ReplicaSet events) became exit 1 at
+the apply that created it. The operator now finds out at the moment they are
+wrong, not from an event nobody reads.
+
+============================================================
+ATTACK G — PRIVILEGED CRONJOB. A CronJob buries its pod spec one level deeper
+than every other controller (spec.jobTemplate.spec.template.spec). This is the
+test that the jobTemplate branch of the podSpec CEL variable actually executes
+rather than merely parsing. The schedule is "0 0 31 2 *" — 31 February, a
+valid cron expression that can never fire — so even a regression here could not
+launch the privileged Job on its own.
+$ kubectl apply -f docs/evidence/phase-2b-admission/attack-privileged-cronjob.yaml
+============================================================
+Warning: would violate PodSecurity "restricted:latest": privileged (container "attacker" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "attacker" must set securityContext.allowPrivilegeEscalation=false)
+Error from server: error when creating "docs/evidence/phase-2b-admission/attack-privileged-cronjob.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.
+(exit code: 1 = denied at admission)
+
+=> The batch/v1 resourceRule and the jobTemplate CEL branch both fire.
+
+============================================================
+ATTACK H — EPHEMERAL CONTAINER INJECTION (audit finding A3, second half).
+An attacker with pods/ephemeralcontainers rights need not create a pod at all:
+they attach a privileged debug container to an ALREADY-RUNNING compliant pod.
+That request goes to a SUBRESOURCE, so a policy matching only "pods" never
+sees it. matchConstraints now lists pods/ephemeralcontainers explicitly.
+target-pod-for-debug.yaml is NOT an attack — it is a fully compliant pod whose
+only job is to be the injection target.
+$ kubectl apply -f docs/evidence/phase-2b-admission/target-pod-for-debug.yaml
+$ kubectl wait --for=condition=Ready pod/target-pod-for-debug -n demo-kyverno-only --timeout=120s
+============================================================
+pod/target-pod-for-debug created
+(exit code: 0)
+pod/target-pod-for-debug condition met
+(exit code: 0)
+
+$ kubectl get pod target-pod-for-debug -n demo-kyverno-only
+NAME                   READY   STATUS    RESTARTS   AGE
+target-pod-for-debug   1/1     Running   0          1s
+
+The injection. --profile=sysadmin is what sets privileged: true on the injected
+container; the image itself is from an allowed registry and pinned, so the
+image policies are deliberately not what fires here:
+$ kubectl debug -n demo-kyverno-only target-pod-for-debug --image=curlimages/curl:8.11.1 --target=target --profile=sysadmin --container=attacker-ephemeral -- sleep 3600
+Targeting container "target". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
+Warning: would violate PodSecurity "restricted:latest": privileged (container "attacker-ephemeral" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "attacker-ephemeral" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "attacker-ephemeral" must set securityContext.capabilities.drop=["ALL"])
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.; Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.
+(exit code: 1 = denied at admission)
+
+Nothing was attached to the still-running pod:
+$ kubectl get pod target-pod-for-debug -n demo-kyverno-only -o jsonpath='{.spec.ephemeralContainers}'
+(empty — no ephemeral container was ever added)
+
+Teardown of the target:
+$ kubectl delete -f docs/evidence/phase-2b-admission/target-pod-for-debug.yaml
+pod "target-pod-for-debug" deleted from demo-kyverno-only namespace
+(exit code: 0)
+
+=> Two policies fired on a subresource request. Before pods/ephemeralcontainers
+was in matchConstraints, kubectl debug never reached Kyverno at all.
+
+============================================================
+ATTACK I — hostPath / AND runAsUser 0, IN NAMESPACE demo.
+THE BLOCKER HERE IS POD SECURITY ADMISSION, NOT KYVERNO. This is the honest
+division of labour: NO ValidatingPolicy in policies/ covers hostPath, hostPID,
+hostNetwork, hostIPC or runAsUser. That gap is real, and PSA
+enforce=restricted on the demo namespace is the control that closes it. The
+error below says "PodSecurity" and names no Kyverno policy.
+$ kubectl apply -f docs/evidence/phase-2b-admission/attack-hostpath-root.yaml
+============================================================
+Error from server (Forbidden): error when creating "docs/evidence/phase-2b-admission/attack-hostpath-root.yaml": pods "attack-hostpath-root" is forbidden: violates PodSecurity "restricted:v1.35": restricted volume types (volume "node-root" uses restricted volume type "hostPath"), runAsNonRoot != true (pod must not set securityContext.runAsNonRoot=false), runAsUser=0 (pod must not set runAsUser=0)
+(exit code: 1 = denied at admission)
+
+Now the counter-proof, and it is deliberately unflattering. The SAME pod in
+demo-kyverno-only, which has PSA warn but no enforce, is ADMITTED: Kyverno
+inspects it and has nothing to say. Server dry run, so nothing is created:
+$ sed 's/^  namespace: demo$/  namespace: demo-kyverno-only/' docs/evidence/phase-2b-admission/attack-hostpath-root.yaml > $SCRATCH/attack-hostpath-root.yaml
+$ cd $SCRATCH
+$ kubectl apply -f attack-hostpath-root.yaml --dry-run=server
+Warning: would violate PodSecurity "restricted:latest": restricted volume types (volume "node-root" uses restricted volume type "hostPath"), runAsNonRoot != true (pod must not set securityContext.runAsNonRoot=false), runAsUser=0 (pod must not set runAsUser=0)
+pod/attack-hostpath-root created (server dry run)
+(exit code: 0)
+
+=> Kyverno alone does NOT stop a node-root hostPath mount. PSA does. The two
+layers are complementary and no writeup should claim otherwise. The
+workload-bearing namespace (demo) runs both; demo-kyverno-only runs one, which
+is exactly why it is a demo namespace and never carries real workloads.
+
+============================================================
+POST-ATTACK STATE — nine attack applies, zero attacker-created objects. The
+real workloads are untouched and were never restarted by any of this.
+$ kubectl get pods,deploy,rs,job,cronjob -n demo-kyverno-only
 $ kubectl get pods -n demo
 ============================================================
-NAME                     READY   STATUS    RESTARTS   AGE
-nginx-6d4cf656c9-8fkgn   1/1     Running   0          2m59s
-nginx-6d4cf656c9-t79g6   1/1     Running   0          3m
+No resources found in demo-kyverno-only namespace.
+(exit code: 0)
 
-============================================================
-POSITIVE CONTROL — the compliant nginx admits under Enforce ([Deny])
-Captured during the Audit->Deny flip, immediately after all four policies
-were switched to validationActions [Deny]:
-$ kubectl get validatingpolicy -o custom-columns='NAME:.metadata.name,ACTIONS:.spec.validationActions,READY:.status.conditionStatus.ready'
-$ kubectl rollout restart deploy/nginx -n demo && kubectl rollout status deploy/nginx -n demo --timeout=180s
-============================================================
-NAME                             ACTIONS   READY
-disallow-latest-and-bare-tag     [Deny]    true
-disallow-privileged-containers   [Deny]    true
-require-drop-all-capabilities    [Deny]    true
-restrict-registries              [Deny]    true
-deployment.apps/nginx restarted
-Waiting for deployment "nginx" rollout to finish: 1 out of 2 new replicas have been updated...
-Waiting for deployment "nginx" rollout to finish: 1 old replicas are pending termination...
-deployment "nginx" successfully rolled out
+NAME                         READY   STATUS    RESTARTS   AGE
+nginx-775678cbbd-mmrxb       1/1     Running   0          72m
+nginx-775678cbbd-q7ddt       1/1     Running   0          72m
+signed-app-c6dcb45d9-qgft2   1/1     Running   0          72m
+(exit code: 0)
 
-Earlier, under [Audit], the same rollout also succeeded and the per-pod
-Kyverno PolicyReports showed pass=4 fail=0 error=0 for both nginx pods,
-proving the compliant workload passes all four rules (including the registry
-allow-list against the literal image string
-nginxinc/nginx-unprivileged:1.29.8-alpine) before enforcement was enabled.
+=> demo-kyverno-only is empty: no Pod, no Deployment, no ReplicaSet, no Job,
+no CronJob. Nothing partially succeeded — an admission denial happens before
+persistence, so there is no half-created object and no ReplicaSet quietly
+retrying in the background. In demo, nginx x2 and signed-app are the only
+pods, still Running with 0 restarts at the age they had before this demo
+started.
