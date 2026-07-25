@@ -1,0 +1,107 @@
+# Phase 4 — supply-chain: admit ONLY cosign keyless-signed images published by
+# this repo's GitHub Actions workflow. Any image under
+# ghcr.io/joesevv/k8s-security-lab/* must carry a Sigstore keyless signature
+# whose Fulcio certificate identity was issued to the pinned OIDC subject
+# (this repo's workflow on refs/heads/main) by GitHub's Actions OIDC issuer, and
+# whose entry is present in the Rekor transparency log.
+#
+# WHY keyless (not key-based): keyless removes the long-lived private key that a
+# key-based cosign attestor would force us to mint, store and rotate. Identity
+# is bound to the workflow's short-lived OIDC token + Fulcio cert + Rekor tlog
+# instead of a secret we have to guard. This also sidesteps the key-based
+# ImageValidatingPolicy limitation tracked upstream in Kyverno #16435.
+#
+# WHY THIS FILE LIVES IN policies/supply-chain/: runbooks/phase-2b-admission.md
+# drives its Audit/Deny loop with `for f in policies/*.yaml` and tears down with
+# a non-recursive `kubectl delete -f policies/`. Both globs are shallow, so
+# keeping this phase-4 policy one directory down stops the phase-2b commands
+# from silently picking it up and flipping or deleting signature enforcement.
+#
+# SCOPE: demo + demo-kyverno-only namespaces (deliberate lab choice, matches the
+# phase-2b ValidatingPolicies) and ONLY images matching the ghcr glob below —
+# Docker Hub nginxinc/* and curlimages/* are intentionally NOT matched here so
+# the lab's existing workloads are never asked to prove a signature they lack.
+#
+# COVERAGE: bare Pods, the pods/ephemeralcontainers subresource, AND pod
+# controllers directly (apps/v1 deployments, statefulsets, daemonsets,
+# replicasets; batch/v1 jobs, cronjobs) — via the explicit resourceRules below,
+# NOT via Kyverno autogen. `spec.autogen.podControllers` is a NO-OP on Kyverno
+# 1.18.2 (status.autogen stays `{}`), so the autogen block was removed.
+# Unlike the phase-2b ValidatingPolicies this policy needs no pod-spec shape
+# resolution: it reads Kyverno's `images.*` variables, which the engine already
+# extracts from whichever pod template the matched resource carries. Verified
+# on-cluster: a Deployment referencing an existing-but-unsigned manifest under
+# the enforced glob is denied at `kubectl apply` (exit 1) with
+# "Policy require-keyless-signed-ghcr failed: Image must be cosign
+# keyless-signed by the k8s-security-lab GitHub Actions workflow.", while
+# workloads/signed-app/deployment.yaml (the real signed digest) still applies at
+# exit 0 — i.e. signature verification genuinely runs on the Deployment path.
+#
+# PINNED IDENTITY: issuer https://token.actions.githubusercontent.com and an
+# EXACT subject string — no regex. The previous version used a subjectRegExp
+# whose workflow-filename segment was '.+':
+#   ^https://github\.com/joesevv/k8s-security-lab/\.github/workflows/.+@refs/heads/main$
+# RE2's '.' matches any character except newline, which includes '@' and '/', so
+# that pattern was far looser than it read. A branch literally named
+# 'evil@refs/heads/main' produces the subject
+#   https://github.com/joesevv/k8s-security-lab/.github/workflows/x.yml@refs/heads/evil@refs/heads/main
+# which the '.+' happily absorbs and the '$' anchor still matches — a non-main
+# ref satisfying a pattern meant to pin main. Any workflow file in the repo also
+# matched. Pinning the literal subject below removes that class of match
+# entirely: exactly one workflow file on exactly one ref can satisfy it.
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: require-keyless-signed-ghcr
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  webhookConfiguration:
+    timeoutSeconds: 30
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: ['v1']
+        operations: ['CREATE', 'UPDATE']
+        resources: ["pods", "pods/ephemeralcontainers"]
+      - apiGroups: ['apps']
+        apiVersions: ['v1']
+        operations: ['CREATE', 'UPDATE']
+        resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+      - apiGroups: ['batch']
+        apiVersions: ['v1']
+        operations: ['CREATE', 'UPDATE']
+        resources: ["jobs", "cronjobs"]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [demo, demo-kyverno-only]
+  matchImageReferences:
+    - glob: 'ghcr.io/joesevv/k8s-security-lab/*'
+  attestors:
+    - name: ghcrKeyless
+      cosign:
+        keyless:
+          identities:
+            - issuer: 'https://token.actions.githubusercontent.com'
+              subject: 'https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main'
+        ctlog:
+          url: 'https://rekor.sigstore.dev'
+          insecureIgnoreTlog: false
+          insecureIgnoreSCT: false
+  validationConfigurations:
+    verifyDigest: true
+    mutateDigest: true
+    required: true
+  validations:
+    - expression: >-
+        (images.containers +
+         images.?initContainers.orValue([]) +
+         images.?ephemeralContainers.orValue([]))
+        .map(image, verifyImageSignatures(image, [attestors.ghcrKeyless]))
+        .all(count, count > 0)
+      message: 'Image must be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.'

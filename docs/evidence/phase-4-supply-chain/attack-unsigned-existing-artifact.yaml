@@ -1,0 +1,54 @@
+# Phase 4 attack (HEADLINE) — an image that REALLY EXISTS in the registry and
+# really has NO signature of its own. The reference is cosign's own signature
+# artifact for the signed app, published by the supply-chain workflow under the
+# OCI 1.1 referrers-fallback tag `sha256-<digest-of-the-signed-image>`. It is a
+# genuine, pullable manifest under the enforced glob
+# (ghcr.io/joesevv/k8s-security-lab/*) — and, being a signature itself, nothing
+# ever signed IT. So the denial below is the POLICY's own verdict on a
+# resolvable image, not a registry 404.
+#
+# This Pod is deliberately made FULLY COMPLIANT with every phase-2b policy so it
+# isolates the supply-chain control:
+#   - restrict-registries: ghcr.io/joesevv/k8s-security-lab/* is allow-listed.
+#   - disallow-latest-and-bare-tag: uses an explicit, non-bare tag
+#     ':sha256-b4cb133e...c141e' (a real tag, not the ':latest' default).
+#   - disallow-privileged-containers: not privileged.
+#   - require-drop-all-capabilities: drops ALL capabilities.
+# It also uses the restricted securityContext (runAsNonRoot, no privesc,
+# readOnlyRootFilesystem, RuntimeDefault seccomp). Therefore the ONLY reason it
+# can be denied is that require-keyless-signed-ghcr found no cosign keyless
+# signature for this image.
+#
+# Contrast with attack-unsigned-image.yaml in this directory, which references a
+# tag that was never built: that one proves the policy FAILS CLOSED when an
+# image cannot be resolved at all. Different property, weaker claim.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-unsigned-existing-artifact
+  namespace: demo
+  labels:
+    app: attack-unsigned-existing-artifact
+    role: supply-chain-demo
+spec:
+  restartPolicy: Never
+  # Use the namespace default SA (like the phase-2b attack pods) so a missing
+  # ServiceAccount can never be the reason for denial — isolating the signature.
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      # The cosign signature artifact for
+      # signed-app@sha256:b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e.
+      # Exists in GHCR, is under the enforced glob, and is itself unsigned.
+      image: ghcr.io/joesevv/k8s-security-lab/signed-app:sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

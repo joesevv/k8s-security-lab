@@ -1,0 +1,218 @@
+Phase 4 — supply-chain image-signing attack demo (captured 2026-07-25)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5.
+Admission controller: Kyverno v1.18.2 (reg.kyverno.io/kyverno/kyverno:v1.18.2).
+Policy: ImageValidatingPolicy require-keyless-signed-ghcr
+(policies/supply-chain/require-signed-images.yaml), validationActions [Deny],
+failurePolicy Fail, matching images under the glob
+ghcr.io/joesevv/k8s-security-lab/* in namespaces demo + demo-kyverno-only, on
+pods, pods/ephemeralcontainers, apps/v1 workloads and batch/v1 jobs.
+
+Threat blocked: "an attacker runs an image this project never built." Registry
+allow-listing (phase 2b) only proves WHERE an image came from, not WHO built
+it — anyone with push access to the org, or a compromised CI step, can put a
+tampered image at a trusted path. A cosign keyless signature binds the image
+DIGEST to the OIDC identity of one specific GitHub Actions workflow on one
+specific ref, recorded in the Rekor transparency log. Kyverno verifies that
+signature at admission, so an image that did not pass through the trusted
+producer never runs.
+
+SCOPE OF THE CLAIM: a signature attests PROVENANCE, not safety. It proves who
+built the bytes and that they have not changed since. It says nothing about
+CVEs — Trivy runs report-only in CI (exit-code 0), so a vulnerable image is
+still signed and still admitted. See runbooks/phase-4-supply-chain.md.
+
+The trusted artifact under test:
+ghcr.io/joesevv/k8s-security-lab/signed-app
+  :4428b14a168491f5e67847ef7ec0ac770b899a05
+  @sha256:b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e
+
+============================================================
+1) POSITIVE CONTROL — the SIGNED image is admitted. Server-side dry-run is used
+deliberately: a plain `kubectl apply` on an unchanged object is a no-op that can
+report "unchanged" without the mutating/validating webhooks ever weighing in.
+`--dry-run=server` forces the request through the full admission chain,
+including the signature webhook, and changes nothing.
+$ kubectl apply -f workloads/signed-app/deployment.yaml --dry-run=server
+============================================================
+deployment.apps/signed-app unchanged (server dry run)
+(exit code: 0)
+
+Methodology proof — `--dry-run=server` really does invoke the signature webhook,
+so the exit 0 above is a genuine admission pass and not a skipped check. The
+SAME flag on the unsigned attack manifest is denied by that same webhook:
+
+$ kubectl apply -f docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml --dry-run=server
+Error from server: error when creating "docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml": admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr failed: Image must be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+(exit code: 1)
+
+The workload it corresponds to is live, and the running container resolves to
+the exact digest cosign signed:
+
+$ kubectl -n demo get pods -l app=signed-app -o wide
+NAME                         READY   STATUS    RESTARTS   AGE   IP            NODE             NOMINATED NODE   READINESS GATES
+signed-app-c6dcb45d9-qgft2   1/1     Running   0          68m   10.244.2.11   seclab-worker2   <none>           <none>
+
+$ kubectl -n demo get pod -l app=signed-app -o jsonpath='{.items[*].spec.containers[*].image}'
+ghcr.io/joesevv/k8s-security-lab/signed-app:4428b14a168491f5e67847ef7ec0ac770b899a05@sha256:b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e
+
+$ kubectl -n demo get pod -l app=signed-app -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'
+ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e
+
+=> the gate is not "deny everything": a correctly signed image passes admission
+and runs, pinned to the signed digest.
+
+============================================================
+2) HEADLINE — an image that REALLY EXISTS and really has NO signature is DENIED,
+by the POLICY's own verdict. The reference is cosign's own signature artifact
+for the signed app, published by the same workflow under the OCI 1.1
+referrers-fallback tag sha256-<digest-of-the-signed-image>. It is a genuine,
+pullable manifest sitting under the enforced glob — and, being a signature
+itself, nothing ever signed IT. That makes it the strongest available negative:
+the registry resolves it fine, so the denial can only come from signature
+verification.
+$ kubectl apply -f docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml
+============================================================
+Error from server: error when creating "docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml": admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr failed: Image must be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+(exit code: 1)
+
+Proof the reference is real, not a typo — the repo has exactly two tags, and the
+second one is the artifact this Pod points at (anonymous pull; the GHCR package
+is public):
+
+$ TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:joesevv/k8s-security-lab/signed-app:pull" | sed -E 's/.*"token":"([^"]+)".*/\1/')
+$ curl -s -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/joesevv/k8s-security-lab/signed-app/tags/list"
+{"name":"joesevv/k8s-security-lab/signed-app","tags":["4428b14a168491f5e67847ef7ec0ac770b899a05","sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e"]}
+
+$ curl -s -w "\nHTTP %{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+    "https://ghcr.io/v2/joesevv/k8s-security-lab/signed-app/manifests/sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e"
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":890,"digest":"sha256:f952e8954e48ed3d5315ad1a8ee9d40b6c690753c2d1aeddb83a92de1ef6d024","artifactType":"application/vnd.oci.empty.v1+json"}]}
+HTTP 200
+
+(HTTP 200 = the manifest resolves. artifactType application/vnd.oci.empty.v1+json
+is the Sigstore bundle layout cosign v3 uses, so there is no legacy
+'sha256-<digest>.sig' tag in this repo — the fallback tag above IS the
+signature.)
+
+The attacker Pod is fully compliant with every OTHER control — allow-listed
+registry, explicit non-bare tag, not privileged, drops ALL capabilities,
+runAsNonRoot, no privilege escalation, readOnlyRootFilesystem, RuntimeDefault
+seccomp, automountServiceAccountToken false — so signature verification is the
+only thing left that can deny it.
+
+=> DENIED with the policy's own message. Not a 404, not a securityContext
+violation: the image resolved and its signature did not verify.
+
+============================================================
+3) FAIL-CLOSED (a DIFFERENT property, not signature verification) — a reference
+CI never built. The ':unsigned' tag does not exist, so the policy cannot even
+attempt verification. With failurePolicy: Fail the request is DENIED rather than
+admitted-by-default. This is worth showing, but it is NOT the signature proof:
+the message below is a registry 404 surfaced through the webhook.
+$ kubectl apply -f docs/evidence/phase-4-supply-chain/attack-unsigned-image.yaml
+============================================================
+Error from server: error when creating "docs/evidence/phase-4-supply-chain/attack-unsigned-image.yaml": admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr error: failed to evaluate policy: GET https://ghcr.io/v2/joesevv/k8s-security-lab/signed-app/manifests/unsigned: MANIFEST_UNKNOWN: manifest unknown
+(exit code: 1)
+
+=> note the wording: "error: failed to evaluate policy" + MANIFEST_UNKNOWN, vs
+case 2's "failed: Image must be cosign keyless-signed". Different mechanism,
+same outcome. A skeptic is right to discount this one on its own; case 2 is the
+one that proves the gate.
+
+============================================================
+4) CONTROLLER PATH — the same unsigned artifact is denied in a DEPLOYMENT, not
+just a bare Pod. Enforcement on apps/v1 rests on hand-written resourceRules, not
+on Kyverno autogen (the live policy has no spec.autogen and status.autogen is
+{}), so it is proven separately rather than assumed. The manifest is the REAL
+signed-app Deployment with only the image (and its name/labels) rewritten —
+every other field is byte-identical to the workload that passes in case 1, so
+the image reference is the sole variable.
+$ sed -e 's|^\( *image: \).*$|\1ghcr.io/joesevv/k8s-security-lab/signed-app:sha256-b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e|' \
+      -e 's|signed-app$|attack-unsigned-deploy|' \
+      workloads/signed-app/deployment.yaml | kubectl apply -f -
+============================================================
+Error from server: error when creating "STDIN": admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr failed: Image must be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+(exit code: 1)
+
+=> denied at `kubectl apply`, before any ReplicaSet or Pod is created. The
+attacker never gets a pod-creation attempt to retry.
+
+============================================================
+5) NEGATIVE CONTROL — the nginx workload is deliberately NOT matched by the
+signature policy and is unaffected. matchImageReferences is a single glob,
+ghcr.io/joesevv/k8s-security-lab/*, so a Docker Hub image is never asked to
+prove a signature it does not have. This is a scoping choice, not a loophole:
+nginx is still bound by the four phase-2b Deny policies.
+$ kubectl apply -f workloads/nginx/deployment.yaml --dry-run=server
+$ kubectl -n demo get pods -l app=nginx
+============================================================
+deployment.apps/nginx unchanged (server dry run)
+(exit code: 0)
+
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-775678cbbd-mmrxb   1/1     Running   0          69m
+nginx-775678cbbd-q7ddt   1/1     Running   0          69m
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{..image}'
+nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+
+=> a full server-side admission pass on an out-of-glob image succeeds, and both
+replicas keep running. The gate is scoped, not global.
+
+============================================================
+6) POST-ATTACK STATE — every attack above was rejected at admission, so there is
+nothing to clean up: no attacker Pod, ReplicaSet or Deployment was ever created.
+$ kubectl -n demo get pods -l role=supply-chain-demo
+$ kubectl get pods,deploy -n demo
+$ kubectl get pods,deploy -n demo-kyverno-only
+============================================================
+$ kubectl -n demo get pods -l role=supply-chain-demo
+No resources found in demo namespace.
+(exit code: 0 — the label both attack Pods carry matches nothing)
+
+$ kubectl get pods,deploy -n demo
+NAME                             READY   STATUS    RESTARTS   AGE
+pod/nginx-775678cbbd-mmrxb       1/1     Running   0          72m
+pod/nginx-775678cbbd-q7ddt       1/1     Running   0          72m
+pod/signed-app-c6dcb45d9-qgft2   1/1     Running   0          72m
+
+NAME                         READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nginx        2/2     2            2           4d7h
+deployment.apps/signed-app   1/1     1            1           22h
+
+$ kubectl get pods,deploy -n demo-kyverno-only
+No resources found in demo-kyverno-only namespace.
+
+$ kubectl get pods -A | grep -iE "attack"
+(exit code: 1 = no match, cluster-wide)
+
+============================================================
+POLICY STATE — the enforcing object, and the identity it pins.
+$ kubectl get imagevalidatingpolicy require-keyless-signed-ghcr
+$ kubectl get imagevalidatingpolicy require-keyless-signed-ghcr -o jsonpath='{.spec.attestors[0].cosign.keyless.identities}'
+============================================================
+NAME                          AGE   READY
+require-keyless-signed-ghcr   24h   true
+
+[{"issuer":"https://token.actions.githubusercontent.com","subject":"https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main"}]
+
+The subject is an EXACT string, not a regex: exactly one workflow file on
+exactly one ref can produce a signature this cluster accepts.
+
+============================================================
+NOT PROVEN HERE — stated so the evidence above is not read as more than it is.
+============================================================
+- cosign is NOT installed on this host, so no local `cosign verify` transcript
+  is part of this capture. The ONLY verification demonstrated here is in-cluster,
+  at admission (cases 1, 2, 4). The workflow's own `cosign verify` self-check is
+  written but has never executed — see the next bullet — so it proves nothing
+  yet.
+- The two-job (build-scan || sign) shape of .github/workflows/supply-chain.yml
+  has NOT yet run. The signed artifact under test was produced by the earlier
+  single-job version of the workflow. The split, the SHA-pinned actions and the
+  cosign verify self-check are unproven until the next run, and
+  docs/evidence/phase-4-supply-chain/cosign-verify.txt does not exist yet.
+- Trivy runs report-only (exit-code: '0'). No CVE finding has ever blocked a
+  signature. Provenance != absence of vulnerabilities.
+- The SBOM is uploaded as a CI artifact only. It is not a cosign attestation
+  bound to the image digest, so no admission policy can verify it. Known gap.

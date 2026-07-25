@@ -1,0 +1,50 @@
+# Phase 4 attack (FAIL-CLOSED case, NOT the headline) — a reference under the
+# enforced ghcr glob (ghcr.io/joesevv/k8s-security-lab/*) that CI never built.
+# The ':unsigned' tag does not exist in the registry, so this demonstrates a
+# DIFFERENT property from signature verification: when the policy cannot resolve
+# the image at all, it fails CLOSED (failurePolicy: Fail) and the Pod is denied
+# rather than admitted-by-default. The denial is a registry MANIFEST_UNKNOWN
+# surfaced through the webhook, not the policy's signature verdict.
+#
+# For the signature verdict itself see attack-unsigned-existing-artifact.yaml in
+# this directory: it references an image that REALLY EXISTS and really has no
+# signature, so the denial there is the policy's own
+# "must be cosign keyless-signed" message.
+#
+# This Pod is deliberately made FULLY COMPLIANT with every phase-2b policy so it
+# isolates the supply-chain control:
+#   - restrict-registries: ghcr.io/joesevv/k8s-security-lab/* is allow-listed.
+#   - disallow-latest-and-bare-tag: uses an explicit non-bare tag ':unsigned'.
+#   - disallow-privileged-containers: not privileged.
+#   - require-drop-all-capabilities: drops ALL capabilities.
+# It also uses the restricted securityContext (runAsNonRoot, no privesc,
+# readOnlyRootFilesystem, RuntimeDefault seccomp). Therefore the ONLY policy that
+# can deny it is require-keyless-signed-ghcr — and it does, by refusing to admit
+# an image whose signature it could not even attempt to check.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-unsigned-image
+  namespace: demo
+  labels:
+    app: attack-unsigned-image
+    role: supply-chain-demo
+spec:
+  restartPolicy: Never
+  # Use the namespace default SA (like the phase-2b attack pods) so a missing
+  # ServiceAccount can never be the reason for denial — isolating the signature.
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: ghcr.io/joesevv/k8s-security-lab/signed-app:unsigned
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

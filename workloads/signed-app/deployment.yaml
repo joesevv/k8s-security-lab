@@ -1,0 +1,70 @@
+# Phase 4 — the lab's own workload, published to ghcr.io/joesevv/k8s-security-lab
+# and admitted only if its cosign keyless signature verifies against the
+# require-keyless-signed-ghcr ImageValidatingPolicy. Mirrors the nginx workload's
+# restricted securityContext so signature enforcement is the ONLY new gate here.
+#
+# The image is pinned as tag@sha256:digest: the tag is the CI commit SHA and the
+# digest is the exact artifact the supply-chain workflow built, scanned, SBOM'd
+# and cosign keyless-signed (CI run on commit 4428b14). Kyverno's
+# require-keyless-signed-ghcr policy verifies that signature at admission.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signed-app
+  namespace: demo
+  labels:
+    app: signed-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signed-app
+  template:
+    metadata:
+      labels:
+        app: signed-app
+    spec:
+      # Dedicated least-privilege identity. Combined with the SA's
+      # automountServiceAccountToken: false, no API token is projected into the
+      # pod — the signed app needs no cluster access.
+      serviceAccountName: signed-app-sa
+      # Pod-level security context. runAsNonRoot + RuntimeDefault seccomp satisfy
+      # the restricted profile the phase-2b Kyverno policies enforce.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: signed-app
+          # Pinned by digest for immutability — the exact image bytes cannot
+          # drift, and the digest is what cosign verification is anchored to.
+          # tag@digest: tag = CI commit SHA, digest = the signed artifact. The
+          # digest is what cosign signed and what Kyverno verifies at admission.
+          image: ghcr.io/joesevv/k8s-security-lab/signed-app:4428b14a168491f5e67847ef7ec0ac770b899a05@sha256:b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          # readOnlyRootFilesystem is on, so give the app a writable emptyDir for
+          # scratch/tmp, mirroring the nginx workload.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
