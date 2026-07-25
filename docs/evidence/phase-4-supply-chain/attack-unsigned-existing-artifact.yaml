@@ -7,6 +7,14 @@
 # ever signed IT. So the denial below is the POLICY's own verdict on a
 # resolvable image, not a registry 404.
 #
+# NOTE: this targets the signature artifact of the PREVIOUS signed image
+# (sha256:b4cb133e...), not the one the cluster currently runs. That is
+# deliberate and still correct: GHCR retains the old image and its signature, so
+# the tag below still resolves (HTTP 200) and is still itself unsigned — exactly
+# the "exists but has no signature" condition the test needs. Re-pointing it at
+# the current image's signature artifact would prove the same thing while
+# silently rewriting what the captured evidence describes.
+#
 # This Pod is deliberately made FULLY COMPLIANT with every phase-2b policy so it
 # isolates the supply-chain control:
 #   - restrict-registries: ghcr.io/joesevv/k8s-security-lab/* is allow-listed.

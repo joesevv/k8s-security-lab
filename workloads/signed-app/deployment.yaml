@@ -5,8 +5,15 @@
 #
 # The image is pinned as tag@sha256:digest: the tag is the CI commit SHA and the
 # digest is the exact artifact the supply-chain workflow built, scanned, SBOM'd
-# and cosign keyless-signed (CI run on commit 4428b14). Kyverno's
-# require-keyless-signed-ghcr policy verifies that signature at admission.
+# and cosign keyless-signed (CI run on commit b8483c5 — the FIRST execution of
+# the two-job build-scan || sign split, whose sign job ran `cosign verify`
+# against the very identity Kyverno pins and passed. That verify runs AFTER the
+# image and its signature are already in GHCR, so it gates nothing: it is a
+# post-publication self-check that FAILS THE PIPELINE, which stops a signature
+# the cluster would reject from shipping silently green — it does not stop one
+# from being published).
+# Kyverno's require-keyless-signed-ghcr policy verifies that signature again at
+# admission.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,7 +47,7 @@ spec:
           # drift, and the digest is what cosign verification is anchored to.
           # tag@digest: tag = CI commit SHA, digest = the signed artifact. The
           # digest is what cosign signed and what Kyverno verifies at admission.
-          image: ghcr.io/joesevv/k8s-security-lab/signed-app:4428b14a168491f5e67847ef7ec0ac770b899a05@sha256:b4cb133e03a5c9b567511956055f668267425aa391d2797d1783d2c83b7c141e
+          image: ghcr.io/joesevv/k8s-security-lab/signed-app:b8483c5892a16afb16c1a15aaaa35b3c8436dd65@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
           ports:
             - name: http
               containerPort: 8080
