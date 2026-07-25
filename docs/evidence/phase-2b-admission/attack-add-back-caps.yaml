@@ -1,0 +1,35 @@
+# Violates ONLY require-drop-all-capabilities: drops ALL but immediately adds
+# SYS_ADMIN back. The kernel applies drop before add, so this container really
+# runs with CAP_SYS_ADMIN — a drop-only check would have passed it.
+# Otherwise compliant — allowed registry (curlimages/*), pinned tag, not
+# privileged, restricted securityContext.
+# Namespace demo-kyverno-only: the demo namespace enforces the restricted Pod
+# Security profile, and PSA runs before admission webhooks, so PSA would reject
+# this pod first and the Kyverno denial would never be observable.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-add-back-caps
+  namespace: demo-kyverno-only
+  labels:
+    app: attack-add-back-caps
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+          add:
+            - SYS_ADMIN

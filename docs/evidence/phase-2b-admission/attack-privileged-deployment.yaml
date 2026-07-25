@@ -1,0 +1,60 @@
+# Violates ONLY disallow-privileged-containers: privileged: true.
+# Otherwise compliant — allowed registry (curlimages/*), pinned tag, drops ALL.
+# The pod template below is the attack-privileged.yaml pod spec verbatim; the
+# only difference is the wrapper. This manifest exists to prove the policies
+# cover pod controllers, not just bare Pods. Two earlier states both FAILED it:
+#   1. resourceRules listing only the pods resource — this Deployment was
+#      ADMITTED (exit 0) and the denial surfaced late and invisibly in the
+#      ReplicaSet's events instead of at kubectl apply.
+#   2. adding spec.autogen.podControllers — SAME RESULT, still exit 0.
+#      spec.autogen is a NO-OP on Kyverno 1.18.2: status.autogen stays `{}`.
+# What actually works, and what the policies now use, is explicit apps/v1 and
+# batch/v1 resourceRules plus a `podSpec` CEL variable that resolves the three
+# pod-spec shapes. Under that, this manifest is denied at exit 1 by
+# disallow-privileged-containers.
+# NOTE: allowPrivilegeEscalation is deliberately omitted; the API server
+# rejects privileged=true combined with allowPrivilegeEscalation=false, and
+# this manifest must reach the Kyverno webhook to demonstrate the denial.
+# NOTE: restartPolicy: Never is also omitted even though the sibling attack Pods
+# set it — a Deployment pod template only accepts restartPolicy: Always, and the
+# API server rejects "Never" during schema validation, which happens BEFORE
+# admission webhooks. Leaving it in produced
+#   spec.template.spec.restartPolicy: Unsupported value: "Never"
+# (verified on-cluster), i.e. a denial from the wrong control.
+# Namespace demo-kyverno-only: the demo namespace enforces the restricted Pod
+# Security profile, and PSA runs before admission webhooks, so PSA would reject
+# this workload first and the Kyverno denial would never be observable.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attack-privileged-deployment
+  namespace: demo-kyverno-only
+  labels:
+    app: attack-privileged-deployment
+    role: admission-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: attack-privileged-deployment
+  template:
+    metadata:
+      labels:
+        app: attack-privileged-deployment
+        role: admission-demo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: attacker
+          image: curlimages/curl:8.11.1
+          command: ["sleep", "3600"]
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

@@ -1,0 +1,48 @@
+# Phase 2b — grant Kyverno's reports controller read access to the
+# pods/ephemeralcontainers subresource.
+#
+# WHY THIS EXISTS: the four phase-2b ValidatingPolicies (and the phase-4
+# ImageValidatingPolicy) list `pods/ephemeralcontainers` in their
+# matchConstraints.resourceRules so that the `kubectl debug` ephemeral-container
+# injection vector is covered. Kyverno's reports controller builds background
+# PolicyReports by reading every resource a policy matches, so the moment that
+# subresource appeared in the match rules the controller needed get/list/watch
+# on it. It did not have that access, and every policy flipped to READY=false
+# with:
+#   Policy is not ready for reporting, missing permissions:
+#     get /v1, Resource=pods/ephemeralcontainers: ;
+#     list /v1, Resource=pods/ephemeralcontainers: ;
+#     watch /v1, Resource=pods/ephemeralcontainers: .
+# ENFORCEMENT WAS NEVER AFFECTED — the admission webhook kept denying, and every
+# attack in docs/evidence/phase-2b-admission kept returning exit 1. READY=false
+# was purely the reporting path. But a policy set that reads READY=false across
+# the board is indistinguishable from a broken one, so it is fixed here.
+#
+# WHY AGGREGATION, NOT A NEW BINDING: the Helm-managed ClusterRole
+# kyverno:reports-controller is an aggregated role. Its aggregationRule
+# (read off the live cluster, not guessed) is:
+#   clusterRoleSelectors:
+#     - matchLabels: {rbac.kyverno.io/aggregate-to-reports-controller: "true"}
+#     - matchLabels: {app.kubernetes.io/component: reports-controller,
+#                     app.kubernetes.io/instance: kyverno,
+#                     app.kubernetes.io/part-of: kyverno}
+# Labelling this ClusterRole with the first selector makes the controller-manager
+# fold these rules into kyverno:reports-controller automatically, so the grant
+# survives a Helm upgrade instead of being reconciled away — and no new
+# ClusterRoleBinding is required.
+#
+# LEAST PRIVILEGE: read verbs only, on exactly one subresource. No pods write
+# access, no wildcard resources, no wildcard verbs. Creating an ephemeral
+# container is a `pods/ephemeralcontainers` UPDATE, which this role does not
+# grant, so aggregating it cannot itself be used to inject a debug container.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:reports-controller:ephemeralcontainers
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["pods/ephemeralcontainers"]
+    verbs: ["get", "list", "watch"]

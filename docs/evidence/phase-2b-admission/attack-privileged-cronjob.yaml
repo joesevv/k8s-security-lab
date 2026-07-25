@@ -1,0 +1,57 @@
+# Violates ONLY disallow-privileged-containers: privileged: true.
+# Otherwise compliant — allowed registry (curlimages/*), pinned tag, drops ALL.
+#
+# WHY A CRONJOB SPECIFICALLY: a CronJob buries its pod spec one level deeper
+# than every other controller —
+#   CronJob                                 spec.jobTemplate.spec.template.spec
+#   Deployment/StatefulSet/DaemonSet/RS/Job spec.template.spec
+#   Pod                                     spec
+# The policies resolve all three with a single `podSpec` CEL variable. A policy
+# that merely PARSES would still admit this CronJob while appearing correct, so
+# this manifest is the test that the `jobTemplate` branch of that expression
+# actually executes. It is the CronJob counterpart to
+# attack-privileged-deployment.yaml.
+#
+# NOTE: allowPrivilegeEscalation is deliberately omitted; the API server rejects
+# privileged=true combined with allowPrivilegeEscalation=false, and this manifest
+# must reach the Kyverno webhook to demonstrate the denial.
+# NOTE: the schedule is 31 February — a syntactically valid cron expression that
+# can never fire. If this manifest were ever admitted (a regression), it would
+# still not launch a privileged Job on its own.
+# Namespace demo-kyverno-only: the demo namespace enforces the restricted Pod
+# Security profile, and PSA runs before admission webhooks, so PSA would reject
+# this workload first and the Kyverno denial would never be observable.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: attack-privileged-cronjob
+  namespace: demo-kyverno-only
+  labels:
+    app: attack-privileged-cronjob
+    role: admission-demo
+spec:
+  schedule: "0 0 31 2 *"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: attack-privileged-cronjob
+            role: admission-demo
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: attacker
+              image: curlimages/curl:8.11.1
+              command: ["sleep", "3600"]
+              securityContext:
+                privileged: true
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL

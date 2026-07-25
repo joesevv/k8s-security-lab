@@ -1,0 +1,43 @@
+# Violates ONLY the restricted Pod Security profile: mounts the node's root
+# filesystem via hostPath and runs the container as UID 0.
+# THE BLOCKER HERE IS POD SECURITY ADMISSION, NOT KYVERNO. No ValidatingPolicy
+# in policies/ covers hostPath volumes or runAsUser — that gap is deliberate and
+# is exactly why the demo namespace now sets
+# pod-security.kubernetes.io/enforce: restricted. Expect a "forbidden" error
+# from the PodSecurity "restricted" admission plugin, not a Kyverno message.
+# Otherwise compliant with all four Kyverno policies — allowed registry
+# (curlimages/*), pinned tag, not privileged, drops ALL and adds none back.
+# Namespace demo (not demo-kyverno-only) precisely because PSA enforcement is
+# the control under test.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-hostpath-root
+  namespace: demo
+  labels:
+    app: attack-hostpath-root
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: attacker
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: node-root
+          mountPath: /host
+  volumes:
+    - name: node-root
+      hostPath:
+        path: /

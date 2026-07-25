@@ -1,0 +1,49 @@
+# NOT an attack. This pod is fully COMPLIANT with all four Kyverno
+# ValidatingPolicies and with the restricted Pod Security profile — allowed
+# registry (nginxinc/*), pinned tag@digest, not privileged, drops ALL and adds
+# none back, runs non-root with RuntimeDefault seccomp.
+# It exists solely as a live, admitted target so that `kubectl debug` can inject
+# a NON-compliant ephemeral container into it. That injection is the proof that
+# pods/ephemeralcontainers is now inside the policies' matchConstraints scope:
+# without the subresource in scope, an attacker with debug rights could attach a
+# privileged sidecar to an already-running compliant pod and no policy would see
+# the request.
+# Namespace demo-kyverno-only: the demo namespace enforces the restricted Pod
+# Security profile, and PSA runs before admission webhooks, so PSA would reject
+# the ephemeral container first and the Kyverno denial would never be
+# observable.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: target-pod-for-debug
+  namespace: demo-kyverno-only
+  labels:
+    app: target-pod-for-debug
+    role: admission-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: target
+      image: nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+      ports:
+        - name: http
+          containerPort: 8080
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

@@ -4,6 +4,12 @@ metadata:
   name: demo
   labels:
     app.kubernetes.io/part-of: k8s-security-lab
-    # Warn only for now. Hard enforcement of the restricted profile comes later
-    # via Kyverno; Pod Security admission here just surfaces violations.
+    # Pod Security admission now HARD-ENFORCES the restricted profile here: any
+    # pod that violates it is rejected by the API server itself. The warn label
+    # is kept so violations are also surfaced as warnings on the client.
+    # PSA is the control that covers the host-namespace (hostPID/hostIPC/
+    # hostNetwork) and hostPath escapes — the Kyverno ValidatingPolicies in
+    # policies/ deliberately do NOT cover those, so PSA is not redundant here.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.35
     pod-security.kubernetes.io/warn: restricted

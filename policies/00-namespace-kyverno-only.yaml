@@ -1,0 +1,18 @@
+# Namespace for demonstrating the Kyverno ValidatingPolicies in isolation.
+#
+# WHY THIS EXISTS: Pod Security admission runs BEFORE admission webhooks and
+# short-circuits — if PSA rejects a pod, the request never reaches Kyverno. Now
+# that the demo namespace sets pod-security.kubernetes.io/enforce: restricted, a
+# privileged pod or a pod that does not drop ALL capabilities is rejected by PSA
+# and Kyverno never sees it, so its denial message can no longer be observed.
+#
+# This namespace therefore sets warn ONLY (no enforce), so PSA reports but does
+# not block. That keeps the Kyverno denials directly observable and the phase-2b
+# evidence reproducible against a cluster that is otherwise hardened.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-kyverno-only
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    pod-security.kubernetes.io/warn: restricted
