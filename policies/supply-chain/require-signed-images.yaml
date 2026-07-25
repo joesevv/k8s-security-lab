@@ -11,11 +11,14 @@
 # instead of a secret we have to guard. This also sidesteps the key-based
 # ImageValidatingPolicy limitation tracked upstream in Kyverno #16435.
 #
-# WHY THIS FILE LIVES IN policies/supply-chain/: runbooks/phase-2b-admission.md
-# drives its Audit/Deny loop with `for f in policies/*.yaml` and tears down with
-# a non-recursive `kubectl delete -f policies/`. Both globs are shallow, so
-# keeping this phase-4 policy one directory down stops the phase-2b commands
-# from silently picking it up and flipping or deleting signature enforcement.
+# WHY THIS FILE LIVES IN policies/supply-chain/: the phase-2b commands in
+# runbooks/phase-2b-admission.md reach only the top level of policies/. Its
+# Audit flip iterates the shallow glob `policies/*.yaml` (selecting the
+# ValidatingPolicies out of it BY KIND, since that directory also holds a
+# Namespace manifest), and the restore is `kubectl apply -f policies/`, which is
+# non-recursive without -R. Neither form descends into a subdirectory, so keeping
+# this phase-4 policy one level down stops a phase-2b command from silently
+# picking it up and flipping or deleting signature enforcement.
 #
 # SCOPE: demo + demo-kyverno-only namespaces (deliberate lab choice, matches the
 # phase-2b ValidatingPolicies) and ONLY images matching the ghcr glob below —

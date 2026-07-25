@@ -32,10 +32,14 @@
 # immutable 40-char commit SHA (a tag can be moved by the upstream owner), and
 # workflow-level permissions are `{}` - deny by default, granted per job.
 #
-# Kyverno (verifyImages) admits ONLY images signed by THIS workflow's OIDC
-# identity, so nothing that did not pass through this pipeline can run in the
-# cluster. Signing the immutable digest (not the mutable tag) prevents a
-# tag-swap after signing.
+# Kyverno's ImageValidatingPolicy admits ONLY images signed by THIS workflow's
+# OIDC identity, and it matches the glob ghcr.io/joesevv/k8s-security-lab/* in
+# the namespaces demo and demo-kyverno-only - so nothing under THIS LAB'S OWN
+# registry path can run in those namespaces without a signature from this
+# pipeline. That is the whole of the claim: images outside the glob (the Docker
+# Hub nginxinc/* and curlimages/* workloads) are allow-listed by registry and
+# carry no signature at all, deliberately - they have none to prove. Signing the
+# immutable digest (not the mutable tag) prevents a tag-swap after signing.
 #
 # Runbook: runbooks/phase-4-supply-chain.md
 # ==============================================================================
