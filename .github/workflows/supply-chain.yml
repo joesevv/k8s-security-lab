@@ -1,16 +1,36 @@
 # ==============================================================================
-# Supply-chain CI (phase-4)  -  build -> scan -> SBOM -> keyless-sign-by-digest
+# Supply-chain CI (phase-4)  -  build -> scan -> SBOM  ||  keyless-sign-by-digest
 # ------------------------------------------------------------------------------
-# This workflow is the trusted producer of container images for the lab:
-#   1. build      - build app/signed-app and push it to GHCR by per-commit tag.
-#   2. scan       - Trivy scans the pushed image (by digest) for CRITICAL/HIGH
-#                   CVEs and emits SARIF. Report-only (exit-code 0) so a signed
-#                   image is always produced even when findings exist.
-#   3. SBOM       - anchore/syft generates an SPDX-JSON SBOM of the same digest.
-#   4. sign       - cosign KEYLESS-signs the image BY DIGEST (not the tag) using
-#                   the workflow's ambient GitHub OIDC identity (id-token: write).
-#                   No private key is stored; the signature is bound to this
-#                   workflow's OIDC subject and recorded in the Rekor log.
+# This workflow is the trusted producer of container images for the lab. It is
+# split into TWO jobs so the signing privilege is isolated to one of them:
+#
+#   build-scan   (contents: read, packages: write  -  NO id-token)
+#     1. build   - build app/signed-app and push it to GHCR by per-commit tag.
+#     2. scan    - Trivy scans the pushed image (by digest) for CRITICAL/HIGH
+#                  CVEs and emits SARIF. Report-only (exit-code 0) so a signed
+#                  image is always produced even when findings exist.
+#     3. SBOM    - anchore/syft generates an SPDX-JSON SBOM of the same digest.
+#                  The immutable digest is exposed as a job output.
+#
+#   sign         (contents: read, packages: write, id-token: write)
+#     4. sign    - cosign KEYLESS-signs the image BY DIGEST (not the tag) using
+#                  the workflow's ambient GitHub OIDC identity (id-token: write).
+#                  No private key is stored; the signature is bound to this
+#                  workflow's OIDC subject and recorded in the Rekor log.
+#     5. verify  - cosign verify re-checks the signature it just made against
+#                  the EXACT keyless identity Kyverno pins. A failure here fails
+#                  the pipeline; the output is kept as evidence.
+#
+# WHY THE SPLIT: `id-token: write` is the permission that lets a job mint the
+# OIDC token whose subject Kyverno trusts. Every third-party action (docker,
+# trivy, syft, upload-artifact) runs in build-scan, where that permission is
+# DENIED - so a compromised or retagged third-party action cannot mint the OIDC
+# identity Kyverno admits on, and cannot forge a signature the cluster accepts.
+# The `sign` job holds id-token: write but runs nothing except GHCR login and
+# cosign - it does NOT check out the repo, so no source tree is present there
+# and no step reads one. For the same reason every action is pinned to an
+# immutable 40-char commit SHA (a tag can be moved by the upstream owner), and
+# workflow-level permissions are `{}` - deny by default, granted per job.
 #
 # Kyverno (verifyImages) admits ONLY images signed by THIS workflow's OIDC
 # identity, so nothing that did not pass through this pipeline can run in the
@@ -30,20 +50,31 @@ on:
       - .github/workflows/supply-chain.yml
   workflow_dispatch:
 
-permissions:
-  contents: read      # read the repo to build
-  packages: write     # push the image to GHCR
-  id-token: write     # REQUIRED: mint OIDC token for cosign keyless signing
+# Deny by default. Each job below grants only the scopes it actually needs.
+permissions: {}
 
 jobs:
-  build-sign:
+  # ----------------------------------------------------------------------------
+  # build-scan: runs all the third-party actions. Deliberately has NO id-token.
+  # ----------------------------------------------------------------------------
+  build-scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read      # read the repo to build
+      packages: write     # push the image to GHCR
+      # NO id-token here - see WHY THE SPLIT above.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after checkout needs the git credential, so don't leave it
+          # in .git/config where a later compromised action could read it.
+          persist-credentials: false
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -51,19 +82,14 @@ jobs:
 
       - name: Build and push image
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: app/signed-app
           push: true
           tags: ghcr.io/joesevv/k8s-security-lab/signed-app:${{ github.sha }}
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.2
-        with:
-          cosign-release: 'v3.0.6'
-
       - name: Trivy scan (report-only)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ghcr.io/joesevv/k8s-security-lab/signed-app@${{ steps.build.outputs.digest }}
           format: sarif
@@ -72,27 +98,91 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy SARIF
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: trivy-sarif
           path: trivy-results.sarif
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ghcr.io/joesevv/k8s-security-lab/signed-app@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom
           path: sbom.spdx.json
 
+  # ----------------------------------------------------------------------------
+  # sign: the ONLY job with id-token: write. Runs cosign and nothing else.
+  # ----------------------------------------------------------------------------
+  sign:
+    runs-on: ubuntu-latest
+    needs: build-scan
+    permissions:
+      # contents: read is very likely redundant here - this job no longer checks
+      # out the repo, and nothing in it makes a contents-scoped GITHUB_TOKEN
+      # call (cosign-installer curls public release URLs, GHCR auth spends the
+      # `packages` scope, upload-artifact uses ACTIONS_RUNTIME_TOKEN, and the
+      # actions themselves are fetched in "Set up job" before a step runs).
+      # It is KEPT until a real CI run shows this job green without it: the
+      # two-job split has never executed, and a broken signing job costs far
+      # more than one surplus read scope.
+      contents: read
+      packages: write     # cosign PUSHES the signature artifact to GHCR
+      id-token: write     # REQUIRED: mint OIDC token for cosign keyless signing
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.0.6'
+
       - name: Keyless sign image by digest
-        run: cosign sign --yes ghcr.io/joesevv/k8s-security-lab/signed-app@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }}
+
+      # Self-check: prove the signature we just made satisfies the EXACT keyless
+      # identity the Kyverno ImageValidatingPolicy pins. If this fails the job
+      # fails - a signature the cluster would reject must not ship silently.
+      # `shell: bash` is explicit so the runner uses `-eo pipefail`: without
+      # pipefail the `| tee` would mask a non-zero cosign exit code.
+      - name: Verify signature (self-check vs the identity Kyverno pins)
+        shell: bash
+        run: |
+          cosign verify \
+            --certificate-identity 'https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }} \
+            2>&1 | tee cosign-verify.txt
+          {
+            echo '### cosign verify (keyless identity self-check)'
+            echo ''
+            echo '```'
+            cat cosign-verify.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Download this and commit it as
+      # docs/evidence/phase-4-supply-chain/cosign-verify.txt
+      # `if: always()` so the transcript is uploaded even when the verify step
+      # FAILED - a failed verification is exactly the case worth debugging, and
+      # without this the evidence would be discarded precisely when it matters.
+      - name: Upload cosign verify evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cosign-verify
+          path: cosign-verify.txt
 
       - name: Record signed digest
         run: |
-          echo "Signed: ghcr.io/joesevv/k8s-security-lab/signed-app@${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "Signed: ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }}" >> $GITHUB_STEP_SUMMARY

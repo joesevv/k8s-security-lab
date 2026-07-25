@@ -1,0 +1,17 @@
+# ==============================================================================
+# Dependabot - keeps the SHA-pinned GitHub Actions current.
+# ------------------------------------------------------------------------------
+# .github/workflows/supply-chain.yml pins every action to an immutable 40-char
+# commit SHA so a retagged upstream release cannot silently change what runs in
+# CI. That pin is only SAFE if something tracks upstream - otherwise the repo
+# freezes on a known-vulnerable version forever. This is that something:
+# Dependabot opens a weekly PR that bumps the pinned SHA and rewrites the
+# trailing `# vX.Y.Z` comment, so the pin stays both immutable and patched.
+# ==============================================================================
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
