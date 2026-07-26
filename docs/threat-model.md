@@ -425,11 +425,15 @@ co-tenant. `NodeRestriction` is enabled and authorization is `Node,RBAC`
 (verified), but that is kubeadm's default, not a hardening decision this lab
 made.
 
-**6.9 The two-job CI split is proven once; the build is not reproducible.** Run
-`30174855073` (2026-07-25) was the **first ever** execution of the `build-scan` /
-`sign` split. Both jobs succeeded, every step included, and the
-`Verify signature (self-check vs the identity Kyverno pins)` step validated the
-new digest `sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b`
+**6.9 As of 2026-07-25 the two-job CI split has run five times, all on one day;
+the build is not reproducible.** Run `30174855073` (2026-07-25) was the **first
+ever** execution
+of the `build-scan` / `sign` split; four more followed the same day —
+`30179122521`, `30179345902`, `30179460564`, `30179497251` — and all five are
+green, `build-scan` and `sign` both succeeding in every one. On the first of
+them the `Verify signature (self-check vs the identity Kyverno pins)` step
+validated that run's digest
+`sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b`
 against certificate-identity
 `https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main`
 and issuer `https://token.actions.githubusercontent.com`, confirming the
@@ -439,18 +443,24 @@ trusted CA certificates — transcript in
 `id-token` isolation in §3.2 is therefore **runnable**: the split builds, scans,
 signs and verifies with `build-scan` holding no `id-token`, which establishes
 that the permission is not needed there. **What that does not buy.** It does not
-make the isolation an observed *control*. Nothing in the run tried to mint an
-OIDC token from `build-scan` and was refused, so "a compromised third-party
-action cannot mint the identity the cluster trusts" is still inferred from the
-`permissions:` block — exactly as readable before the run executed as after it.
-And one green run of one workflow shape is evidence that it works, not that it
-is durable. The build is **not byte-reproducible**: an unchanged application
-produced a different digest from the previous build (`sha256:b4cb133e…` →
-`sha256:7fd13d22…`), which is expected from layer-metadata timestamps but means
-the digest the cluster pins cannot be independently re-derived from source —
-the signature is the only link back to the pipeline. And the `sign` job still
-carries `contents: read` although it runs no checkout; the green run had that
-scope present, so whether it is genuinely removable is untested.
+make the isolation an observed *control*, and five runs buy no more of that than
+one did. Nothing in any of them tried to mint an OIDC token from `build-scan`
+and was refused, so "a compromised third-party action cannot mint the identity
+the cluster trusts" is still inferred from the `permissions:` block — exactly as
+readable before the first run executed as after the fifth. Nor do five runs
+establish durability. They span about two and a half hours of a single day, over
+application source unchanged since the pipeline was written, and three of them
+are the merges of PRs #1–#3 (§6.11), which touched nothing but the workflow
+file. That is repeatable evidence the shape works, not evidence that it keeps
+working. The build is **not byte-reproducible**: an unchanged application
+produces a different digest on every build — `sha256:b4cb133e…` before the
+split, then a distinct digest on each of the five runs, ending
+`sha256:551f01a6…` on `30179497251` — which is expected from layer-metadata
+timestamps but means the digest the cluster pins cannot be independently
+re-derived from source; the signature is the only link back to the pipeline.
+And the `sign` job still carries `contents: read` although it runs no checkout;
+all five runs had that scope present, so whether it is genuinely removable is
+untested.
 
 **6.10 The signing identity's trust root is push access to `main`, and the guard
 on `main` is one-person-satisfiable.** The pinned subject makes exactly one
@@ -483,16 +493,31 @@ mirrorable by anyone (asset 6 in §2). Checked the same day on
 is `enabled`, secret-scanning push protection is `enabled`, Dependabot security
 updates are `enabled`, and Dependabot alerts are on
 (`GET /vulnerability-alerts` → HTTP 204); `GET /secret-scanning/alerts` returns
-`[]`. Dependabot version updates are **firing**, not merely configured — PRs
-#1–#3 (2026-07-25) each bump a SHA-pinned action (`docker/login-action`
-3.7.0→4.5.1, `actions/upload-artifact` 4.6.2→7.0.1, `actions/checkout`
-4.4.0→7.0.1), so the tracking half of the pin-plus-track design in
-`.github/dependabot.yml` does detect stale pins and propose exact replacements.
-That is where it stops: all three PRs are still **open**, none is merged, and
-`gh pr checks` reports no checks on any of them, since the workflow triggers
-only on push to `main`. Detection and proposal are demonstrated; the loop has
-never been closed by a merged bump that then built, signed and verified.
-**Still off, and each is a real gap.**
+`[]`. **The pin-plus-track loop in `.github/dependabot.yml` has closed end to
+end.** PRs #1–#3 (2026-07-25) each bumped a SHA-pinned action
+(`docker/login-action` 3.7.0→4.5.1, `actions/upload-artifact` 4.6.2→7.0.1,
+`actions/checkout` 4.4.0→7.0.1) and all three were merged the same day: the
+tracking half detects a stale pin, proposes the exact replacement, and the
+merge is what proves the replacement builds. Because each merge touched
+`.github/workflows/supply-chain.yml`, which is a trigger path, each one rebuilt,
+re-scanned, re-signed and re-verified green — runs `30179345902`, `30179460564`
+and `30179497251` (§6.9). Dependabot rewrote **both halves** of every pin, the
+40-char SHA and its trailing version comment
+(`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`), which is
+the part that keeps a pin auditable: an immutable SHA carrying a stale comment
+is a pin no reviewer can read. The bumps also cleared what motivated them —
+earlier runs carried a warning annotation naming exactly these three actions as
+targeting Node.js 20 and being forced onto Node.js 24, and the annotations API
+returns **zero** annotations for both jobs of run `30179497251`. **What that
+does and does not settle.** It is one cycle, three actions, one workflow: the
+mechanism is demonstrated, the design is not stress-tested. All three bumps
+happened to be compatible, two of them across three major versions, so nothing
+here shows what a breaking upstream change does to this pipeline. The
+consolation is that the failure mode of a *breaking* bump is a red CI run rather
+than a compromised signature — the signing identity is the workflow's OIDC
+subject and does not depend on which action versions ran. What CI cannot catch
+is a bump that is hostile rather than merely incompatible, and §6.10's gate lets
+one account merge it unreviewed. **Still off, and each is a real gap.**
 `secret_scanning_non_provider_patterns` and `secret_scanning_validity_checks`
 are both `disabled`, so a credential in a custom or non-provider format is not
 matched. Private vulnerability reporting is `{"enabled": false}` and there is no
