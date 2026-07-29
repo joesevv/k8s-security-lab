@@ -1,0 +1,106 @@
+# Namespace for the Falco runtime sensor.
+#
+# WHAT FALCO IS, STATED BEFORE THE PRIVILEGE IS GRANTED: a syscall-level
+# DETECTOR. It writes an alert line to its own stdout when a rule matches. It
+# blocks nothing, kills nothing and denies nothing. Every other privileged
+# thing in this lab is privileged in order to ENFORCE; this one is privileged
+# in order to WATCH, which is a weaker justification and is why the exemption
+# is written out at length here rather than assumed.
+#
+# WHAT PRIVILEGE IT ACTUALLY NEEDS, AND WHY. Read from the rendered chart, not
+# from folklore (`helm template ... | grep -A2 securityContext`, and the
+# hostPath volume list):
+#
+#   privileged: true      - the modern eBPF probe loads BPF programs and
+#                           attaches them to kernel raw tracepoints. That needs
+#                           CAP_BPF + CAP_PERFMON + CAP_SYS_RESOURCE +
+#                           CAP_SYS_PTRACE at minimum. The chart's default for
+#                           driver.kind=modern_ebpf is the blunt instrument,
+#                           privileged: true (driver.modernEbpf.leastPrivileged
+#                           defaults to false). This install did NOT reduce it,
+#                           and that is a real, unremediated gap: the sensor
+#                           runs with more privilege than it strictly requires.
+#   hostPath /proc        - Falco builds its initial process table from the
+#                           host procfs and heals it there after event drops.
+#   hostPath /sys/kernel  - BTF (/sys/kernel/btf/vmlinux) so the probe can be
+#                           CO-RE-relocated against this kernel.
+#   hostPath /boot,
+#            /lib/modules,
+#            /usr, /etc    - the kernel-headers/config search paths the driver
+#                           machinery probes on startup.
+#   hostPath x6 CRI sockets - docker / containerd / crio / podman / k3s socket
+#                           paths, used ONLY to resolve a container id into a
+#                           pod name, namespace and image. This is metadata
+#                           enrichment, not detection: without it the events
+#                           still fire, they just print <NA> for k8s fields.
+#
+# NOT NEEDED, CONTRARY TO THE OBVIOUS ASSUMPTION: hostPID is NOT set, and no
+# /dev mount is requested. This differs from phase 5's kube-bench, which does
+# need hostPID. The consequence is visible in the Falco log at startup —
+# "libpman: disabled BPF iterators (not running in the root PID namespace)" —
+# so this deployment is NOT fully-featured, and no claim of full host
+# process-tree visibility should be read into it.
+#
+# WHY IT CANNOT LIVE IN demo. Every item above is a restricted-profile
+# violation, and the two object forms are refused by DIFFERENT controls:
+#
+#   Pod form       - namespace demo carries pod-security.kubernetes.io/enforce:
+#                    restricted with enforce-version: v1.35, so PSA refuses it
+#                    outright, naming 'restricted:v1.35'. (The probe has to set
+#                    serviceAccountName: default first; with the real SA name
+#                    the built-in ServiceAccount admission plugin short-circuits
+#                    the request before PSA ever runs. See attack-output.txt 4a
+#                    and 4c.)
+#   DaemonSet form - PSA only WARNS, naming 'restricted:latest' - the warn
+#                    label, not the enforce one - because PSA evaluates Pods,
+#                    not apps controllers. The DENIAL comes from Kyverno, and
+#                    from exactly THREE of the four ValidatingPolicies:
+#                    disallow-privileged-containers, require-drop-all-
+#                    capabilities and restrict-registries. The fourth,
+#                    disallow-latest-and-bare-tag, does NOT fire, because the
+#                    Falco images are digest-pinned. Naming four here would
+#                    credit a control that never answered, which is the exact
+#                    error this phase exists to avoid.
+#
+# Both refusals are recorded verbatim in attack-output.txt (4c and 4d), along
+# with WHICH control answered WHICH object form — they are not the same
+# control, and collapsing them into one claim would be wrong. The refusal is
+# CORRECT behaviour: a namespace that admitted Falco would also admit an
+# attacker's privileged pod.
+#
+# The exemption is therefore written down HERE, explicitly, rather than being
+# inherited silently:
+#
+#   enforce: privileged   - stated in the manifest. Note that an UNLABELLED
+#                           namespace on this cluster already behaves this way:
+#                           the API server has no --admission-control-config-file
+#                           so the PodSecurity plugin falls back to its built-in
+#                           privileged/latest default. Labelling makes the
+#                           exemption greppable and reviewable instead of
+#                           implicit.
+#   warn: restricted      - observable: the `helm install` of the chart prints
+#                           the exact restricted-profile violations Falco
+#                           commits. That warning is part of the evidence.
+#   audit: restricted     - HONEST CAVEAT: audit annotations are written to the
+#                           API server audit log, and this cluster has no audit
+#                           logging (threat model 6.2). This label records
+#                           nothing today; it is here so the record exists the
+#                           moment an audit backend does.
+#
+# The four Kyverno ValidatingPolicies and the ImageValidatingPolicy are scoped
+# by namespaceSelector to [demo, demo-kyverno-only] only, so none of them
+# evaluates anything in this namespace. Falco's own images are digest-pinned by
+# the install command in clusters/falco-install.md — by this repo's standard,
+# not because any admission control here compels it. Nothing in this namespace
+# is gated by admission; that is the residual risk conceded in threat model
+# 6.7, and this namespace is a second concrete instance of it alongside
+# cis-benchmark.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: falco
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

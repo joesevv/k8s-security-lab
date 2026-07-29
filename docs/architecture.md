@@ -152,9 +152,27 @@ Runbooks with the full command logs, all in [`../runbooks/`](../runbooks/):
 [`phase-2b-admission.md`](../runbooks/phase-2b-admission.md),
 [`phase-2c-network.md`](../runbooks/phase-2c-network.md),
 [`phase-3-secrets.md`](../runbooks/phase-3-secrets.md),
-[`phase-4-supply-chain.md`](../runbooks/phase-4-supply-chain.md).
+[`phase-4-supply-chain.md`](../runbooks/phase-4-supply-chain.md),
+[`phase-5-cis-benchmark.md`](../runbooks/phase-5-cis-benchmark.md),
+[`phase-6-falco.md`](../runbooks/phase-6-falco.md).
 
 What is **not** in these diagrams — no encryption at rest, no audit log, no
-runtime sensor, no CVE gate, and policies that stop at the `demo` namespace
-boundary — is enumerated with reasons in
+CVE gate, and policies that stop at the `demo` namespace boundary — is
+enumerated with reasons in
 [§6 of the threat model](threat-model.md#6-residual-risk-and-what-is-deliberately-out-of-scope).
+
+**The runtime sensor is the one omission that is not a gap: it exists.** Since
+2026-07-29 Falco 0.44.1 has run as a three-pod DaemonSet in namespace `falco`,
+reading syscalls on all three nodes through a modern eBPF probe. It is left out
+of both diagrams on purpose, because neither is a runtime view — the first is
+a request passing through ordered gates, the second an artifact being
+transformed — and Falco is neither. It sits beside every workload *after*
+admission and only watches, so a box for it in a diagram whose whole grammar
+is "gate → REJECTED" would read as a gate, and it is not one: it **detects
+and does not prevent**. The interactive shell it reported inside `demo/nginx`
+on 2026-07-29 ran to completion, and the alert went to a container's stdout
+and nowhere else. What the sensor saw, what it missed, and what nothing does
+about either are in
+[§6.4 and §6.13 of the threat model](threat-model.md#6-residual-risk-and-what-is-deliberately-out-of-scope),
+with the transcript in [`evidence/phase-6-falco/`](evidence/phase-6-falco/) and
+the replay in [`../runbooks/phase-6-falco.md`](../runbooks/phase-6-falco.md).

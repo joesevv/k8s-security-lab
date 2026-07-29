@@ -1,0 +1,1317 @@
+Phase 6 — Falco runtime detection (captured 2026-07-29)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, 3 nodes
+(seclab-control-plane, seclab-worker, seclab-worker2). All three "nodes" are
+containers sharing ONE WSL2 kernel, 6.18.33.2-microsoft-standard-WSL2.
+Sensor: Falco 0.44.1, Helm chart falcosecurity/falco 9.1.0, namespace falco
+(pod-security.kubernetes.io/enforce: privileged), driver modern_ebpf.
+  image  docker.io/falcosecurity/falco:0.44.1
+        @sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+  init   docker.io/falcosecurity/falcoctl:0.13.0
+        @sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
+  rules  ghcr.io/falcosecurity/rules/falco-rules
+        @sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0
+  plugin ghcr.io/falcosecurity/plugins/plugin/container
+        @sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891
+
+FALCO DETECTS. IT DOES NOT PREVENT. THIS IS THE FIRST SENTENCE ON PURPOSE.
+Every phase before this one ships something that REFUSES an attack and then
+proves the refusal: RBAC denies, Kyverno denies, PSA denies, NetworkPolicy
+drops, sealed-secrets makes the plaintext absent, the ImageValidatingPolicy
+refuses an unsigned image. Falco does none of that. When a rule matches it
+writes ONE LINE to its own container's stdout and the attack continues. Both
+attacks in section 2 below succeeded. Section 3 is the proof that they
+succeeded, and section 3 is the honest heart of this file — not section 2.
+
+FILENAME, SINCE IT DOES NOT DESCRIBE THE CONTENTS: this file is named
+attack-output.txt to match the other six phases and because five manifests in
+this directory already point at that name. It is a DETECTION transcript, not a
+denial transcript. Section 4 is the only part of it where anything is refused,
+and the thing refused there is the sensor itself.
+
+AN ALERT IS NOT A CONTROL. There is no alerting pipeline in this lab. The
+alert's entire lifetime is: written to the falco container's stdout -> the
+kubelet's container log on that node -> gone at pod restart or log rotation.
+falcosidekick is deliberately not installed, file_output is off, http_output is
+off with an empty url, program_output is off, json_output is off, and
+responseActions is off. Nothing routes an alert, nothing stores it, nothing
+pages anybody, and nothing acts on it. All of that is shown, command by
+command, in section 3 — it is evidence, not a disclaimer.
+
+SCOPE OF THE DETECTION, STATED BEFORE THE ALERTS: TWO distinct behaviours were
+fired at the pinned install, against TWO stock rules. In the 2026-07-29 ATTACK
+WINDOW that produced THREE alert lines, not two: the terminal-shell behaviour
+was rehearsed once, 50 seconds before the marked attack and without a marker
+string, and it fired the same rule; that third line is in the log and is
+printed and accounted for in 2f rather than dropped.
+DO NOT READ A TOTAL LINE COUNT AS A RESULT. THE LOG ONLY GROWS. Nothing
+deduplicates a Falco alert and nothing removes one until the pod restarts, so
+the number of lines `kubectl logs` returns is a function of WHEN YOU LOOK, not
+of what this phase demonstrated. It is already larger than three: a later
+adversarial verification pass re-fired both behaviours against the live
+cluster and added two more lines, which 2f prints and attributes. Section 0
+destroys an entire earlier install so that no alert can be silently inherited,
+and the same standard is applied here: every alert in this pod's log is
+listed and attributed, whether or not it belongs to this phase. THE EVIDENCE
+IS THE TWO DEMONSTRATED BEHAVIOURS AND THE TWO STOCK RULES THEY FIRED — both
+of which are fixed, and neither of which changes when the log gets longer.
+Nothing here measures what would have slipped past, and section
+2e records one behaviour — the textbook `cat /etc/shadow` — that this lab's own
+hardening makes INVISIBLE to the stock rule.
+
+THIS IS NOT A THREE-NODE DETECTION FLEET. The three kind nodes share one
+kernel and the modern eBPF probe is attached to that one kernel, so all three
+Falco pods see every event on the whole cluster. Each alert below appears
+THREE times, at near-identical nanosecond timestamps, and only the pod
+co-located with the target's containerd can resolve the container and k8s
+fields — the other two print <NA>. Section 2c shows this. Any count of
+"detections" taken from these logs must be divided by three or the lab claims
+3x the reality. This is a kind-on-Docker-Desktop artifact and does NOT
+describe Falco on a real multi-node cluster.
+
+RULE NAMES ARE A NAMED UNVERIFIED INPUT. Falco runs here with
+json_output: false, so each alert line carries a PRIORITY and the rule's
+OUTPUT STRING, and never the rule's name. The working notes behind this phase
+name the two rules "Terminal shell in container" and "Execution from
+/dev/shm". NO COMMAND WAS RUN to read those names out of the loaded
+/etc/falco/falco_rules.yaml, so they appear below only as an identification
+against the stock ruleset, never as a captured field. What IS captured, and
+what every claim here rests on, is the priority and the message text, both of
+which appear literally in the alert lines.
+
+PROVENANCE, SO THE WORD VERBATIM MEANS SOMETHING: every alert line, error
+string, log line, config fragment and diff below is transcribed from the raw
+capture taken during the run, unedited. A small number of jsonpath queries
+were recorded by the operator in a LABELLED form rather than as bare stdout —
+the query abbreviated in the "$" line and the resolved values printed under a
+label. Those are reproduced exactly as recorded and are tagged
+[LABELLED SUMMARY] where they appear, so nobody reads a label as apiserver
+output. Nothing here is reconstructed and no output is paraphrased.
+
+============================================================
+0) PROVENANCE OF THE INSTALL — AN EARLIER, UNPINNED FALCO EXISTED AND WAS
+DESTROYED. Recorded rather than dropped, because the namespace in the
+pre-state below is older than this phase's install and a reader would
+otherwise see a 10-minute-old namespace holding a 0-minute-old release. A
+driver smoke test earlier the same day installed chart 9.1.0 with FIVE --set
+flags — driver.kind=modern_ebpf, falcosidekick.enabled=false,
+falcosidekick.webui.enabled=false, collectors.kubernetes.enabled=false and
+tty=true — and NO digest pins, and left it running. (The smoke document itself
+says "four" and then lists five; the count is corrected here against its own
+install command rather than inherited.) What is committed must be what is
+running, so that release was uninstalled and the namespace deleted before the
+pinned install below. The smoke test's own four alerts belong to a release that
+no longer exists and are NOT counted as this phase's evidence; the three alert
+lines in section 2's attack window were all fired against the pinned install.
+TWO OF THE THREE "$" LINES IN THIS SECTION ARE RECONSTRUCTED. The raw capture
+recorded these outputs under section labels without their command lines; the
+two below are read back off the outputs' own headers and are marked
+[COMMAND RECONSTRUCTED]. The third block has no unambiguous command and is
+left as the labelled summary it was recorded as. Section 0 is the only place
+in this file where any "$" line is not a transcription. The outputs
+themselves, here and everywhere else, are transcribed unedited.
+$ kubectl get ns --show-labels                      [COMMAND RECONSTRUCTED]
+$ helm -n falco list                                [COMMAND RECONSTRUCTED]
+============================================================
+NAME                 STATUS   AGE     LABELS
+cis-benchmark        Active   3d12h   app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=cis-benchmark,pod-security.kubernetes.io/audit=restricted,pod-security.kubernetes.io/enforce=privileged,pod-security.kubernetes.io/warn=restricted
+default              Active   8d      kubernetes.io/metadata.name=default
+demo                 Active   8d      app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=demo,pod-security.kubernetes.io/enforce-version=v1.35,pod-security.kubernetes.io/enforce=restricted,pod-security.kubernetes.io/warn=restricted
+demo-kyverno-only    Active   4d13h   app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=demo-kyverno-only,pod-security.kubernetes.io/warn=restricted
+falco                Active   10m     app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=falco,pod-security.kubernetes.io/audit=restricted,pod-security.kubernetes.io/enforce=privileged,pod-security.kubernetes.io/warn=restricted
+kube-node-lease      Active   8d      kubernetes.io/metadata.name=kube-node-lease
+kube-public          Active   8d      kubernetes.io/metadata.name=kube-public
+kube-system          Active   8d      kubernetes.io/metadata.name=kube-system
+kyverno              Active   8d      kubernetes.io/metadata.name=kyverno,name=kyverno
+local-path-storage   Active   8d      kubernetes.io/metadata.name=local-path-storage
+(exit code: 0)
+
+NAME 	NAMESPACE	REVISION	UPDATED                              	STATUS  	CHART      	APP VERSION
+falco	falco    	1       	2026-07-29 09:51:57.2416673 -0500 CDT	deployed	falco-9.1.0	0.44.1
+(exit code: 0)
+
+[LABELLED SUMMARY] the DaemonSet's containers as the smoke test left them:
+init falcoctl-artifact-install docker.io/falcosecurity/falcoctl:0.13.0
+main falco docker.io/falcosecurity/falco:0.44.1
+main falcoctl-artifact-follow docker.io/falcosecurity/falcoctl:0.13.0
+
+(exit code: 0)
+
+=> TAGS ONLY, AND A LIVE AUTO-UPDATER. Three unpinned image references and a
+falcoctl-artifact-follow sidecar that re-pulls the ruleset every 168h. A
+self-updating detection ruleset means the evidence in this file could silently
+stop describing what is running, which is the opposite of what this repo is
+for. Torn down:
+
+$ helm uninstall falco --namespace falco
+release "falco" uninstalled
+(exit code: 0)
+$ kubectl delete ns falco --wait=true
+namespace "falco" deleted
+(exit code: 0)
+$ kubectl get ns falco
+Error from server (NotFound): namespaces "falco" not found
+(exit code: 1)
+
+============================================================
+1) THE SENSOR — INSTALLED PINNED, AND THE modern_ebpf DRIVER PROVED AGAINST
+GROUND TRUTH RATHER THAN AGAINST ITS OWN LOG. The driver was this phase's
+main technical risk: the nodes run a Microsoft WSL2 kernel, 6.18.33.2, and
+there is no prebuilt Falco kernel module for it and no kernel headers on the
+node to build one. The CO-RE eBPF probe needs BTF. Checked on ALL THREE nodes.
+PROVENANCE OF THIS ONE BLOCK, DISCLOSED BECAUSE IT DIFFERS FROM THE REST OF THE
+FILE. The node and BTF baseline was originally taken during the driver smoke
+test that section 0 destroys, so it was NOT part of this phase's capture, and
+section 0 says the smoke run's outputs are not this phase's evidence. Rather
+than present smoke-run output as pinned-run output, the five commands were
+RE-RUN against the live cluster at 2026-07-29T15:53:21Z — after sections 2 to 5
+had been captured — and what is printed below is that re-run, verbatim. It is
+the only block in this file taken outside the phase's own capture window, and
+it is dated so. The stat commands need MSYS_NO_PATHCONV=1 in this shell,
+the same Git Bash path-rewriting trap recorded in 1d(a) and 3a; the two
+kubectl calls and uname do not.
+THE THIRD NODE WAS ADDED LATER, AND THE ADDITION IS DATED SEPARATELY. The
+2026-07-29T15:53:21Z re-run stat'd only seclab-worker and seclab-control-plane,
+and an earlier revision of this file left seclab-worker2 unchecked and said so.
+It has now been stat'd. The loop below was run against all three nodes at
+2026-07-29T16:09:23Z and its output is what is printed.
+$ kubectl config current-context
+$ kubectl get nodes -o wide
+$ docker exec seclab-worker uname -r
+$ for n in seclab-worker seclab-control-plane seclab-worker2; do MSYS_NO_PATHCONV=1 docker exec $n ls -la /sys/kernel/btf/vmlinux; done
+============================================================
+kind-seclab
+(exit code: 0)
+
+NAME                   STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION                      CONTAINER-RUNTIME
+seclab-control-plane   Ready    control-plane   8d    v1.35.5   172.18.0.2    <none>        Debian GNU/Linux 13 (trixie)   6.18.33.2-microsoft-standard-WSL2   containerd://2.3.1
+seclab-worker          Ready    <none>          8d    v1.35.5   172.18.0.3    <none>        Debian GNU/Linux 13 (trixie)   6.18.33.2-microsoft-standard-WSL2   containerd://2.3.1
+seclab-worker2         Ready    <none>          8d    v1.35.5   172.18.0.4    <none>        Debian GNU/Linux 13 (trixie)   6.18.33.2-microsoft-standard-WSL2   containerd://2.3.1
+(exit code: 0)
+
+6.18.33.2-microsoft-standard-WSL2
+(exit code: 0)
+-r--r--r-- 1 root root 6677359 Jul 29 14:47 /sys/kernel/btf/vmlinux
+-r--r--r-- 1 root root 6677359 Jul 29 14:47 /sys/kernel/btf/vmlinux
+-r--r--r-- 1 root root 6677359 Jul 29 14:47 /sys/kernel/btf/vmlinux
+(exit code: 0)
+
+=> BTF IS PRESENT, SO CO-RE IS VIABLE — ON ALL THREE NODES, EACH STAT'D
+DIRECTLY. Three identical lines, in loop order seclab-worker,
+seclab-control-plane, seclab-worker2: same size (6677359) and same mtime
+(Jul 29 14:47) on every node, which is what one shared WSL2 kernel behind
+three container mounts looks like. Nothing here is inferred from the shared
+kernel and nothing rests on "the Falco pod started, so BTF must be there".
+
+------------------------------------------------------------
+1a) THE INSTALL — every OCI artifact digest-pinned. This is the SECOND install
+command of the run; see 1e for the pin that was missing from the first.
+------------------------------------------------------------
+$ helm install falco falcosecurity/falco \
+    --namespace falco \
+    --version 9.1.0 \
+    --set driver.kind=modern_ebpf \
+    --set image.tag=0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b \
+    --set falcoctl.image.tag=0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02 \
+    --set falcoctl.artifact.follow.enabled=false \
+    --set falcoctl.config.artifact.install.refs[0]=ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 \
+    --set falcoctl.config.artifact.follow.refs[0]=ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 \
+    --set collectors.containerEngine.pluginRef=ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891 \
+    --set collectors.kubernetes.enabled=false \
+    --set falcosidekick.enabled=false \
+    --set falcosidekick.webui.enabled=false \
+    --set tty=true \
+    --timeout 10m --wait
+I0729 10:07:45.104607   27840 warnings.go:107] "Warning: would violate PodSecurity \"restricted:latest\": privileged (container \"falco\" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.capabilities.drop=[\"ALL\"]), restricted volume types (volumes \"container-engine-socket-0\", \"container-engine-socket-1\", \"container-engine-socket-2\", \"container-engine-socket-3\", \"container-engine-socket-4\", \"container-engine-socket-5\", \"boot-fs\", \"lib-modules\", \"usr-fs\", \"etc-fs\", \"sys-fs\", \"proc-fs\" use restricted volume type \"hostPath\"), runAsNonRoot != true (pod or containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")"
+NAME: falco
+LAST DEPLOYED: Wed Jul 29 10:07:44 2026
+NAMESPACE: falco
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+TEST SUITE: None
+NOTES:
+Falco agents are spinning up on each node in your cluster. After a few
+seconds, they are going to start monitoring your containers looking for
+security issues.
+
+TIP:
+You can easily forward Falco events to Slack, Kafka, AWS Lambda and more with falcosidekick.
+Full list of outputs: https://github.com/falcosecurity/charts/tree/master/charts/falcosidekick.
+You can enable its deployment with `--set falcosidekick.enabled=true` or in your values.yaml.
+See: https://github.com/falcosecurity/charts/blob/master/charts/falcosidekick/values.yaml for configuration values.
+(exit code: 0)
+
+=> THE CHART'S OWN NOTES ARE KEPT RATHER THAN TRIMMED, and the TIP is worth
+reading against section 3: the chart itself tells you the way to make an alert
+go anywhere is falcosidekick, and falcosidekick is deliberately NOT installed
+here (--set falcosidekick.enabled=false, in the install command above). The
+"they are going to start monitoring your containers" line is the chart's
+phrasing, not a claim this file endorses — monitoring is what happens; nothing
+downstream of it does.
+
+=> THE INSTALL PRINTS ITS OWN JUSTIFICATION FOR NOT BEING IN demo. That
+warning is the falco namespace's warn: restricted label doing its job: the
+apiserver enumerates SIX categories of restricted-profile violation the sensor
+commits — privileged, allowPrivilegeEscalation, capabilities, hostPath
+volumes, runAsNonRoot and seccompProfile. It is a WARN here only because the
+namespace is labelled enforce: privileged. Section 4 submits the same spec to
+demo, where it is not a warning.
+
+$ helm -n falco list
+NAME 	NAMESPACE	REVISION	UPDATED                              	STATUS  	CHART      	APP VERSION
+falco	falco    	1       	2026-07-29 10:07:44.9542527 -0500 CDT	deployed	falco-9.1.0	0.44.1
+(exit code: 0)
+
+$ kubectl -n falco get pods -o wide
+NAME          READY   STATUS    RESTARTS   AGE   IP            NODE                   NOMINATED NODE   READINESS GATES
+falco-6pq4p   1/1     Running   0          27s   10.244.1.8    seclab-worker          <none>           <none>
+falco-b6hrw   1/1     Running   0          27s   10.244.0.7    seclab-control-plane   <none>           <none>
+falco-rvlds   1/1     Running   0          27s   10.244.2.10   seclab-worker2         <none>           <none>
+(exit code: 0)
+
+Running is not the proof. 1b to 1d are.
+
+------------------------------------------------------------
+1b) THE PIN HELD — .spec carries tag@digest and the kubelet resolved that
+digest. Both fields are shown because .status.containerStatuses[].image prints
+the TAG ONLY: the kubelet normalises 'tag@digest' back to 'tag'. Reading only
+the status field would look like the pin was dropped. It was not.
+------------------------------------------------------------
+$ kubectl -n falco get ds falco -o jsonpath (spec images = the pin)
+[LABELLED SUMMARY]
+init  docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
+main  docker.io/falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+(exit code: 0)
+
+$ kubectl -n falco get pod -o jsonpath (imageID = what the kubelet actually resolved)
+[LABELLED SUMMARY]
+falco-6pq4p  docker.io/falcosecurity/falco@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+falco-b6hrw  docker.io/falcosecurity/falco@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+falco-rvlds  docker.io/falcosecurity/falco@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+(exit code: 0)
+
+The digests were cross-checked against the registry rather than inherited from
+a planning note, and both are MANIFEST-LIST digests, which is the form the
+kubelet resolves on a multi-arch node:
+$ docker buildx imagetools inspect docker.io/falcosecurity/falco:0.44.1 | grep -iE 'Name|MediaType' | head -3
+Name:      docker.io/falcosecurity/falco:0.44.1
+MediaType: application/vnd.docker.distribution.manifest.list.v2+json
+  MediaType: application/vnd.docker.distribution.manifest.v2+json
+$ docker buildx imagetools inspect docker.io/falcosecurity/falcoctl:0.13.0 | grep -iE 'Name|MediaType' | head -3
+Name:      docker.io/falcosecurity/falcoctl:0.13.0
+MediaType: application/vnd.oci.image.index.v1+json
+  MediaType:   application/vnd.oci.image.manifest.v1+json
+$ docker buildx imagetools inspect --format '{{.Manifest.Digest}}' docker.io/falcosecurity/falco:0.44.1
+sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+$ docker buildx imagetools inspect --format '{{.Manifest.Digest}}' docker.io/falcosecurity/falcoctl:0.13.0
+sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
+
+------------------------------------------------------------
+1c) THE RULES AND THE PLUGIN — the falcoctl init container log, verbatim, pod
+falco-6pq4p on seclab-worker. Both ghcr artifacts are pulled by DIGEST and
+cosign-verified at pull time.
+------------------------------------------------------------
+{"level":"INFO","msg":"Resolving dependencies ...","timestamp":"2026-07-29 15:07:47"}
+{"level":"INFO","msg":"Installing artifacts","refs":["ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891","ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0"],"timestamp":"2026-07-29 15:07:47"}
+{"level":"INFO","msg":"Preparing to pull artifact","ref":"ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891","timestamp":"2026-07-29 15:07:47"}
+{"level":"INFO","msg":"Pulling layer 3716e0f93086","timestamp":"2026-07-29 15:07:47"}
+{"level":"INFO","msg":"Pulling layer 6962a5081b03","timestamp":"2026-07-29 15:07:47"}
+{"level":"INFO","msg":"Pulling layer 9d33aaa10d89","timestamp":"2026-07-29 15:07:48"}
+{"digest":"ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891","level":"INFO","msg":"Verifying signature for artifact","timestamp":"2026-07-29 15:07:48"}
+{"level":"INFO","msg":"Signature successfully verified!","timestamp":"2026-07-29 15:07:50"}
+{"file":"container-0.7.1-linux-x86_64.tar.gz","level":"INFO","msg":"Extracting and installing artifact","timestamp":"2026-07-29 15:07:50","type":"plugin"}
+{"digest":"sha256:9d33aaa10d893cc7b329b64c786030bef6cd7a5c6245b760ae791edf10123f3e","directory":"/plugins","level":"INFO","msg":"Artifact successfully installed","name":"ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891","timestamp":"2026-07-29 15:07:50","type":"plugin"}
+{"level":"INFO","msg":"Preparing to pull artifact","ref":"ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0","timestamp":"2026-07-29 15:07:50"}
+{"level":"INFO","msg":"Pulling layer 735f0f1c0920","timestamp":"2026-07-29 15:07:51"}
+{"level":"INFO","msg":"Pulling layer 306bee1a8283","timestamp":"2026-07-29 15:07:51"}
+{"level":"INFO","msg":"Pulling layer 36d143c0ae2d","timestamp":"2026-07-29 15:07:51"}
+{"digest":"ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0","level":"INFO","msg":"Verifying signature for artifact","timestamp":"2026-07-29 15:07:51"}
+{"level":"INFO","msg":"Signature successfully verified!","timestamp":"2026-07-29 15:07:52"}
+{"file":"falco_rules.yaml.tar.gz","level":"INFO","msg":"Extracting and installing artifact","timestamp":"2026-07-29 15:07:52","type":"rulesfile"}
+{"digest":"sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0","directory":"/rulesfiles","level":"INFO","msg":"Artifact successfully installed","name":"ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0","timestamp":"2026-07-29 15:07:52","type":"rulesfile"}
+(exit code: 0)
+
+=> "Signature successfully verified!" IS falcoctl's OWN CLAIM, not an
+independent check. No cosign binary exists on this host (phase 4 verified in
+CI, not locally), so the verification was not repeated by hand. What is
+independently true is the digest pin: the refs above are the exact digests in
+the install command. The two DOCKER HUB images (falco, falcoctl) were NOT
+signature-verified at all — see NOT PROVEN HERE.
+
+------------------------------------------------------------
+1d) THE DRIVER — Falco's own startup log first, then three checks that do not
+depend on Falco telling the truth (gotcha #3: a tool's own output can be
+wrong).
+------------------------------------------------------------
+$ kubectl -n falco logs falco-6pq4p -c falco | head -20
+Wed Jul 29 15:07:53 2026: Falco version: 0.44.1 (x86_64)
+Wed Jul 29 15:07:53 2026: Falco initialized with configuration files:
+Wed Jul 29 15:07:53 2026:    /etc/falco/falco.yaml | schema validation: ok
+Wed Jul 29 15:07:53 2026: System info: Linux version 6.18.33.2-microsoft-standard-WSL2 (root@f1bbfb02316b) (gcc (GCC) 13.2.0, GNU ld (GNU Binutils) 2.41) #1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026
+Wed Jul 29 15:07:53 2026: Loaded plugin 'container@0.7.1' from file /usr/share/falco/plugins/libcontainer.so
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'podman' container engine.
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/run/podman/podman.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'docker' container engine.
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/var/run/docker.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'cri' container engine.
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/run/containerd/containerd.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/run/crio/crio.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/run/k3s/containerd/containerd.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/run/host-containerd/containerd.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'containerd' container engine.
+Wed Jul 29 15:07:53 2026: [libs]: container: * enabled container runtime socket at '/host/run/host-containerd/containerd.sock'
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'lxc' container engine.
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'libvirt_lxc' container engine.
+Wed Jul 29 15:07:53 2026: [libs]: container: Enabled 'bpm' container engine.
+Wed Jul 29 15:07:53 2026: Loading rules from:
+(exit code: 0)
+
+$ kubectl -n falco logs falco-6pq4p -c falco | grep -n -E 'Falco version|syscall buffer|event sources|Opening|ring buffer|libpman|driver|Loading rules|Hostname'
+1:Wed Jul 29 15:07:53 2026: Falco version: 0.44.1 (x86_64)
+20:Wed Jul 29 15:07:53 2026: Loading rules from:
+21:Wed Jul 29 15:07:53 2026:    /etc/falco/falco_rules.yaml | schema validation: ok
+22:Wed Jul 29 15:07:53 2026: Hostname value has been overridden via environment variable to: seclab-worker
+23:Wed Jul 29 15:07:53 2026: The chosen syscall buffer dimension is: 8388608 bytes (8 MBs)
+25:Wed Jul 29 15:07:53 2026: Loaded event sources: syscall
+26:Wed Jul 29 15:07:53 2026: Enabled event sources: syscall
+27:Wed Jul 29 15:07:53 2026: Opening 'syscall' source with modern BPF probe.
+28:Wed Jul 29 15:07:53 2026: One ring buffer every '2' CPUs.
+30:Wed Jul 29 15:07:53 2026: [libs]: libpman: disabled BPF iterators (not running in the root PID namespace, or failed to determine it)
+(exit code: 0)
+
+=> ONE RULES FILE, ONE EVENT SOURCE. Line 21 is the whole detection surface:
+/etc/falco/falco_rules.yaml, the stock artifact from 1c, and nothing else. No
+custom rule, no override, no second rules file. Line 30 is the cost of the
+chart not requesting hostPID for modern_ebpf — BPF iterators are off and Falco
+heals its process table from procfs instead, so host process-tree visibility
+is REDUCED and none is claimed.
+
+(a) the effective engine config inside the RUNNING container. The first
+attempt is kept because its error message is a trap:
+$ kubectl -n falco exec falco-6pq4p -c falco -- sed -n '/^engine:/,/^[a-z]/p' /etc/falco/falco.yaml
+sed: C:/Program Files/Git/etc/falco/falco.yaml: No such file or directory
+command terminated with exit code 1
+(exit code: 1)
+
+=> THAT IS NOT FALCO MISSING ITS CONFIG. It is Git Bash MSYS path conversion
+rewriting the IN-CONTAINER path /etc/falco/falco.yaml into a Windows path
+before kubectl ever sees it. The message reads exactly like "Falco has no
+config file", and it is not. Recorded because it is a live instance of gotcha
+#2 — read WHICH thing answered. Retried with MSYS_NO_PATHCONV=1:
+
+$ MSYS_NO_PATHCONV=1 kubectl -n falco exec falco-6pq4p -c falco -- sed -n '/^engine:/,/^[a-z]/p' /etc/falco/falco.yaml
+engine:
+  kind: modern_ebpf
+  modern_ebpf:
+    buf_size_preset: 4
+    cpus_for_each_buffer: 2
+    disable_iterators: false
+    drop_failed_exit: false
+falco_libs:
+(exit code: 0)
+
+(b) no Falco kernel module is loaded on ANY node, so the events CANNOT be
+kmod-sourced:
+$ docker exec seclab-control-plane sh -c "lsmod | grep -i -E 'falco|scap' || echo NO_FALCO_KMOD_LOADED"
+NO_FALCO_KMOD_LOADED
+$ docker exec seclab-worker sh -c "lsmod | grep -i -E 'falco|scap' || echo NO_FALCO_KMOD_LOADED"
+NO_FALCO_KMOD_LOADED
+$ docker exec seclab-worker2 sh -c "lsmod | grep -i -E 'falco|scap' || echo NO_FALCO_KMOD_LOADED"
+NO_FALCO_KMOD_LOADED
+(exit code: 0)
+
+(c) the kernel's own view — Falco PID 1 holds live BPF objects:
+$ kubectl -n falco exec falco-6pq4p -c falco -- sh -c "ls -l /proc/1/fd | grep -o 'bpf[-a-z]*' | sort | uniq -c"
+     13 bpf
+     14 bpf-map
+    197 bpf-prog
+(exit code: 0)
+
+(d) the pod's actual privilege — hostPID is NOT set, contradicting the obvious
+assumption and differing from phase 5's kube-bench, which genuinely needs it:
+$ kubectl -n falco get ds falco -o jsonpath='{.spec.template.spec.hostPID}|{.spec.template.spec.hostNetwork}|{.spec.template.spec.hostIPC}'
+[LABELLED SUMMARY]
+hostPID=[] hostNetwork=[] hostIPC=[]
+(exit code: 0)
+$ kubectl -n falco get ds falco -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
+{"privileged":true}
+(exit code: 0)
+
+(e) a fallback to another driver would show as a container restart:
+$ kubectl -n falco get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[0].restartCount
+NAME          NODE                   RESTARTS
+falco-6pq4p   seclab-worker          0
+falco-b6hrw   seclab-control-plane   0
+falco-rvlds   seclab-worker2         0
+(exit code: 0)
+
+=> FOUR INDEPENDENT LINES OF EVIDENCE AGREE, AND ONLY ONE OF THEM IS FALCO'S
+OWN WORD. The config file in the running container says kind: modern_ebpf; no
+kernel module is loaded anywhere on the cluster; procfs shows 197 bpf-prog and
+14 bpf-map descriptors held by PID 1; and no pod restarted, so nothing fell
+back. The driver is the modern eBPF probe, attached to the shared WSL2 kernel.
+The privilege it runs with is privileged: true — the chart default for
+modern_ebpf, since driver.modernEbpf.leastPrivileged defaults to false. The
+least-privileged capability set was NOT adopted. The sensor therefore runs
+with more privilege than it strictly needs, and that is an unremediated gap,
+not a claim of minimal privilege.
+
+------------------------------------------------------------
+1e) A CORRECTION, RECORDED RATHER THAN DROPPED — THE FIRST INSTALL WAS NOT
+FULLY PINNED. The first pinned attempt set the two image digests and both
+falcoctl rules refs. Its init-container log then resolved an artifact the
+--set flags never named:
+------------------------------------------------------------
+{"level":"INFO","msg":"Installing artifacts","refs":["ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0","ghcr.io/falcosecurity/plugins/plugin/container:0.7.1"],"timestamp":"2026-07-29 15:05:21"}
+
+=> A FLOATING TAG SURVIVED A PIN THAT LOOKED COMPLETE.
+ghcr.io/falcosecurity/plugins/plugin/container:0.7.1 comes from the chart
+value collectors.containerEngine.pluginRef, NOT from falcoctl dependency
+resolution, so setting resolveDeps=false does not remove it — confirmed by
+rendering the chart, where the tag ref was still appended. The fix is to pin
+pluginRef itself, which is what 1a does, using the manifest digest the first
+install's own log printed
+(sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891).
+This is written down because anyone who copies a flag set without the
+pluginRef line gets a floating plugin and will not know it. The first release
+was uninstalled and replaced; only the fully pinned install produced the
+alerts below.
+
+Supporting probe, run before the install flags were chosen, to establish that
+falcoctl 0.13.0 accepts a digest ref at all:
+$ kubectl -n falco exec falco-z9lr9 -c falcoctl-artifact-follow -- falcoctl artifact install ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 --rulesfiles-dir /tmp/rd --plugins-dir /tmp/pd
+2026-07-29 15:02:29 INFO  Resolving dependencies ...
+2026-07-29 15:02:29 INFO  Installing artifacts
+                      └ refs: [ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0]
+2026-07-29 15:02:29 INFO  Preparing to pull artifact
+                      └ ref: ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0
+2026-07-29 15:02:29 INFO  Pulling layer 735f0f1c0920
+2026-07-29 15:02:29 INFO  Pulling layer 306bee1a8283
+2026-07-29 15:02:29 INFO  Pulling layer 36d143c0ae2d
+2026-07-29 15:02:29 INFO  Verifying signature for artifact
+                      └ digest: ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0
+2026-07-29 15:02:31 INFO  Signature successfully verified!
+2026-07-29 15:02:31 ERROR cannot use directory "C:/Users/josep/AppData/Local/Temp/rd" as install destination: C:/Users/josep/AppData/Local/Temp/rd doesn't exists
+command terminated with exit code 1
+(exit code: 1)
+
+=> THE NON-ZERO EXIT IS MSYS AGAIN, AFTER THE PART THAT MATTERED. The digest
+ref resolved, all three layers pulled and the signature verified; only the
+destination directory failed, because MSYS rewrote /tmp/rd into a Windows
+path. The definitive evidence is 1c, where the same digest ref is used for
+real by the committed install.
+
+============================================================
+2) THE ATTACK, AND THE ALERT — two behaviours fired at the hardened demo
+workload, two marked alerts back, each correlated to its attack by a unique
+marker string AND by a timestamp window bracketing the attack. A third,
+unmarked alert line — a rehearsal of the first behaviour — is in the same log
+and is accounted for in 2f. The target is
+demo/nginx-775678cbbd-q7ddt: PSA enforce=restricted, uid 101, all capabilities
+dropped, read-only root filesystem, digest-pinned nginxinc image. Node
+placement matters, because only the Falco pod co-located with the target's
+containerd can resolve k8s metadata.
+$ kubectl -n demo get pods -o wide
+$ kubectl -n falco get pods -o wide
+============================================================
+NAME                          READY   STATUS    RESTARTS      AGE     IP           NODE             NOMINATED NODE   READINESS GATES
+nginx-775678cbbd-mmrxb        1/1     Running   2 (26h ago)   3d20h   10.244.2.4   seclab-worker2   <none>           <none>
+nginx-775678cbbd-q7ddt        1/1     Running   2 (26h ago)   3d20h   10.244.1.4   seclab-worker    <none>           <none>
+signed-app-5d4c4ffff4-vrtps   1/1     Running   2 (26h ago)   3d17h   10.244.2.3   seclab-worker2   <none>           <none>
+(exit code: 0)
+
+NAME          READY   STATUS    RESTARTS   AGE     IP            NODE                   NOMINATED NODE   READINESS GATES
+falco-6pq4p   1/1     Running   0          4m26s   10.244.1.8    seclab-worker          <none>           <none>
+falco-b6hrw   1/1     Running   0          4m26s   10.244.0.7    seclab-control-plane   <none>           <none>
+falco-rvlds   1/1     Running   0          4m26s   10.244.2.10   seclab-worker2         <none>           <none>
+(exit code: 0)
+
+------------------------------------------------------------
+2a) PRIMARY — AN INTERACTIVE SHELL, WITH A REAL TTY, INSIDE THE HARDENED POD.
+The stock rule requires proc.tty != 0. `kubectl exec -it` from Git Bash does
+NOT allocate a PTY (stdin is not a tty), so the exec is driven through
+util-linux `script` on the control-plane node against the node's own kubectl.
+This is a genuine interactive exec, not a synthesized event: `tty` inside the
+shell returns a real /dev/pts device, printed below.
+------------------------------------------------------------
+T0 (UTC) immediately before:
+2026-07-29T15:13:31.760633900Z
+$ docker exec seclab-control-plane script -q -c "kubectl exec -it -n demo nginx-775678cbbd-q7ddt -- /bin/sh -c 'tty; id; echo PHASE6-PRIMARY-MARKER; uname -a'" /dev/null
+^@/dev/pts/0^M
+uid=101(nginx) gid=101(nginx) groups=101(nginx)^M
+PHASE6-PRIMARY-MARKER^M
+Linux nginx-775678cbbd-q7ddt 6.18.33.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026 x86_64 Linux^M
+(exit code: 0)
+T1 (UTC) immediately after:
+2026-07-29T15:13:32.179439800Z
+
+2b) THE ALERT IT RAISED — verbatim, from the enriching pod falco-6pq4p on
+seclab-worker:
+$ kubectl -n falco logs falco-6pq4p -c falco | grep PHASE6-PRIMARY-MARKER
+15:13:32.047577782: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo PHASE6-PRIMARY-MARKER; uname -a terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=4e6de1a83332 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=1.29.8-alpine k8s_pod_name=nginx-775678cbbd-q7ddt k8s_ns_name=demo
+(exit code: 0)
+
+CORRELATION, STATED AS ARITHMETIC RATHER THAN AS A CLAIM:
+  attack window (UTC)  T0 = 15:13:31.760633900   T1 = 15:13:32.179439800
+  alert timestamp           15:13:32.047577782   -> inside the window
+  priority                  Notice               (printed literally)
+  message                   "A shell was spawned in a container with an
+                            attached terminal"   (printed literally)
+  rule name                 identified as the stock rule "Terminal shell in
+                            container" — NOT printed, see the preamble
+  terminal=34816            non-zero: the proc.tty != 0 the rule requires,
+                            i.e. this really was an interactive shell
+  user_uid=101              the alert fired against the NON-ROOT hardened
+                            workload, not a root helper pod
+  command=...PHASE6-PRIMARY-MARKER...   the marker string that ties this line
+                            to this attack and to no other event
+
+------------------------------------------------------------
+2c) THE SHARED-KERNEL ARTIFACT — THE SAME EVENT, REPORTED BY ALL THREE PODS.
+Two of the three carry no k8s metadata at all. This is printed in full because
+it is the difference between "three detections" and "one event seen three
+times", and only one of those sentences is true.
+------------------------------------------------------------
+--- falco-6pq4p (seclab-worker):
+15:13:32.047577782: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo PHASE6-PRIMARY-MARKER; uname -a terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=4e6de1a83332 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=1.29.8-alpine k8s_pod_name=nginx-775678cbbd-q7ddt k8s_ns_name=demo
+--- falco-b6hrw (seclab-control-plane):
+15:13:32.047572312: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo PHASE6-PRIMARY-MARKER; uname -a terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=4e6de1a83332 container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>
+--- falco-rvlds (seclab-worker2):
+15:13:32.047564872: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo PHASE6-PRIMARY-MARKER; uname -a terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=4e6de1a83332 container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>
+(exit code: 0)
+
+=> ONE KERNEL, OBSERVED THREE TIMES. The three timestamps span 12.9
+MICROSECONDS, not nanoseconds. The subtraction, from the three lines above, so
+it is checkable rather than asserted:
+  falco-6pq4p   15:13:32.047577782   (latest)
+  falco-b6hrw   15:13:32.047572312
+  falco-rvlds   15:13:32.047564872   (earliest)
+  6pq4p - b6hrw  =  .047577782 - .047572312  =      5,470 ns
+  b6hrw - rvlds  =  .047572312 - .047564872  =      7,440 ns
+  full spread    =  .047577782 - .047564872  =     12,910 ns = 12.91 us
+Only falco-6pq4p — the pod on the node whose containerd owns the target —
+resolved container_name, the image and the k8s fields; the other two printed
+<NA>. On a real cluster with three separate kernels, two of these three lines
+would not exist. Every count in this file is of DISTINCT EVENTS, never of log
+lines.
+
+------------------------------------------------------------
+2d) SECONDARY — STAGE AND EXECUTE A PAYLOAD FROM /dev/shm. The pod's
+readOnlyRootFilesystem blocks writing into the image, so the attacker uses the
+one writable, exec-able path the spec left open. This one needs no TTY.
+------------------------------------------------------------
+T0 (UTC):
+2026-07-29T15:14:26.822373800Z
+$ kubectl exec -n demo nginx-775678cbbd-q7ddt -- /bin/sh -c 'cp /bin/busybox /dev/shm/bb && /dev/shm/bb id && echo PHASE6-SHM-MARKER'
+bb: applet not found
+command terminated with exit code 127
+(exit code: 127)
+T1 (UTC):
+2026-07-29T15:14:27.026634800Z
+
+$ kubectl -n falco logs falco-6pq4p -c falco | grep PHASE6-SHM-MARKER | head -1
+15:14:27.005294126: Warning File execution detected from /dev/shm | evt_res=SUCCESS file=<NA> proc_cwd=/ proc_pcmdline=sh -c cp /bin/busybox /dev/shm/bb && /dev/shm/bb id && echo PHASE6-SHM-MARKER user_loginname=<NA> group_gid=101 group_name=<NA> evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=bb proc_exepath=/dev/shm/bb parent=sh command=bb id terminal=0 exe_flags=EXE_WRITABLE container_id=4e6de1a83332 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=1.29.8-alpine k8s_pod_name=nginx-775678cbbd-q7ddt k8s_ns_name=demo
+(exit code: 0)
+
+CORRELATION (SECONDARY):
+  attack window (UTC)  T0 = 15:14:26.822373800   T1 = 15:14:27.026634800
+  alert timestamp           15:14:27.005294126   -> inside the window
+  priority                  Warning              (printed literally)
+  message                   "File execution detected from /dev/shm"
+                                                 (printed literally)
+  rule name                 identified as the stock rule "Execution from
+                            /dev/shm" — NOT printed, see the preamble
+  evt_res=SUCCESS           the execve SUCCEEDED
+  proc_exepath=/dev/shm/bb  it executed from the staged path
+  exe_flags=EXE_WRITABLE    the binary it ran was on a writable mount
+
+=> DO NOT MISREAD THE 127. "bb: applet not found" is BUSYBOX'S OWN MESSAGE,
+printed AFTER it started: a copied busybox chooses its applet from argv[0] and
+"bb" is not an applet name. The kernel executed the staged binary — Falco's
+evt_res=SUCCESS is the independent confirmation of that — and the exit code
+belongs to the payload's argument handling, not to the exec. The staging write
+and the execution both happened.
+
+------------------------------------------------------------
+2e) NEGATIVE CONTROL, RECORDED BECAUSE IT IS THE DEMO THAT DOES NOT WORK HERE.
+The textbook Falco demonstration is `cat /etc/shadow`. Against THIS lab's
+hardened workload it produces NOTHING, and that is correct rather than a gap.
+------------------------------------------------------------
+T0 (UTC):
+2026-07-29T15:17:16.799890500Z
+$ kubectl exec -n demo nginx-775678cbbd-q7ddt -- /bin/sh -c 'cat /etc/shadow; echo PHASE6-SHADOW-MARKER rc=$?'
+PHASE6-SHADOW-MARKER rc=1
+cat: can't open '/etc/shadow': Permission denied
+T1 (UTC):
+2026-07-29T15:17:17.010259100Z
+$ kubectl -n falco logs falco-6pq4p -c falco --since=30s | grep -iE 'shadow|Sensitive file' || echo NO_SENSITIVE_FILE_ALERT
+NO_SENSITIVE_FILE_ALERT
+(exit code: 0)
+
+=> TWO SEPARATE THINGS ARE TRUE HERE AND ONLY ONE OF THEM IS COMFORTABLE.
+First, the lab's own runAsNonRoot posture DEFEATED the attack outright: as uid
+101 the open() failed EACCES before Falco was ever relevant, so prevention
+beat detection to it. Second, the stock rule's open_read macro requires a
+SUCCESSFUL open (fd.num >= 0), so Falco stayed SILENT on the blocked attempt.
+A detector that says nothing about a failed attack is a detector with a blind
+spot, and this is a documented one. A demo built on this rule would have shown
+an empty log; the two behaviours in 2a and 2d were used instead.
+
+------------------------------------------------------------
+2f) THE THIRD ALERT, AND A FULL ACCOUNTING OF THE LOG. Section 0 destroys an
+earlier install so that its alerts cannot be inherited. That is only worth
+doing if this install's own log is then read to the END, so it is read here.
+It contains a line the raw capture does not record a command for: an UNMARKED
+rehearsal of the 2a behaviour, 50 seconds before it, which fired the SAME rule.
+Printed rather than dropped. This enumeration was run at 2026-07-29T15:58:12Z,
+after the capture window closed, and — like the section 1 baseline — is dated
+because of it.
+------------------------------------------------------------
+$ kubectl -n falco get pods -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,START:.status.containerStatuses[0].state.running.startedAt
+NAME          RESTARTS   START
+falco-6pq4p   0          2026-07-29T15:07:53Z
+falco-b6hrw   0          2026-07-29T15:07:53Z
+falco-rvlds   0          2026-07-29T15:07:52Z
+(exit code: 0)
+
+$ kubectl -n falco logs falco-6pq4p -c falco | grep -oE '^[0-9:.]+: (Notice|Warning) [A-Za-z /]+'
+15:12:42.954798594: Notice A shell was spawned in a container with an attached terminal
+15:13:32.047577782: Notice A shell was spawned in a container with an attached terminal
+15:14:27.005294126: Warning File execution detected from /dev/shm
+15:42:04.019645548: Notice A shell was spawned in a container with an attached terminal
+15:42:16.729771901: Warning File execution detected from /dev/shm
+(exit code: 0)
+
+$ kubectl -n falco logs falco-6pq4p -c falco | grep '15:12:42'
+15:12:42.954798594: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=4e6de1a83332 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=1.29.8-alpine k8s_pod_name=nginx-775678cbbd-q7ddt k8s_ns_name=demo
+(exit code: 0)
+
+$ kubectl -n falco logs falco-6pq4p -c falco | grep -oE '(VERIFY|PHASE6)-[A-Z0-9-]+' | sort | uniq -c
+      1 PHASE6-PRIMARY-MARKER
+      1 PHASE6-SHM-MARKER
+      1 VERIFY-PRIMARY-MARKER-JS
+      1 VERIFY-SHM-MARKER-JS
+(exit code: 0)
+
+=> FIVE ALERT LINES EXIST IN THIS POD'S LOG. THREE BELONG TO THIS PHASE'S RUN,
+TWO DO NOT, AND NEITHER GROUP IS LEFT UNEXPLAINED. The container has 0 restarts
+and started at 15:07:53Z, so this log is the complete record of the pinned
+install; nothing has rotated away.
+  15:12:42.954798594  REHEARSAL of the 2a behaviour. What is CAPTURED: same
+                      rule message, same priority Notice, same target pod, same
+                      container_id 4e6de1a83332, same terminal=34816 — but
+                      command=sh -c tty; id, with NO marker string, 50s early.
+                      What is INFERRED, and labelled as inference because the
+                      raw capture records no command line for it: that this is
+                      the operator confirming `script` had allocated a real PTY
+                      before firing the marked attack. The missing command line
+                      is why this line went unnoticed when the file was first
+                      written. Either way it is the SAME behaviour and the SAME
+                      rule as 2b, so it adds no rule coverage and is not counted
+                      as a third behaviour — only as a third alert LINE.
+  15:13:32.047577782  the 2a/2b PRIMARY, marked PHASE6-PRIMARY-MARKER.
+  15:14:27.005294126  the 2d SECONDARY, marked PHASE6-SHM-MARKER.
+  15:42:04.019645548  NOT THIS PHASE'S RUN, AND NOT AN ANOMALY EITHER. Both are
+  15:42:16.729771901  timestamped after the raw capture closed at 15:20:47Z —
+                      about 28 minutes after the marked attack — and both carry
+                      VERIFY-*-JS markers instead of PHASE6-* ones. They were
+                      produced by an ADVERSARIAL VERIFICATION AGENT re-firing
+                      the same two behaviours against the live cluster to
+                      confirm the phase REPRODUCED. That is a legitimate and
+                      deliberate thing to have happened, and it is recorded as
+                      what it was rather than folded into the demo or quietly
+                      dropped. No command line exists for them in this file's
+                      capture, so the attribution rests on the markers, the
+                      timestamps and the verification pass that claimed them.
+                      They confirm the two behaviours reproduce; they add no
+                      behaviour, no rule and no coverage, and they are NOT
+                      counted as this phase's evidence.
+So: two behaviours, two rules, and three alert lines in the 2026-07-29 attack
+window, one of those three being a rehearsal.
+THE LINE COUNT IS NOT A RESULT AND WILL NOT STAY AT FIVE. This log only grows:
+nothing deduplicates a Falco alert and nothing removes one until the pod
+restarts, so what `kubectl logs` returns is a function of WHEN YOU LOOK. It
+was three at 15:20:47Z and five at 15:58:12Z, and each replay of section 2
+adds two more. What does NOT change with replays is the thing this phase
+actually demonstrated: BEHAVIOURS and RULES, both of which are two. Any count
+taken from this file should be of those.
+
+============================================================
+3) THE ATTACKS WERE NOT PREVENTED — THE HONEST HEART OF THIS PHASE. Section 2
+is the part that looks impressive. This is the part that is true. Falco
+observed both behaviours and did nothing about either. What follows is the
+proof, from the live configuration and the live cluster, that there was no
+block, no kill, no route, no store and no responder.
+============================================================
+
+------------------------------------------------------------
+3a) THE ATTACK PATH WAS OPEN, AND STAYED OPEN. The staged payload is still on
+disk after the alert. The same command shows readOnlyRootFilesystem doing what
+Falco did not: refusing a write. Run with MSYS_NO_PATHCONV=1 in the
+environment — the first attempt hit the same Git Bash path-rewriting trap as
+1d(a), which mangled the in-container /bin/sh into a Windows path.
+------------------------------------------------------------
+$ MSYS_NO_PATHCONV=1 kubectl exec -n demo nginx-775678cbbd-q7ddt -- /bin/sh -c 'ls -l /dev/shm/bb; touch /blocked; echo rootfs-write-rc=$?'
+-rwxr-xr-x    1 nginx    nginx       804616 Jul 29 15:14 /dev/shm/bb
+rootfs-write-rc=1
+touch: /blocked: Read-only file system
+(exit code: 0)
+
+=> THE CONTRAST IN ONE COMMAND. `touch /blocked` is REFUSED — that is a
+preventive control (readOnlyRootFilesystem), and it produces an error the
+attacker cannot argue with. /dev/shm/bb is 804616 bytes, present, mode 755 —
+the
+write and the execution Falco alerted on are both still standing. Falco
+produced a log line. The pod spec produced a refusal. Only one of those is a
+control.
+
+------------------------------------------------------------
+3b) EVERY OUTPUT CHANNEL, READ OUT OF THE LIVE CONFIG IN THE RUNNING
+CONTAINER. Not from the chart's defaults, not from the values file — from
+/etc/falco/falco.yaml as Falco is actually reading it.
+------------------------------------------------------------
+$ kubectl -n falco exec falco-6pq4p -c falco -- sh -c 'for k in stdout_output file_output http_output program_output syslog_output json_output; do echo "== $k =="; grep -A2 "^$k:" /etc/falco/falco.yaml; done'
+== stdout_output ==
+stdout_output:
+  enabled: true
+syscall_event_drops:
+== file_output ==
+file_output:
+  enabled: false
+  filename: ./events.txt
+== http_output ==
+http_output:
+  ca_bundle: ""
+  ca_cert: ""
+== program_output ==
+program_output:
+  enabled: false
+  keep_alive: false
+== syslog_output ==
+syslog_output:
+  enabled: true
+time_format_iso_8601: false
+== json_output ==
+json_output: false
+libs_logger:
+  enabled: true
+(exit code: 0)
+
+The http_output and program_output blocks in full, so "enabled: false" is read
+together with the destination it would have used:
+$ kubectl -n falco exec falco-6pq4p -c falco -- sed -n '/^http_output:/,/^[a-z]/p;/^program_output:/,/^[a-z]/p' /etc/falco/falco.yaml
+http_output:
+  ca_bundle: ""
+  ca_cert: ""
+  ca_path: /etc/falco/certs/
+  client_cert: /etc/falco/certs/client/client.crt
+  client_key: /etc/falco/certs/client/client.key
+  compress_uploads: false
+  echo: false
+  enabled: false
+  insecure: false
+  keep_alive: false
+  max_consecutive_timeouts: 5
+  mtls: false
+  url: ""
+  user_agent: falcosecurity/falco
+json_include_message_property: false
+program_output:
+  enabled: false
+  keep_alive: false
+  program: 'jq ''{text: .output}'' | curl -d @- -X POST https://hooks.slack.com/services/XXX'
+rule_matching: first
+(exit code: 0)
+
+A CORRECTION, RECORDED RATHER THAN QUIETLY SWAPPED. This check first shipped
+as `ls -la ./events.txt 2>&1; pgrep -a syslogd rsyslogd 2>&1 | head; echo
+pgrep-rc=$?`, and it was BROKEN TWO WAYS. busybox pgrep takes ONE pattern, so
+two arguments make it print its usage text instead of searching; and `$?`
+after a pipeline is `head`'s status, not pgrep's, so `pgrep-rc` was
+meaningless whatever happened. Worse, the output recorded under it in an
+earlier revision of this file — a bare NO_SYSLOG_DAEMON line — is a string the
+command cannot emit; there is no `echo NO_SYSLOG_DAEMON` anywhere in it. That
+line was FABRICATED and is removed. What the broken command really prints, run
+against the live cluster at 2026-07-29T16:12:02Z:
+$ kubectl -n falco exec falco-6pq4p -c falco -- sh -c 'ls -la ./events.txt 2>&1; pgrep -a syslogd rsyslogd 2>&1 | head; echo pgrep-rc=$?'
+ls: ./events.txt: No such file or directory
+BusyBox v1.37.0 (2026-06-10 01:15:43 UTC) multi-call binary.
+
+Usage: pgrep [-flanovx] [-s SID|-P PPID|PATTERN]
+
+Display process(es) selected by regex PATTERN
+
+	-l	Show command name too
+	-a	Show command line too
+	-f	Match against entire command line
+	-n	Show the newest process only
+pgrep-rc=0
+(exit code: 0)
+
+The underlying claim — no syslog daemon in this container — is TRUE, so the
+claim stays and the EVIDENCE is replaced with two probes that actually
+establish it: enumerate every process in the container's PID namespace out of
+/proc, and ask whether a syslog binary exists in the image at all. Same
+container, same moment, 2026-07-29T16:12:02Z:
+$ kubectl -n falco exec falco-6pq4p -c falco -- sh -c 'ls -la ./events.txt 2>&1; for p in /proc/[0-9]*; do echo "pid $(basename $p) $(cat $p/comm)"; done; command -v syslogd rsyslogd syslog-ng; echo syslog-binary-rc=$?'
+ls: ./events.txt: No such file or directory
+pid 1 falco
+pid 313 sh
+syslog-binary-rc=127
+(exit code: 0)
+
+=> "pid 313 sh" is this command's OWN shell; the number changes on every run
+and only "pid 1 falco" is stable. The pod does not set hostPID (1d(d)), so
+/proc inside the container is the container's own PID namespace — which is
+exactly the scope of the claim. Nothing here is said about daemons running on
+the NODE. command -v printed no path and returned 127: none of syslogd,
+rsyslogd or syslog-ng exists in the image.
+
+=> stdout_output IS THE ONLY LIVE CHANNEL. file_output is off and there is no
+events.txt and no PVC. http_output is off and its url is the empty string.
+program_output is off and its program is the chart's unedited Slack EXAMPLE,
+pointing at hooks.slack.com/services/XXX — a placeholder, not a destination.
+json_output is off, which is why no rule NAME appears in any alert above.
+syslog_output is the one channel nominally ENABLED, and it is worth nothing
+here: it writes to the container's syslog socket, the only processes in that
+container are Falco and a transient shell, and no syslog binary is present to
+consume the socket. So the honest statement is not "Falco is configured to
+alert" — it is "Falco writes a line to a file descriptor and the line's next
+hop does not exist".
+
+------------------------------------------------------------
+3c) NO EXTERNAL SINK EXISTS ANYWHERE ON THE CLUSTER — not merely unconfigured
+in Falco, absent from the cluster.
+------------------------------------------------------------
+$ helm ls -A | grep -iE 'sidekick|talon|loki|elastic|fluent|alertmanager|prometheus' || echo NONE
+NONE
+$ kubectl get pods -A | grep -iE 'sidekick|talon|loki|elastic|fluent|alertmanager|prometheus' || echo NONE
+NONE
+$ kubectl -n falco get svc,deploy,cm | grep -iE 'sidekick|talon' || echo NONE
+NONE
+$ kubectl -n falco get all  (the whole namespace: a DaemonSet and its pods, nothing else)
+NAME              READY   STATUS    RESTARTS   AGE
+pod/falco-6pq4p   1/1     Running   0          8m20s
+pod/falco-b6hrw   1/1     Running   0          8m20s
+pod/falco-rvlds   1/1     Running   0          8m20s
+
+NAME                   DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+daemonset.apps/falco   3         3         3       3            3           <none>          8m20s
+(exit code: 0)
+
+=> THE ALERT'S ENTIRE LIFETIME, WRITTEN OUT: falco container stdout -> the
+kubelet's container log file on that node -> deleted at pod restart or log
+rotation. No falcosidekick, no Talon, no Loki, no Elasticsearch, no Fluent
+Bit, no Alertmanager, no Prometheus, no PVC, no shipper, no dashboard, no
+webhook, no page. The whole namespace is a DaemonSet and its three pods.
+Nobody is on call for this. Nothing reads it.
+
+------------------------------------------------------------
+3d) FALCO TOOK NO ACTION — the attacked pod is untouched. If anything had
+responded, the pod would show a kill, a restart, an eviction or a changed
+network posture.
+------------------------------------------------------------
+$ kubectl -n demo get pod nginx-775678cbbd-q7ddt -o wide
+NAME                     READY   STATUS    RESTARTS      AGE     IP           NODE            NOMINATED NODE   READINESS GATES
+nginx-775678cbbd-q7ddt   1/1     Running   2 (26h ago)   3d20h   10.244.1.4   seclab-worker   <none>           <none>
+(exit code: 0)
+$ kubectl -n demo get pod nginx-775678cbbd-q7ddt -o jsonpath restartCount / startedAt
+[LABELLED SUMMARY]
+restartCount=2  started=2026-07-28T13:09:22Z
+(exit code: 0)
+
+=> UNCHANGED, TO THE FIELD. restartCount is still 2 and the last restart was
+26h before the attack (see the AGE/RESTARTS column in section 2's pre-state,
+captured before either behaviour was fired). Same node, same IP, still
+Running. Nothing killed it, nothing evicted it, no NetworkPolicy was applied
+to it, and the payload it was made to execute is still sitting in its /dev/shm
+(3a). Three alert lines were raised against this pod in the attack window
+(2b, 2d, 2f) and the attacked workload did not notice any of them. Two more
+were raised against it later by the verification pass (2f), and it did not
+notice those either.
+
+3e) AND THE RESPONSE MACHINERY IS OFF IN THE RELEASE VALUES, not merely
+unused. THIS BLOCK WAS RE-CAPTURED, AND THE REASON IS DISCLOSED: an earlier
+revision of this file recorded four lines here (responseActions / enabled:
+false / scc: / create: true), copied from the run's raw capture. That is not
+what the command prints. `driver:` sorts before `responseActions:` in helm's
+YAML output, so the driver block matches first and `| head` cuts the output at
+ten lines, before `scc:` is ever reached. The command was re-run against the
+live cluster at 2026-07-29T16:15:45Z — the release is still REVISION 1 and its
+values have not changed since the install in 1a — and this is that output,
+verbatim:
+$ helm -n falco get values falco -a | grep -A2 -iE 'responseActions|driver:|leastPrivileged' | head
+driver:
+  enabled: true
+  kind: modern_ebpf
+--
+    leastPrivileged: false
+    sysfsMount: true
+  sysfsMountPath: /sys/kernel
+--
+responseActions:
+  enabled: false
+(exit code: 0)
+
+=> THE `--` LINES ARE GREP'S OWN, separating the three -A2 context runs. The
+block carries TWO facts, not one: responseActions.enabled is false, and
+driver.modernEbpf.leastPrivileged is false — the second being the unremediated
+privilege gap recorded in 1d and in NOT PROVEN HERE.
+
+=> DETECTION HAPPENED. RESPONSE DID NOT, AND COULD NOT HAVE. There is no
+response action configured, no Falco Talon on the cluster (3c), and no human
+notified. "Falco is monitoring the cluster" is true. "Falco is protecting the
+cluster" is FALSE, and this section exists so that sentence cannot be written
+anywhere in this repo.
+
+============================================================
+4) THE LAB'S OWN HARDENING REFUSES THE SENSOR — and WHICH control refuses it
+depends on the object form. Phase 5 learned this with kube-bench; it is
+re-tested here from scratch rather than assumed, and this time it produced a
+result phase 5 did not: the first probe was refused by a control that is not
+even part of this lab. Everything below is applied with
+--server-side --dry-run=server, which is a real admission request that
+persists nothing. A plain --dry-run=server against an unchanged object
+computes an empty patch and never reaches the server.
+$ diff <(grep -v '^#' falco-daemonset-rendered.yaml) <(grep -v '^#' rejected-in-demo-daemonset.yaml)
+============================================================
+5c5
+<   namespace: falco
+---
+>   namespace: demo
+(exit code: 1 = the files differ, by exactly those two lines: the namespace)
+
+The bare-Pod probe carries the DaemonSet's podSpec byte-for-byte. Checked by
+canonicalising both and hashing them, not asserted:
+$ python - <<'PY'  # canonical-YAML compare of DaemonSet .spec.template.spec vs Pod .spec
+IDENTICAL
+podSpec sha256 (daemonset): b563ae3cca4ae3faffac4dd69903ab0db1dcd901159621bb0555a791b142a09b
+podSpec sha256 (bare pod) : b563ae3cca4ae3faffac4dd69903ab0db1dcd901159621bb0555a791b142a09b
+(exit code: 0)
+
+------------------------------------------------------------
+4a) POD FORM into demo — AND THE CONTROL THAT ANSWERED IS NEITHER PSA NOR
+KYVERNO. Read the message.
+------------------------------------------------------------
+$ kubectl apply --server-side --dry-run=server -f rejected-in-demo-pod.yaml
+Error from server (Forbidden): pods "falco" is forbidden: error looking up service account demo/falco: serviceaccount "falco" not found
+(exit code: 1)
+
+=> GOTCHA #2, LIVE, AND IT WOULD HAVE PRODUCED A FALSE CLAIM. That refusal
+comes from the built-in ServiceAccount admission plugin, which runs in the
+MUTATING phase — before the PodSecurity validating plugin and before any
+webhook. The request never reached the controls this phase is about. The
+podSpec is the real one, so it names serviceAccountName: falco, and that
+ServiceAccount exists only in namespace falco. Writing "PSA refuses the Falco
+pod in demo" on the strength of this output would have been FALSE. A second
+probe isolates PSA by changing exactly one field that bears on nothing
+security-relevant.
+
+------------------------------------------------------------
+4b) THE ISOLATING DIFF — one field of substance, checked not asserted.
+------------------------------------------------------------
+$ diff <(grep -v '^#' rejected-in-demo-pod.yaml) <(grep -v '^#' rejected-in-demo-pod-sa-isolated.yaml)
+4c4
+<   name: falco
+---
+>   name: falco-psa-isolated
+14c14
+<   serviceAccountName: falco
+---
+>   serviceAccountName: default
+(exit code: 1 = the files differ, by exactly those four lines)
+
+Every field that bears on the security question — privileged, capabilities,
+the twelve hostPath volumes, runAsNonRoot, seccompProfile — is untouched. The
+object name is changed only so the two probes cannot be confused in a
+transcript.
+
+------------------------------------------------------------
+4c) POD FORM into demo, SERVICEACCOUNT ISOLATED — NOW PSA ANSWERS.
+------------------------------------------------------------
+$ kubectl apply --server-side --dry-run=server -f rejected-in-demo-pod-sa-isolated.yaml
+Error from server (Forbidden): pods "falco-psa-isolated" is forbidden: violates PodSecurity "restricted:v1.35": privileged (container "falco" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (containers "falcoctl-artifact-install", "falco" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers "falcoctl-artifact-install", "falco" must set securityContext.capabilities.drop=["ALL"]), restricted volume types (volumes "container-engine-socket-0", "container-engine-socket-1", "container-engine-socket-2", "container-engine-socket-3", "container-engine-socket-4", "container-engine-socket-5", "boot-fs", "lib-modules", "usr-fs", "etc-fs", "sys-fs", "proc-fs" use restricted volume type "hostPath"), runAsNonRoot != true (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+(exit code: 1)
+
+=> DENIED BY PODSECURITY, NAMING 'restricted:v1.35' — the PINNED enforce
+version from the demo namespace label, which is what distinguishes an ENFORCE
+denial from the 'restricted:latest' string a warn label emits. Six independent
+restricted violations are listed. No Kyverno policy is involved: PSA
+short-circuits before webhooks.
+
+------------------------------------------------------------
+4d) DAEMONSET FORM into demo — the form Falco really ships as. The answer
+changes, and the change is the interesting part.
+------------------------------------------------------------
+$ kubectl apply --server-side --dry-run=server -f rejected-in-demo-daemonset.yaml
+Warning: would violate PodSecurity "restricted:latest": privileged (container "falco" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (containers "falcoctl-artifact-install", "falco" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers "falcoctl-artifact-install", "falco" must set securityContext.capabilities.drop=["ALL"]), restricted volume types (volumes "container-engine-socket-0", "container-engine-socket-1", "container-engine-socket-2", "container-engine-socket-3", "container-engine-socket-4", "container-engine-socket-5", "boot-fs", "lib-modules", "usr-fs", "etc-fs", "sys-fs", "proc-fs" use restricted volume type "hostPath"), runAsNonRoot != true (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.; Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.; Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.
+(exit code: 1)
+
+=> SAME podSpec, DIFFERENT OBJECT KIND, DIFFERENT CONTROL, DIFFERENT SEVERITY,
+DIFFERENT PROFILE VERSION QUOTED. PodSecurity only WARNED here, and it named
+'restricted:latest' — the warn label, not the enforce one — so with PSA alone
+the DaemonSet object would have been ADMITTED and then failed silently when
+its pods were rejected one by one. The actual DENIAL came from KYVERNO, and
+from THREE policies at once: require-drop-all-capabilities,
+restrict-registries and disallow-privileged-containers. Note which is absent:
+no ValidatingPolicy in policies/ covers hostPath or host namespaces, so
+Kyverno says nothing about the twelve hostPath mounts. PSA is what covers
+those, and only against the Pod form. Neither control alone tells the whole
+story, and writing either one as "the control that refuses Falco" would exceed
+enforced reality.
+
+Note the DaemonSet's Kyverno denial names THREE policies where phase 5's
+kube-bench Job named ONE (restrict-registries). The extra two are Falco's own
+doing: it sets privileged: true and it drops no capabilities, neither of which
+the kube-bench master Job did.
+
+------------------------------------------------------------
+4e) THE SAME TWO FORMS into demo-kyverno-only — PSA warn only, no enforce
+label. Kyverno answers both times.
+------------------------------------------------------------
+$ sed 's/namespace: demo/namespace: demo-kyverno-only/' rejected-in-demo-pod-sa-isolated.yaml | kubectl apply --server-side --dry-run=server -f -
+Warning: would violate PodSecurity "restricted:latest": privileged (container "falco" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (containers "falcoctl-artifact-install", "falco" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers "falcoctl-artifact-install", "falco" must set securityContext.capabilities.drop=["ALL"]), restricted volume types (volumes "container-engine-socket-0", "container-engine-socket-1", "container-engine-socket-2", "container-engine-socket-3", "container-engine-socket-4", "container-engine-socket-5", "boot-fs", "lib-modules", "usr-fs", "etc-fs", "sys-fs", "proc-fs" use restricted volume type "hostPath"), runAsNonRoot != true (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.; Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.; Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.
+(exit code: 1)
+
+$ sed 's/namespace: demo/namespace: demo-kyverno-only/' rejected-in-demo-daemonset.yaml | kubectl apply --server-side --dry-run=server -f -
+Warning: would violate PodSecurity "restricted:latest": privileged (container "falco" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (containers "falcoctl-artifact-install", "falco" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers "falcoctl-artifact-install", "falco" must set securityContext.capabilities.drop=["ALL"]), restricted volume types (volumes "container-engine-socket-0", "container-engine-socket-1", "container-engine-socket-2", "container-engine-socket-3", "container-engine-socket-4", "container-engine-socket-5", "boot-fs", "lib-modules", "usr-fs", "etc-fs", "sys-fs", "proc-fs" use restricted volume type "hostPath"), runAsNonRoot != true (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers "falcoctl-artifact-install", "falco" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.; Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.; Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.
+(exit code: 1)
+
+=> IN demo-kyverno-only BOTH FORMS ARE DENIED BY KYVERNO AND PSA ONLY WARNS,
+because that namespace carries a warn label and no enforce label. So the Pod
+form's answer CHANGES with the namespace — PSA in demo, Kyverno in
+demo-kyverno-only — which is a second reason not to write a single sentence
+naming one control. The policies fire in a different ORDER in the two
+messages; that is Kyverno reporting order, and nothing should be read into it.
+
+------------------------------------------------------------
+4f) NOTHING PERSISTED. --server-side --dry-run=server creates no object.
+------------------------------------------------------------
+$ kubectl -n demo get pod,daemonset -o name
+pod/nginx-775678cbbd-mmrxb
+pod/nginx-775678cbbd-q7ddt
+pod/signed-app-5d4c4ffff4-vrtps
+(exit code: 0 — three workload pods, zero daemonsets, no falco object)
+
+$ kubectl -n demo-kyverno-only get pod,daemonset -o name
+(exit code: 0 — no output at all above the exit line: the namespace is empty)
+
+$ kubectl get pod,daemonset -A -o name | grep -i falco
+pod/falco-6pq4p
+pod/falco-b6hrw
+pod/falco-rvlds
+daemonset.apps/falco
+(exit code: 0 — the only falco-named objects: the DaemonSet and its three pods)
+
+=> THE REFUSAL IS CORRECT BEHAVIOUR, NOT A BUG, AND IT IS WHY THE SENSOR SITS
+OUTSIDE THE ENFORCEMENT BOUNDARY. A namespace that admitted this DaemonSet
+would also admit an attacker's privileged pod with twelve hostPath mounts. So
+Falco runs in its own namespace, labelled enforce: privileged, where none of
+the five Kyverno policies selects it and PSA does not enforce. Nothing in that
+namespace is gated by admission. That is threat model 6.7's already-conceded
+residual risk, and the falco namespace is a SECOND concrete instance of it
+alongside cis-benchmark — this time holding the most privileged workload in
+the lab.
+
+============================================================
+5) THE LAB IS UNHARMED — a detection phase that changed the lab would be a
+failed detection phase.
+$ kubectl -n demo get deploy,pods -o wide
+$ kubectl get validatingpolicy,imagevalidatingpolicy
+$ kubectl get nodes
+$ kubectl get pod,daemonset,job -A | grep -iE 'falco-smoke|psa-isolate|attack|probe' || echo NO_LEFTOVER_ATTACK_OBJECTS
+============================================================
+NAME         READY   UP-TO-DATE   AVAILABLE   AGE
+nginx        2/2     2            2           8d
+signed-app   1/1     1            1           4d17h
+
+NAME                          READY   STATUS    RESTARTS      AGE     IP           NODE             NOMINATED NODE   READINESS GATES
+nginx-775678cbbd-mmrxb        1/1     Running   2 (26h ago)   3d20h   10.244.2.4   seclab-worker2   <none>           <none>
+nginx-775678cbbd-q7ddt        1/1     Running   2 (26h ago)   3d20h   10.244.1.4   seclab-worker    <none>           <none>
+signed-app-5d4c4ffff4-vrtps   1/1     Running   2 (26h ago)   3d17h   10.244.2.3   seclab-worker2   <none>           <none>
+(exit code: 0)
+
+[LABELLED SUMMARY] images actually running in demo, with digest:
+nginx-775678cbbd-mmrxb  docker.io/nginxinc/nginx-unprivileged@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+nginx-775678cbbd-q7ddt  docker.io/nginxinc/nginx-unprivileged@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+signed-app-5d4c4ffff4-vrtps  ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
+(exit code: 0)
+
+NAME                                                                  AGE   READY
+validatingpolicy.policies.kyverno.io/disallow-latest-and-bare-tag     8d    true
+validatingpolicy.policies.kyverno.io/disallow-privileged-containers   8d    true
+validatingpolicy.policies.kyverno.io/require-drop-all-capabilities    8d    true
+validatingpolicy.policies.kyverno.io/restrict-registries              8d    true
+
+NAME                                                                    AGE     READY
+imagevalidatingpolicy.policies.kyverno.io/require-keyless-signed-ghcr   4d20h   true
+(exit code: 0)
+
+[LABELLED SUMMARY] validationActions read back per policy:
+  disallow-latest-and-bare-tag -> Deny
+  disallow-privileged-containers -> Deny
+  require-drop-all-capabilities -> Deny
+  restrict-registries -> Deny
+  require-keyless-signed-ghcr -> Deny
+(exit code: 0)
+
+NAME                   STATUS   ROLES           AGE   VERSION
+seclab-control-plane   Ready    control-plane   8d    v1.35.5
+seclab-worker          Ready    <none>          8d    v1.35.5
+seclab-worker2         Ready    <none>          8d    v1.35.5
+(exit code: 0)
+
+NO_LEFTOVER_ATTACK_OBJECTS
+(exit code: 0)
+
+The one artifact either attack left behind was the staged payload inside the
+standing nginx workload. It is on tmpfs and would vanish at pod restart
+anyway; removed so the lab workload is returned to a clean state:
+$ kubectl exec -n demo nginx-775678cbbd-q7ddt -- /bin/sh -c 'rm -f /dev/shm/bb; ls /dev/shm; echo cleaned-rc=$?'
+total 0
+drwxrwxrwt    2 root     root            40 Jul 29 15:16 .
+drwxr-xr-x    5 root     root           360 Jul 28 13:09 ..
+cleaned-rc=0
+(exit code: 0)
+
+$ helm ls -A
+NAME          	NAMESPACE  	REVISION	UPDATED                              	STATUS  	CHART                	APP VERSION
+falco         	falco      	1       	2026-07-29 10:07:44.9542527 -0500 CDT	deployed	falco-9.1.0          	0.44.1
+kyverno       	kyverno    	1       	2026-07-21 08:50:15.7202603 -0500 CDT	deployed	kyverno-3.8.2        	v1.18.2
+sealed-secrets	kube-system	1       	2026-07-23 17:40:26.7263997 -0500 CDT	deployed	sealed-secrets-2.19.1	0.38.4
+(exit code: 0)
+
+------------------------------------------------------------
+5a) THE COMMITTED DaemonSet MANIFEST MATCHES THE LIVE INSTALL. The two
+rejected-in-demo-* probes are only honest if the file they were derived from
+is the thing that is actually running. Compared field by field, live cluster
+against committed file:
+------------------------------------------------------------
+privileged:
+  rendered: True
+  live:     True
+  MATCH: True
+hostPID:
+  rendered: None
+  live:     None
+  MATCH: True
+falco_image:
+  rendered: docker.io/falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+  live:     docker.io/falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+  MATCH: True
+init_image:
+  rendered: ['docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02']
+  live:     ['docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02']
+  MATCH: True
+hostpaths:
+  rendered: ['/boot', '/etc', '/lib/modules', '/proc', '/run/containerd/containerd.sock', '/run/crio/crio.sock', '/run/host-containerd/containerd.sock', '/run/k3s/containerd/containerd.sock', '/run/podman/podman.sock', '/sys/kernel', '/usr', '/var/run/docker.sock']
+  live:     ['/boot', '/etc', '/lib/modules', '/proc', '/run/containerd/containerd.sock', '/run/crio/crio.sock', '/run/host-containerd/containerd.sock', '/run/k3s/containerd/containerd.sock', '/run/podman/podman.sock', '/sys/kernel', '/usr', '/var/run/docker.sock']
+  MATCH: True
+(exit code: 0)
+
+=> THE PROBES ARE FALSIFIABLE. The committed
+falco-daemonset-rendered.yaml carries the same privilege flag, the same
+absence of hostPID, the same two digest-pinned images and the same twelve
+hostPath mounts as the running DaemonSet. The comparison covers the SECURITY
+fields only — it is not a whole-object diff, and no claim is made that every
+annotation and label matches.
+
+============================================================
+NOT PROVEN HERE — stated so the evidence above is not read as more than it is.
+============================================================
+- NOTHING WAS PREVENTED. Both attacks in section 2 SUCCEEDED. The shell ran
+  and printed its output; the staged binary executed and Falco itself recorded
+  evt_res=SUCCESS. This phase belongs in no "attack it blocks" column, and it
+  earns no row in the Control -> MITRE ATT&CK table, whose own rule is that
+  mappings are MITIGATIONS. A detector mitigates nothing. The one thing in
+  this file that actually stopped an attack is the pod spec's
+  readOnlyRootFilesystem (3a) and the runAsNonRoot posture (2e) — both of
+  which predate this phase.
+- THERE IS NO ALERTING PIPELINE, AND THE ALERT DOES NOT SURVIVE. stdout is the
+  only live channel (3b). The alert's whole life is a line in a container log
+  on one node, deleted at pod restart or log rotation. No file, no PVC, no
+  webhook, no shipper, no log store, no dashboard, no retention policy, no
+  page, no on-call rota, no owner. If both attacks had happened at 3am, the
+  only trace this morning would be whatever is left in three pods' stdout, and
+  nobody would have been told.
+- NO RESPONSE ACTION EXISTS. responseActions.enabled is false in the release
+  values (3e) and Falco Talon is not installed (3c). Detection without
+  response is not mitigation, so threat model 6.4 is AMENDED by this phase and
+  NOT closed: runtime behaviour is now observed; it is still not stopped, and
+  nobody is notified.
+- THE COVERAGE CLAIM IS TWO RULES, AND IT IS NOT A LINE COUNT. Two behaviours
+  were fired against two stock rules; three alert lines came back in the
+  2026-07-29 attack window, because the first behaviour was rehearsed once
+  before the marked run (2f). Two rules and two behaviours is the entire
+  detection evidence. The LINE count is not evidence of anything: this log
+  only grows, a later verification pass has already pushed it to five (2f),
+  and a reader running `kubectl logs` tomorrow will see whatever number the
+  replays since have produced. It says nothing about the other rules in
+  the stock ruleset, which were never exercised here, and nothing about the
+  rules that do not exist.
+- FALSE NEGATIVES WERE NOT ENUMERATED. Nothing here measures what would slip
+  past. One blind spot was found by accident (2e: the stock sensitive-file
+  rule matches only SUCCESSFUL opens, so a BLOCKED attack is invisible to it),
+  which is one more than zero and far fewer than all of them. No adversary
+  emulation suite was run, no event-generator, no rule-coverage analysis.
+- NOTHING WAS TUNED, AND THE RULESET IS ONE STOCK ARTIFACT. The startup log
+  shows a single rules file, /etc/falco/falco_rules.yaml, from the pinned
+  upstream falco-rules artifact. No custom rule was written, no exception was
+  added, no rule was disabled, no priority threshold was set, and no noise or
+  false-positive rate was measured in steady state. A production deployment
+  needs all of that; this one has none of it.
+- ALERT VOLUME AND SYSCALL DROPS WERE NOT MEASURED on the pinned install. No
+  baseline exists for how chatty this ruleset is on this cluster, and no
+  syscall_event_drops counter was read. A detector that silently drops events
+  under load would look exactly like this one does.
+- THIS IS NOT A THREE-NODE DETECTION FLEET. All three kind nodes share one
+  WSL2 kernel, so each event appears in all three pods' logs (2c) and only the
+  co-located pod resolves container and k8s fields. Divide any count by three.
+  None of this describes Falco on a real cluster with separate kernels.
+- THE k8s METADATA IS THE PLUGIN'S, NOT THE APISERVER'S.
+  collectors.kubernetes.enabled is false, so there is no k8s-metacollector.
+  The pod and namespace fields in the alerts come from the container plugin
+  resolving a container id through the node's runtime socket. Where that
+  lookup fails the alert still fires but prints <NA> — as two of the three
+  pods do for every event.
+- THE SENSOR ITSELF IS THE LARGEST NEW ATTACK SURFACE IN THE LAB, AND IT IS
+  EXEMPT FROM THE LAB'S OWN CONTROLS. It runs privileged: true with twelve
+  hostPath mounts including /proc, /etc, /usr and six container-runtime
+  sockets, in a namespace where PSA does not enforce and none of the five
+  Kyverno policies selects it. driver.modernEbpf.leastPrivileged was left at
+  its default false, so the least-privileged capability set was NOT adopted
+  and the sensor runs with more privilege than it strictly needs. A compromise
+  of the Falco pod is a compromise of the node.
+- THE SENSOR'S OWN SUPPLY CHAIN IS ONLY PARTLY VERIFIED. All four OCI
+  artifacts are digest-pinned, and the two Docker Hub digests were
+  cross-checked against the registry (1b). But NO SIGNATURE WAS VERIFIED FOR
+  THE TWO IMAGES: falco and falcoctl publish to Docker Hub, so the phase-4
+  ImageValidatingPolicy — scoped to ghcr.io/joesevv/k8s-security-lab/* — has
+  nothing to say about them, and no cosign binary exists on this host. The
+  "Signature successfully verified!" lines in 1c are falcoctl's own claim
+  about the two ghcr artifacts, taken on trust and not independently
+  reproduced. The pins prove the bytes are stable, not that they are
+  trustworthy.
+- BTF WAS CONFIRMED ON ALL THREE NODES, so this is no longer a gap — it is
+  listed here only because an earlier revision of this file recorded it as
+  one. /sys/kernel/btf/vmlinux was stat'd directly on seclab-worker,
+  seclab-control-plane and seclab-worker2 (section 1), identical size and
+  mtime on each. What is still NOT claimed: that BTF completeness was
+  verified. The stat proves the blob exists and is readable; nothing here
+  checks that it covers every type the probe's CO-RE relocations need. The
+  probe loading and producing events is what carries that, and that is
+  Falco's own behaviour, not an independent check.
+- NOTHING IS SCHEDULED AND NOTHING IS REVIEWED. Falco runs continuously, which
+  is more than phase 5's on-demand scanner, but no one reads its output, no
+  report is produced, no alert is triaged and no cadence exists for looking.
+  An unread log is a capability, not a control.
+- THE RULE NAMES ABOVE ARE AN IDENTIFICATION, NOT A CAPTURE. json_output is
+  false, so no alert line carries a rule name. "Terminal shell in container"
+  and "Execution from /dev/shm" were not read out of the loaded rules file by
+  any command in this run. The priorities and message texts ARE captured.
+- kind IS NOT PRODUCTION, AND THIS IS A TEACHING ARTIFACT. Three nodes on one
+  kernel, one host, Docker Desktop on WSL2. Nothing here transfers to another
+  cluster as a security result.

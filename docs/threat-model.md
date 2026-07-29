@@ -346,14 +346,28 @@ Outside this table: the CI signing path also addresses **T1195.002 Compromise
 Software Supply Chain**, which is an Enterprise technique (Linux/Windows/macOS)
 and has no place in the ATT&CK for Containers matrix above.
 
-Not claimed: runtime-behaviour techniques (there is no runtime sensor — §6.4),
-and any technique in a namespace the policies do not select (§6.7).
+Not claimed: runtime-behaviour techniques. Since 2026-07-29 a runtime sensor
+does exist and does observe them (§6.4), but observing is not mitigating and
+this table lists mitigations only. Also not claimed: any technique in a
+namespace the policies do not select (§6.7).
 
 Phase 5 has deliberately **no row here.** kube-bench is an assessment, not a
 mitigation: it blocks no technique, and this table's rule is that only
 techniques justified by what is actually enforced get listed. A scan that
 changed no manifest mitigates nothing, so the findings it produced are recorded
 as residual risk in §6.12 instead.
+
+Phase 6 has deliberately **no row here either**, for a different reason.
+Falco does engage with runtime techniques — it matches the syscalls and names
+what it saw — but the only artifact it produces is a line on a pod's stdout
+that nothing routes, stores or acts on (§6.4). A (P) marking is the easiest
+overclaim available in this document: (P) is defined above as "raises cost or
+covers one variant", and an alert nobody reads does neither. An attacker who
+spawned the shell in `demo` on 2026-07-29 kept the shell. ATT&CK keeps
+detections separate from mitigations for exactly this reason, and this table
+has no detection column; adding one would mean re-deriving every row above
+against a standard they were not written to. What the sensor saw, what it did
+not see, and what nothing does about either are in §6.4 and §6.13.
 
 ---
 
@@ -382,7 +396,13 @@ plainly:** there is no record of *who did what* to this cluster. Every denial in
 this document is a preventive control; none of them is detective. Phase 5's
 kube-bench run (§6.12) does not change that: a point-in-time configuration scan
 is neither preventive nor detective — it observes posture once, on request, and
-would not notice an action taken against this cluster a second later.
+would not notice an action taken against this cluster a second later. Phase 6's
+Falco (§6.4, §6.13) changes that only in part, and not in the direction this
+item is about: it is genuinely detective, but it watches syscalls on the nodes,
+not requests at the API server, so it still records nothing about *who called
+what*. Deleting a NetworkPolicy or reading a Secret through the API leaves no
+trace on this cluster either way, and Falco's own output is a container's
+stdout — not queryable, not retained, not an audit trail.
 
 **6.3 No node or kernel hardening.** No AppArmor or SELinux profile beyond
 `seccompProfile: RuntimeDefault`, no gVisor or Kata, and no CIS remediation: as
@@ -394,12 +414,45 @@ documented before the scan: the kubelets set no `seccompDefault` (4.2.14), so
 is `demo` alone, per §6.7 — and no `podPidsLimit` is set (4.2.13). All three
 nodes are containers on one shared WSL2 kernel. **Consequence:** a kernel-level
 escape that gets past PSA lands on the host directly — there is no second wall.
+Since 2026-07-29 a kernel-level eBPF probe watches that same shared kernel
+(§6.4), so such an escape would stand a chance of being *seen*. It is still not
+a second wall: seeing is not stopping, nothing reads the alert, and the probe
+itself is a privileged component on the kernel it watches (§6.13).
 
-**6.4 No runtime detection until Falco lands.** Every control in this document
-fires at admission time or at connection time. A workload that is admitted and
-*then* misbehaves — a shell spawned in a container, a miner started inside an
-allow-listed and correctly signed image — is neither detected nor stopped.
-Signature verification is explicitly not a behavioural control.
+**6.4 Runtime behaviour is now observed, and nothing responds to what is
+observed.** Every *control* in this document still fires at admission time or at
+connection time. A workload that is admitted and *then* misbehaves — a shell
+spawned in a container, a miner started inside an allow-listed and correctly
+signed image — is still not **stopped** by anything here, and signature
+verification remains explicitly not a behavioural control. What changed on
+2026-07-29 is the other half of the old concession, and only that half. Falco
+0.44.1 runs as a DaemonSet on all three nodes, reading syscalls through a
+modern eBPF probe, so such misbehaviour is now **detected**: an interactive
+shell in the hardened `demo/nginx` pod produced `A shell was spawned in a
+container with an attached terminal` at priority Notice, and a busybox copy
+executed out of `/dev/shm` produced `File execution detected from /dev/shm` at
+priority Warning — both inside the attack window, with pod name, namespace,
+image and uid 101 resolved on the alert. Message text and priority are what an
+alert line carries here; `json_output` is off, so the stock rule names behind
+them are an identification against the shipped ruleset and not a captured
+field. **Both attacks succeeded.**
+The shell returned exit 0; the staged binary ran (`evt_res=SUCCESS`); afterwards
+the pod was still Running with its restart count unchanged and the payload
+still sitting in `/dev/shm` until it was cleaned up by hand. **What happens to
+a Falco alert on this cluster is: nothing.** It is written to the falco
+container's stdout and no further — `file_output`, `http_output`,
+`program_output` and `json_output` are all disabled, `responseActions.enabled`
+is `false`, and no falcosidekick, Talon, log shipper or alert router is
+installed anywhere on the cluster — so the alert lives in a container log
+until rotation or pod restart and is read only by someone who already went
+looking for it. One channel is nominally on and is worth naming rather than
+omitting: `syslog_output` is `true`, but it writes to the container's syslog
+socket and no syslog daemon runs in that image, so nothing consumes it either.
+There is no routing, no persistence, no on-call and no automated response.
+**Detection without response is not mitigation.** That is why this
+item stays in residual risk instead of being closed, why phase 6 takes no row
+in §5, and why what the sensor itself introduces is written up separately in
+§6.13.
 
 **6.5 The CVE gate is report-only.** Trivy runs with `exit-code: '0'`
 ([`.github/workflows/supply-chain.yml`](../.github/workflows/supply-chain.yml)),
@@ -430,7 +483,10 @@ fail-closed (`failurePolicy: Fail`); a cluster-wide policy that also matched
 webhook ever misbehaved. **Consequence:** workloads in any other namespace,
 including `default` and `kube-system`, are constrained by neither PSA nor
 Kyverno here. Production would invert this — match cluster-wide and carve out
-explicit system-namespace exclusions.
+explicit system-namespace exclusions. Two namespaces now make that concrete
+rather than hypothetical: `cis-benchmark` (§6.12) and, since 2026-07-29,
+`falco`, which is labelled `pod-security.kubernetes.io/enforce: privileged` and
+holds the most privileged workload on this cluster (§6.13).
 
 **6.8 kind is not production.** One host, one kernel, one etcd, a single
 non-HA control plane, and no real multi-tenancy. Nothing here says anything
@@ -625,6 +681,83 @@ from the scan. And per §6.8, a kind cluster passes and fails a great many CIS
 checks because of what kubeadm chose, not because of a hardening decision this
 lab made — the scan measures the substrate at least as much as it measures the
 lab.
+
+**6.13 The runtime sensor is itself privileged, ungated and unwatched.** §6.4
+records what phase 6 bought and what it does not do with it; this item records
+what the sensor *costs*, because installing Falco added the largest new attack
+surface this lab has taken on. Six things, none of them remediated.
+
+1. **It runs `privileged: true`.** That is the chart's default for
+   `driver.kind=modern_ebpf` (`driver.modernEbpf.leastPrivileged` defaults to
+   `false`) and this install did not reduce it. The probe needs roughly
+   `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE` and `CAP_SYS_PTRACE`; it was
+   given everything instead. It also host-mounts `/proc`, `/sys/kernel`,
+   `/boot`, `/lib/modules`, `/usr`, `/etc` and six container-runtime socket
+   paths — at least one of which really is connected, since the alerts resolve
+   container and pod names through it. A compromise of this pod would in
+   practice be a compromise of the node. That was not demonstrated here and
+   does not need to be to be worth writing down. One thing is narrower than the
+   obvious assumption: `hostPID`, `hostNetwork` and `hostIPC` are **not** set,
+   and that costs visibility — the startup log records `libpman: disabled BPF
+   iterators (not running in the root PID namespace)`, so no claim of full host
+   process-tree visibility is made.
+2. **Nothing on this cluster gates it.** Namespace `falco` is labelled
+   `pod-security.kubernetes.io/enforce: privileged` and sits outside the
+   `[demo, demo-kyverno-only]` namespace selector every Kyverno policy uses, so
+   neither PSA nor admission control evaluates anything in it — the second
+   concrete instance of §6.7 after `cis-benchmark`. The exemption is at least
+   written out in
+   [`evidence/phase-6-falco/00-namespace-falco.yaml`](evidence/phase-6-falco/00-namespace-falco.yaml)
+   rather than inherited silently, and the same spec submitted to `demo` is
+   refused — by PSA as a Pod, by Kyverno as a DaemonSet. Documentation is not
+   enforcement, and a refusal elsewhere is not a control here.
+3. **The sensor's own supply chain is unverified in the sense phase 4 means.**
+   All four OCI artifacts are pinned by digest — the Falco and falcoctl images
+   plus the ruleset and container-plugin artifacts — and falcoctl **reported**
+   `Signature successfully verified!` for the two `ghcr.io/falcosecurity/*`
+   artifacts at pull time. That is falcoctl's own claim about its own pull, not
+   an independent check: nobody re-derived it, and there is no cosign binary on
+   this host to re-derive it with, so it is taken on trust. What *is*
+   independently true of those two artifacts is the digest pin. The two images
+   come from Docker Hub, are outside the `ImageValidatingPolicy`'s glob, and had
+   no signature checked at all; the pins prove the bytes are stable, not that
+   they are trustworthy. The first install also
+   left the container-metadata plugin on a floating tag
+   (`plugin/container:0.7.1`), because it is a chart value rather than a
+   falcoctl ref. It was found and pinned, and the miss is recorded in
+   [`../clusters/falco-install.md`](../clusters/falco-install.md) rather than
+   tidied away.
+4. **The false-negative rate is unknown and was not measured.** Two behaviours
+   were fired and each produced an alert; that says nothing about what would
+   slip past. One counter-example is already on record: the textbook
+   `cat /etc/shadow` demo produces **no alert** against this lab's non-root
+   workload, because the open fails `EACCES` and the stock rule matches
+   successful opens only — the lab's own hardening defeats the demo and the
+   rule stays silent on the blocked attempt. The ruleset is the stock
+   `falco-rules` artifact, frozen at a digest with the update sidecar
+   disabled. That is deliberate, so the committed evidence describes what is
+   really running, but it also means the detections never improve on their own.
+   No custom rule was written against this lab's own threat model.
+5. **A detection here is counted three times.** All three kind nodes are
+   containers on one shared WSL2 kernel (§6.3, §6.8), so a single syscall
+   event is reported by all three Falco pods within microseconds of one
+   another, and only the pod co-located with the target's containerd resolves
+   `k8s_pod_name`, `container_name` and the image; the other two print `<NA>`.
+   Any figure drawn from these logs must be divided by three, and on a real
+   cluster with three kernels the enrichment behaviour would be different.
+6. **Nothing retains the alerts.** Restated from §6.4 because it is the
+   load-bearing limit and the easiest one to forget: stdout only, no shipper,
+   no store, no page. Each pod's log holds three alert lines from the
+   2026-07-29 attack window — the two documented above plus an earlier,
+   unrecorded shell-spawn rehearsal at `15:12:42.954798594` — and every one of
+   them survives exactly as long as a container log does.
+
+**Consequence, stated plainly:** this cluster can now see a category of attack
+it previously could not, and can still do nothing about it — while carrying a
+privileged, ungated new component to get that visibility. Wiring an alert
+router and a response action, even one that merely annotates the offending pod,
+is what would turn this into a control, and that work is not done. Until it is,
+§6.4 stays open and no §5 row is earned.
 
 ---
 

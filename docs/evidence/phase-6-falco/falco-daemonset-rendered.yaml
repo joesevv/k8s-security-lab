@@ -1,0 +1,218 @@
+# Phase 6 - the Falco DaemonSet EXACTLY AS INSTALLED, rendered from the chart.
+#
+# WHAT THIS IS: `helm template` output for chart falcosecurity/falco 9.1.0 with
+# the identical --set flags recorded in clusters/falco-install.md, DaemonSet
+# document only. It is committed for ONE reason: the two rejected-in-demo-*
+# probes beside it are only honest if they can be shown to differ from the real
+# thing in the namespace and nothing else. That diff is run and captured in
+# attack-output.txt. Without this file the probes would be unfalsifiable.
+#
+# THIS FILE IS NOT THE INSTALL PATH. Falco is installed by Helm, not by
+# `kubectl apply -f` of this file - applying it would create an unmanaged
+# DaemonSet that Helm does not own. Replay the install from
+# clusters/falco-install.md.
+#
+# THE PRIVILEGE, STATED PLAINLY, because this is the most privileged workload in
+# the lab: securityContext {"privileged": true} on the falco container, plus
+# hostPath mounts of /proc, /etc, /usr, /boot, /lib/modules, /sys/kernel and six
+# container-runtime sockets. hostPID, hostNetwork and hostIPC are NOT set - a
+# reader who assumes Falco needs hostPID (as phase 5's kube-bench genuinely
+# does) will misread the PSA violation list. The cost of not having it is
+# visible in the startup log: "libpman: disabled BPF iterators (not running in
+# the root PID namespace)". Detection still works; full host process-tree
+# visibility is not claimed.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: falco
+  labels:
+    helm.sh/chart: falco-9.1.0
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: falco
+    app.kubernetes.io/version: "0.44.1"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: falco
+      app.kubernetes.io/instance: falco
+  template:
+    metadata:
+      name: falco
+      labels:
+        app.kubernetes.io/name: falco
+        app.kubernetes.io/instance: falco
+      annotations:
+        checksum/config: 68520d7afabc71764f9725d07750e0ffe90b3920035bd71ee1b8caa73df805ad
+        checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    spec:
+      serviceAccountName: falco
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/master
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+      containers:
+        - name: falco
+          image: docker.io/falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1024Mi
+            requests:
+              cpu: 100m
+              memory: 512Mi
+          securityContext:
+            privileged: true
+          args:
+            - /usr/bin/falco        
+          env:
+            - name: HOST_ROOT
+              value: /host
+            - name: FALCO_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: FALCO_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          tty: true
+          ports:
+            - containerPort: 8765
+              name: web
+              protocol: TCP
+          startupProbe:
+            initialDelaySeconds: 3
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 20
+            httpGet:
+              path: /healthz
+              port: 8765
+          livenessProbe:
+            initialDelaySeconds: 0
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8765
+          readinessProbe:
+            initialDelaySeconds: 0
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8765
+          volumeMounts:
+            - mountPath: /host/var/run/docker.sock
+              name: container-engine-socket-0
+            - mountPath: /host/run/podman/podman.sock
+              name: container-engine-socket-1
+            - mountPath: /host/run/host-containerd/containerd.sock
+              name: container-engine-socket-2
+            - mountPath: /host/run/containerd/containerd.sock
+              name: container-engine-socket-3
+            - mountPath: /host/run/crio/crio.sock
+              name: container-engine-socket-4
+            - mountPath: /host/run/k3s/containerd/containerd.sock
+              name: container-engine-socket-5
+            - mountPath: /etc/falco
+              name: rulesfiles-install-dir
+            - mountPath: /usr/share/falco/plugins
+              name: plugins-install-dir
+            - mountPath: /root/.falco
+              name: root-falco-fs
+            - mountPath: /host/proc
+              name: proc-fs
+            - mountPath: /host/etc
+              name: etc-fs
+              readOnly: true
+            - mountPath: /sys/kernel
+              name: sys-fs
+              readOnly: true
+            - mountPath: /etc/falco/falco.yaml
+              name: falco-yaml
+              subPath: falco.yaml
+      initContainers:
+        - name: falcoctl-artifact-install
+          image: docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
+          imagePullPolicy: IfNotPresent
+          args:
+            - artifact
+            - install
+            - --log-format=json
+          securityContext:
+          volumeMounts:
+            - mountPath: /plugins
+              name: plugins-install-dir
+            - mountPath: /rulesfiles
+              name: rulesfiles-install-dir
+            - mountPath: /etc/falcoctl
+              name: falcoctl-config-volume
+            - mountPath: /artifactstate
+              name: artifact-state-dir
+      volumes:
+        - hostPath:
+            path: /var/run/docker.sock
+          name: container-engine-socket-0
+        - hostPath:
+            path: /run/podman/podman.sock
+          name: container-engine-socket-1
+        - hostPath:
+            path: /run/host-containerd/containerd.sock
+          name: container-engine-socket-2
+        - hostPath:
+            path: /run/containerd/containerd.sock
+          name: container-engine-socket-3
+        - hostPath:
+            path: /run/crio/crio.sock
+          name: container-engine-socket-4
+        - hostPath:
+            path: /run/k3s/containerd/containerd.sock
+          name: container-engine-socket-5
+        - name: plugins-install-dir
+          emptyDir: {}
+        - name: rulesfiles-install-dir
+          emptyDir: {}
+        - name: artifact-state-dir
+          emptyDir: {}
+        - name: root-falco-fs
+          emptyDir: {}  
+        - name: boot-fs
+          hostPath:
+            path: /boot
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: usr-fs
+          hostPath:
+            path: /usr
+        - name: etc-fs
+          hostPath:
+            path: /etc
+        - name: sys-fs
+          hostPath:
+            path: /sys/kernel
+        - name: proc-fs
+          hostPath:
+            path: /proc
+        - name: falcoctl-config-volume
+          configMap: 
+            name: falco-falcoctl
+            items:
+              - key: falcoctl.yaml
+                path: falcoctl.yaml
+        - name: falco-yaml
+          configMap:
+            name: falco
+            items:
+            - key: falco.yaml
+              path: falco.yaml
+  updateStrategy:
+    type: RollingUpdate
