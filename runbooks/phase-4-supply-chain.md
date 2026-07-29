@@ -153,8 +153,8 @@ transcript, downloaded from that run's `cosign-verify` artifact, is at
   deliberate — a lab that cannot produce a signed image because upstream shipped
   a HIGH in libc teaches nothing about signing — but it means **the signature
   says nothing about vulnerabilities.**
-- **The SBOM is attested as of 2026-07-29 — for FUTURE builds, and not yet
-  proven by a run.** Until that date this bullet read, in full: "**The SBOM is a
+- **The SBOM is attested as of 2026-07-29 — for FUTURE builds, and proven by
+  one run.** Until that date this bullet read, in full: "**The SBOM is a
   CI artifact, not an attestation.** `sbom.spdx.json` is uploaded with
   `actions/upload-artifact`; it is not `cosign attest`-ed against the image
   digest, so it is not bound to the image and **no admission policy can verify
@@ -162,11 +162,12 @@ transcript, downloaded from that run's `cosign-verify` artifact, is at
   attestation check to the policy. Not done." Half of that is now addressed and
   half is not, so it stays in this list. The `sign` job now runs `cosign attest
   --type spdxjson` against the build digest (section 1a), which binds the SBOM
-  of every FUTURE build to that build's digest. Still open, precisely: the step
-  has **never executed** — the workflow fires only on `push` to `main`, so the
-  claim rests on a static read of the YAML until the first green run on main
-  hands back a `cosign verify-attestation` transcript for
-  `docs/evidence/phase-4-supply-chain/`; the digest the cluster runs today
+  of every FUTURE build to that build's digest, and that path **executed once,
+  green, on 2026-07-29** — run `30480411426`, whose `cosign verify-attestation`
+  transcript is committed at
+  `docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt`. Still
+  open, precisely: one green run is one green run, and what it attested is the
+  image THAT RUN built; the digest the cluster runs today
   (`b8483c58...@sha256:7fd13d22...`) was built before the step existed and stays
   **unattested by design**, because the repo pins the digest it actually
   verified rather than repointing at an untested one; and **admission still
@@ -176,14 +177,19 @@ transcript, downloaded from that run's `cosign-verify` artifact, is at
 
 ---
 
-## 1a. The SBOM attestation — added 2026-07-29, not yet exercised
+## 1a. The SBOM attestation — added 2026-07-29, exercised the same day
 
 Four steps were added to the `sign` job on 2026-07-29 so the SBOM stops being a
 CI artifact that nothing can tie to an image: the three below, plus the evidence
-upload that carries the transcript out. **None of them have run.** The
-workflow triggers only on `push` to `main` (paths-filtered, plus
-`workflow_dispatch`), so what follows documents what the YAML says, not what a
-run observed — the first green run on main owes the transcript.
+upload that carries the transcript out. **All four ran green the same day**, in
+run `30480411426` — a `push` to `main` at head `1b1f8398`, the first run that
+could execute them and so far the only one. What follows therefore documents
+both what the YAML says and what one run observed. Read the scope narrowly:
+that run attested the image THAT RUN built, not the image the cluster runs. The
+transcript it produced is committed at
+`docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt` and the run
+is captured in section 7 of
+`docs/evidence/phase-4-supply-chain/attack-output.txt`.
 
 **1a-i. Move the SBOM into the privileged job.** It is generated in `build-scan`,
 the job that deliberately cannot sign, so it crosses the job boundary as an
@@ -235,10 +241,32 @@ loose build artifact.
 The identity and issuer strings are byte-identical to the signature self-check
 in section 1 and to the pair the `ImageValidatingPolicy` pins. The transcript
 uploads as its own `cosign-verify-attestation` artifact with `if: always()` — a
-FAILED verification is the one worth keeping — and belongs at
-`docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt` once a run
-has produced one. Expect it to be large: `cosign verify-attestation` echoes the
-verified payload, which is the whole SBOM.
+FAILED verification is the one worth keeping — and now lives at
+`docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt`, committed
+verbatim from run `30480411426`
+(sha256 `49af20e3dc6dbc50fcb50c0ba0ea9addd8729c2f26a265ee6f65db69e77cac00`).
+It is large, as promised: `cosign verify-attestation` echoes the verified
+payload, which is the whole SBOM — 7 lines and 1192177 bytes, of which line 7
+is the base64 payload alone.
+
+**Two things that first run taught, both observed on 2026-07-29 and both from
+a single run.**
+
+- **The step summary hit GitHub's 1024k cap.** As written for that run the step
+  appended the WHOLE transcript to `$GITHUB_STEP_SUMMARY`; at 1164k the upload
+  aborted with the annotation "`$GITHUB_STEP_SUMMARY upload aborted, supports
+  content up to a size of 1024k, got 1164k`". The run still concluded success
+  and the tee'd file was untouched — only the rendered summary was lost. The
+  step now writes a TRUNCATED summary **by design** (`head -c 2000` inside the
+  fence, plus a line pointing at the artifact); the `tee` is deliberately
+  unchanged, because the `cosign-verify-attestation` artifact, not the summary,
+  is the evidence path.
+- **The verify step took 18m32s.** In that run it ran 18:34:09Z → 18:52:41Z,
+  18m32s of the `sign` job's 18m59s, while every other step in the job finished
+  in 7s or less. cosign's own output is timestamped ~2s after the step started
+  and the log holds nothing further for that step, so WHERE the time went is
+  visible and WHY is not: the log states no cause and none is assumed here. One
+  observation on one day — not a benchmark, and not a reason to change the step.
 
 **Where this sits in the pipeline — stated precisely.** Every cosign call in
 this workflow, the two old ones and the two new ones, runs **after** the image

@@ -470,14 +470,17 @@ always produces a signed artifact for the demo to consume.
 **6.6 The SBOM is attested for future builds only, and nothing verifies it at
 admission.** Syft produces an SPDX-JSON SBOM and the workflow uploads it as a
 **CI artifact**. Since 2026-07-29 the `sign` job also runs `cosign attest
---type spdxjson --predicate sbom.spdx.json` against the build digest (commit
-pending merge), so every FUTURE build binds its SBOM to its own immutable
-digest and records the attestation in Rekor. Four limits keep this on the
-residual-risk list. The step has **never run** — the workflow fires only on
-`push` to `main`, so this records a static change to the YAML, not observed
-behaviour; the first green run on main owes a `cosign verify-attestation`
-transcript to `docs/evidence/phase-4-supply-chain/`. The digest the cluster
-runs today (`b8483c58...@sha256:7fd13d22...`) predates the step and stays
+--type spdxjson --predicate sbom.spdx.json` against the build digest, so a
+build from that date on binds its SBOM to its own immutable digest and
+records the attestation in Rekor. The step **ran green once**, on
+2026-07-29: run `30480411426`, a push to `main`, in which `cosign attest`
+and the `cosign verify-attestation` self-check both concluded success. Its
+transcript is committed as
+[`cosign-verify-attestation.txt`](evidence/phase-4-supply-chain/cosign-verify-attestation.txt).
+That is ONE run binding ONE build's SBOM to ONE digest, not a guarantee
+about runs that have not happened. Three limits keep this on the
+residual-risk list. The digest the cluster runs today
+(`b8483c58...@sha256:7fd13d22...`) predates the step and stays
 **unattested by design**, because the repo pins the digest it actually
 verified. **The attestation's integrity extends trust to the build job that
 produced the SBOM:** `build-scan` generates `sbom.spdx.json` and `sign`
