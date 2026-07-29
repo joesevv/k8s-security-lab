@@ -1,0 +1,47 @@
+# Namespace for running the kube-bench CIS Benchmark scanner.
+#
+# WHY THIS EXISTS: kube-bench inspects the NODE — static pod manifests under
+# /etc/kubernetes, the etcd data directory, the kubelet config and service unit,
+# and the live control-plane process flags via `ps` in the host PID namespace.
+# That requires hostPID: true and hostPath mounts, which are Baseline violations
+# and therefore rejected outright by pod-security.kubernetes.io/enforce:
+# restricted. The scanner CANNOT run in demo: PSA rejects the Pod, and that
+# rejection is correct behaviour, not a bug (see the phase-5 runbook and the
+# recorded dry-run rejection in attack-output.txt).
+#
+# The scanner is therefore privileged infrastructure and needs a namespace where
+# the restricted profile is not enforced. The exemption is written down HERE,
+# explicitly, rather than being inherited silently:
+#
+#   enforce: privileged   - stated in the manifest. Note that an UNLABELLED
+#                           namespace on this cluster already behaves this way:
+#                           the API server has no --admission-control-config-file
+#                           so the PodSecurity plugin falls back to its built-in
+#                           privileged/latest default. Labelling makes the
+#                           exemption greppable and reviewable instead of
+#                           implicit.
+#   warn: restricted      - observable: every kubectl apply of the Jobs below
+#                           prints the exact restricted-profile violations the
+#                           scanner commits. That warning is part of the
+#                           evidence.
+#   audit: restricted     - HONEST CAVEAT: audit annotations are written to the
+#                           API server audit log, and this cluster has no audit
+#                           logging (threat model 6.2, and kube-bench's own
+#                           1.2.16-1.2.19 findings confirm it). This label
+#                           records nothing today; it is here so the record
+#                           exists the moment an audit backend does.
+#
+# The four Kyverno ValidatingPolicies and the ImageValidatingPolicy are scoped by
+# namespaceSelector to [demo, demo-kyverno-only] only, so none of them evaluates
+# anything in this namespace. Nothing here is gated by admission — that is the
+# residual risk conceded in threat model 6.7, and this namespace is a concrete
+# instance of it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cis-benchmark
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

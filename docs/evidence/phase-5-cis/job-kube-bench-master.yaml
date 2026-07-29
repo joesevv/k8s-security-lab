@@ -1,0 +1,266 @@
+# Phase 5 — kube-bench CIS Benchmark scan of the CONTROL-PLANE node.
+#
+# WHAT THIS IS: a run-once Job that assesses seclab-control-plane against the
+# CIS Kubernetes Benchmark. It is an ASSESSMENT, not a control: it enforces
+# nothing, blocks no attack, and its output is a list of findings. It lives
+# under docs/evidence/ because it exists only to produce the committed
+# transcript, exactly like the phase-2b attack manifests.
+#
+# IMAGE PIN: tag@sha256:digest, per this repo's own disallow-latest-and-bare-tag
+# and restrict-registries policies. Upstream's job-master.yaml ships
+# `docker.io/aquasec/kube-bench:latest`, which would violate BOTH of those
+# policies if this Job ran in a policy-scoped namespace. It does not (see
+# 00-namespace-cis-benchmark.yaml), so nothing forces the pin — it is pinned
+# because the repo's written rule is that images are pinned, and shipping an
+# unpinned manifest would let the claim exceed the practice. The digest is the
+# multi-arch OCI index for v0.15.6, resolved from Docker Hub and cross-checked
+# against public.ecr.aws/aquasecurity/kube-bench:v0.15.6 (identical). kube-bench
+# publishes to Docker Hub and AWS public ECR only — there is no ghcr.io image,
+# so the phase-4 signature gate has nothing to say about it and none is claimed.
+#
+# BENCHMARK PIN: --benchmark cis-1.12 is stated rather than auto-detected.
+# kube-bench v0.15.6's version_mapping stops at Kubernetes "1.34"; this cluster
+# is v1.35.5, so auto-detection would silently walk the minor version DOWN one
+# step (1.35 -> 1.34) and land on cis-1.12 with nothing in the output saying it
+# did. Pinning produces the same benchmark by an auditable route. Note also that
+# --benchmark and --version are mutually exclusive.
+#
+# READ THE FIRST FIVE LINES OF THE OUTPUT BEFORE BELIEVING THE WARNING THERE.
+# kube-bench prints, unconditionally and before it does anything else:
+#   "Warning: Kubernetes version was not auto-detected ... Assuming default
+#    version 1.18"
+# That line is COSMETIC HERE and does NOT mean the cluster was graded against the
+# CIS benchmark for Kubernetes 1.18. In cmd/root.go the call is
+# getBenchmarkVersion(kubeVersion, benchmarkVersion, getPlatformInfo(), ...) —
+# getPlatformInfo() is an ARGUMENT, so Go evaluates it (and its getKubeVersion()
+# probe, which fails because no ServiceAccount token is mounted) every single run.
+# But cmd/common.go only consults the detected version inside
+# `if isEmpty(benchmarkVersion)`, a branch --benchmark cis-1.12 never enters.
+#
+# --v=1 is set precisely so the report is SELF-PROVING on this point instead of
+# relying on a reader trusting the paragraph above. It costs 11 lines and makes
+# kube-bench name, in its own words, the benchmark and the exact config files it
+# loaded:
+#   common.go:351] Kubernetes version: "" to Benchmark version: "cis-1.12"
+#   common.go:274] Using config file: cfg/cis-1.12/config.yaml
+#   common.go:78]  Using test file: cfg/cis-1.12/master.yaml
+#   common.go:78]  Using test file: cfg/cis-1.12/controlplane.yaml
+#   common.go:78]  Using test file: cfg/cis-1.12/etcd.yaml
+#   common.go:78]  Using test file: cfg/cis-1.12/policies.yaml
+# Note the empty kube version: "" — it was never consulted, which is the point.
+# The rejected alternative was to mount a ServiceAccount token so auto-detection
+# succeeds and the warning disappears. That buys a cosmetically cleaner log by
+# handing API credentials to a hostPID pod with node-filesystem access, which is
+# the exact capability set an escape attacker wants. The log line is cheaper.
+#
+# TARGETS: master,controlplane,etcd,policies. Upstream's job-master.yaml runs
+# `--targets master` only, which silently skips three of the five targets
+# cis-1.12 defines. The `node` target runs separately in job-kube-bench-node.yaml
+# because it must land on a worker.
+#
+# --include-test-output prints the VALUE each check actually observed, not just
+# PASS/FAIL. Without it a reader has to take the triage on faith.
+#
+# PRIVILEGES REQUESTED, AND WHY EACH IS NEEDED:
+#   hostPID: true      - checks 1.2.x / 1.3.x / 2.x read live component flags by
+#                        running `ps -ef | grep kube-apiserver` (etc.). Without
+#                        the host PID namespace the container sees only its own
+#                        PID 1 and every flag check degrades to a false FAIL.
+#                        On kind the control-plane components are static pods,
+#                        but they run in the NODE's PID namespace, so this works.
+#   /etc/kubernetes    - static pod manifests (1.1.1-1.1.8), admin.conf /
+#                        scheduler.conf / controller-manager.conf permissions
+#                        (1.1.13-1.1.20), and the PKI directory (1.1.20-1.1.21).
+#   /var/lib/etcd      - etcd data directory permissions and ownership (1.1.11,
+#                        1.1.12).
+#   /var/lib/kubelet   - kubelet config.yaml, read by the controlplane/node
+#                        checks that fall back to audit_config.
+#   /var/lib/cni       - CNI file permission/ownership checks (1.1.9, 1.1.10)
+#                        stat everything under /var/lib/cni/networks.
+#   /etc/systemd       - kubelet.service and its 10-kubeadm.conf dropin. kind
+#                        DOES run systemd as PID 1 and the kubelet IS a real
+#                        systemd unit, so these checks are applicable here.
+#   /lib/systemd       - the distro-shipped unit path kube-bench also probes.
+#   /etc/passwd,
+#   /etc/group         - needed for `stat -c %U:%G` to resolve uid/gid to names
+#                        in every ownership check. Files, not directories.
+# All mounts are readOnly: true. hostNetwork is NOT requested; upstream does not
+# ask for it either.
+#
+# UPSTREAM MOUNTS DELIBERATELY TRIMMED (upstream job-master.yaml has 14, this
+# has 8):
+#   /usr/bin                        - upstream mounts it at
+#                                     /usr/local/mount-from-host/bin purely so
+#                                     kube-bench can exec kubectl/kubelet to
+#                                     auto-detect the Kubernetes version.
+#                                     --benchmark is pinned, so no detection
+#                                     happens. It is also the largest mount in
+#                                     the set (kubectl and kubelet are ~58 MB
+#                                     each) and the least appropriate thing to
+#                                     expose to a scanner.
+#   /etc/cni/net.d, /opt/cni/bin    - not referenced by any check in cis-1.12
+#                                     (verified against cfg/config.yaml and
+#                                     cfg/cis-1.12/*.yaml at tag v0.15.6).
+#   /srv/kubernetes,
+#   /var/lib/kube-scheduler,
+#   /var/lib/kube-controller-manager - DO NOT EXIST on a kubeadm/kind node.
+#                                     These hostPath volumes carry no `type:`
+#                                     field, so the kubelet would CREATE them as
+#                                     empty root-owned directories on the node —
+#                                     a "read-only audit" silently mutating the
+#                                     host filesystem. Dropping them yields the
+#                                     identical check result (kube-bench guards
+#                                     these with `test -e`) with no node
+#                                     mutation.
+# Every volume that IS kept sets an explicit `type:` (Directory or File) for the
+# same reason: it makes the kubelet refuse to start the Pod if the path is
+# missing, instead of quietly creating an empty directory and letting the scan
+# report a fabricated result against it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-bench-master
+  namespace: cis-benchmark
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    app.kubernetes.io/component: cis-benchmark
+spec:
+  # No retries: a failed run should be read, not silently re-attempted into a
+  # pile of pods. kube-bench's --exit-code is left at its default 0 so FAIL
+  # findings do NOT fail the container — the findings belong in the transcript,
+  # not in a BackoffLimitExceeded loop.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: k8s-security-lab
+        app.kubernetes.io/component: cis-benchmark
+    spec:
+      restartPolicy: Never
+      hostPID: true
+      # No Kubernetes API access is needed: every check in these four targets
+      # inspects node-local files or processes. Projecting a token would be
+      # privilege this scanner has no use for. (Upstream leaves the default
+      # ServiceAccount token mounted.)
+      automountServiceAccountToken: false
+      # Pin to the control-plane node. On a worker, /var/lib/etcd does not exist
+      # and /etc/kubernetes/manifests is empty, so a master-target scan there
+      # would report fabricated failures against absent files.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      # seclab-control-plane carries exactly one taint:
+      #   node-role.kubernetes.io/control-plane:NoSchedule  (no value)
+      # operator: Exists matches a valueless taint. The legacy
+      # node-role.kubernetes.io/master toleration upstream also ships is dropped:
+      # that taint was removed in Kubernetes 1.25 and is not present here.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: kube-bench
+          image: docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+          command:
+            - kube-bench
+            - run
+            - --v=1
+            - --benchmark
+            - cis-1.12
+            - --targets
+            - master,controlplane,etcd,policies
+            - --include-test-output
+          # The scanner must read root-owned 0600 files (static pod manifests,
+          # kubeconfigs) and the 0700 etcd data dir, so it runs as uid 0 — owner
+          # permissions alone suffice, which is why ALL capabilities are dropped:
+          # no CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH is needed. This is strictly
+          # tighter than upstream, which ships no securityContext at all.
+          #
+          # ASYMMETRY WITH THE NODE JOB, STATED SO IT IS NOT MISTAKEN FOR AN
+          # OVERSIGHT: job-kube-bench-node.yaml DOES add CAP_DAC_READ_SEARCH back,
+          # because the node target must read the kubelet systemd dropins and the
+          # kind node image ships /etc/systemd/system/kubelet.service.d as a
+          # directory with mode 0644 — no execute bit, so with CapEff=0 even uid 0
+          # cannot traverse it. None of this job's four targets reads a path behind
+          # such a directory: the fresh master run's output contains zero
+          # occurrences of "permission denied" (grep -ic, verified, not assumed),
+          # so the capability is withheld here rather than granted for symmetry.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: etc-kubernetes
+              mountPath: /etc/kubernetes
+              readOnly: true
+            - name: var-lib-etcd
+              mountPath: /var/lib/etcd
+              readOnly: true
+            - name: var-lib-kubelet
+              mountPath: /var/lib/kubelet
+              readOnly: true
+            - name: var-lib-cni
+              mountPath: /var/lib/cni
+              readOnly: true
+            - name: etc-systemd
+              mountPath: /etc/systemd
+              readOnly: true
+            - name: lib-systemd
+              mountPath: /lib/systemd
+              readOnly: true
+            - name: etc-passwd
+              mountPath: /etc/passwd
+              readOnly: true
+            - name: etc-group
+              mountPath: /etc/group
+              readOnly: true
+            # readOnlyRootFilesystem is on; give the process a writable scratch
+            # dir rather than let a stray temp write turn into a false finding.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: etc-kubernetes
+          hostPath:
+            path: /etc/kubernetes
+            type: Directory
+        - name: var-lib-etcd
+          hostPath:
+            path: /var/lib/etcd
+            type: Directory
+        - name: var-lib-kubelet
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: var-lib-cni
+          hostPath:
+            path: /var/lib/cni
+            type: Directory
+        - name: etc-systemd
+          hostPath:
+            path: /etc/systemd
+            type: Directory
+        - name: lib-systemd
+          hostPath:
+            path: /lib/systemd
+            type: Directory
+        - name: etc-passwd
+          hostPath:
+            path: /etc/passwd
+            type: File
+        - name: etc-group
+          hostPath:
+            path: /etc/group
+            type: File
+        - name: tmp
+          emptyDir: {}

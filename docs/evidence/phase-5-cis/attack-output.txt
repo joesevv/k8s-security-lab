@@ -1,0 +1,1226 @@
+Phase 5 — kube-bench CIS Benchmark assessment (report captured 2026-07-26;
+triage probes 2026-07-28; re-verified 2026-07-29)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, 3 nodes
+(seclab-control-plane, seclab-worker, seclab-worker2).
+Scanner: kube-bench v0.15.6, image docker.io/aquasec/kube-bench:v0.15.6
+@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5,
+run as two run-once Jobs in namespace cis-benchmark. The benchmark is PINNED
+with --benchmark cis-1.12; that pin is proved, not asserted, in section 2.
+
+FILENAME, SINCE IT DOES NOT DESCRIBE THE CONTENTS: this file is named
+attack-output.txt to match the other five phases and because three manifests
+in this directory already point at that name. It is NOT an attack transcript.
+Section 1 is the only adversarial-shaped capture in it, and the "attacker"
+there is a benign scanner being refused. Everything after section 1 is an
+assessment.
+
+NOTHING IN THIS PHASE ENFORCES ANYTHING. Every other phase in this repo ships
+a control that BLOCKS something and then proves the block. This one ships a
+scanner that MEASURES. No policy was added, no namespace label on demo was
+changed, no apiserver flag was altered, and not one CIS finding below was
+remediated. The only thing section 1 demonstrates being blocked is the scanner
+itself, by controls that already existed before this phase. A reader who takes
+"kube-bench ran" as "the cluster was hardened" has read this exactly
+backwards.
+
+THIS IS A TEACHING ARTIFACT, NOT A COMPLIANCE RESULT. kind is not a production
+cluster. Its three "nodes" are containers sharing one WSL2 kernel, its
+control-plane components are kubeadm static pods, and the large majority of
+the PASSes below are kubeadm's defaults rather than decisions this lab made. A
+passing or failing score here does not transfer to any other cluster, and it
+is not an audit result. Read the counts as "what this scanner said about this
+particular kind cluster on this particular day" — never as "N% CIS compliant".
+TWO OF THE SCANNER'S OWN RESULTS ARE DEFECTIVE, IN OPPOSITE DIRECTIONS: section
+6 records a PASS that is outright wrong, and 5a / 5d-a record a WARN kube-bench
+emitted without ever reading the file the check is about, which hid a real
+1.1.9 finding until a direct stat exposed it.
+
+SCOPE OF THE SCAN, STATED BEFORE THE NUMBERS: a Job produces ONE Pod, so the
+node target ran on seclab-worker only. seclab-worker2 was NEVER scanned by
+kube-bench. Its two node findings were confirmed by hand (probe 5d-d), as was
+the 1.1.9 CNI file mode on all three nodes (probe 5d-a), but those are manual
+checks, not kube-bench results. Scanning every worker needs a DaemonSet, which
+this phase does not ship.
+
+BENCHMARK VERSION, WITH ITS CAVEAT: cis-1.12 is the newest generic CIS config
+kube-bench v0.15.6 ships, but that config's own version_mapping stops at
+Kubernetes "1.34" and this cluster is v1.35.5. cis-1.12 is therefore applied
+ONE MINOR VERSION AHEAD of the newest Kubernetes release its authors mapped it
+to. It is the closest available match, not a declared match. CIS Benchmark
+releases lag Kubernetes releases; that is normal, and it is stated here so
+nobody writes "cis-1.12 is the CIS benchmark for Kubernetes 1.35". It is not.
+
+============================================================
+1) THE SCANNER IS REFUSED BY THE CLUSTER'S OWN HARDENING — and the control
+that refuses it is NOT the same one at both levels. Read which one answers
+rather than assuming. kube-bench needs hostPID and hostPath mounts of node
+paths; that is a restricted-profile violation, so PSA enforce=restricted on
+demo rejects it, and that rejection is CORRECT BEHAVIOUR, not a bug. Applied
+with --server-side --dry-run=server, which is a real admission request that
+persists nothing. A plain --dry-run=server against an unchanged object
+computes an empty patch and never reaches the server at all, so it would prove
+nothing.
+
+1a) POD PATH — the object PSA actually evaluates.
+$ kubectl apply --server-side --dry-run=server -f docs/evidence/phase-5-cis/rejected-in-demo-pod.yaml
+============================================================
+Error from server (Forbidden): pods "kube-bench-master-pod" is forbidden: violates PodSecurity "restricted:v1.35": host namespaces (hostPID=true), restricted volume types (volumes "etc-kubernetes", "var-lib-etcd", "var-lib-kubelet", "var-lib-cni", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+(exit code: 1)
+
+=> DENIED by PodSecurity, naming 'restricted:v1.35' — the PINNED enforce
+version from the demo namespace label, which is what distinguishes an ENFORCE
+denial from the 'restricted:latest' WARN the warn label emits. Four
+independent restricted violations are listed. No Kyverno policy is involved:
+none of the four ValidatingPolicies covers hostPID or hostPath, and PSA
+short-circuits before webhooks anyway.
+
+1b) JOB PATH — the SAME spec as a batch/v1 Job. The answer changes, and the
+change is the interesting part. rejected-in-demo-job.yaml differs from the
+real job-kube-bench-master.yaml in the namespace and nothing else; checked,
+not asserted:
+$ diff <(grep -v '^\s*#' job-kube-bench-master.yaml | grep -v '^\s*$') <(grep -v '^\s*#' rejected-in-demo-job.yaml | grep -v '^\s*$')
+5c5
+<   namespace: cis-benchmark
+---
+>   namespace: demo
+(exit code: 1 = the files differ, by exactly those two lines)
+
+$ kubectl apply --server-side --dry-run=server -f docs/evidence/phase-5-cis/rejected-in-demo-job.yaml
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), restricted volume types (volumes "etc-kubernetes", "var-lib-etcd", "var-lib-kubelet", "var-lib-cni", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.
+(exit code: 1)
+
+=> READ THE VERDICT, DO NOT ASSUME IT. Two things changed at the Job level.
+First, PodSecurity only WARNED — 'restricted:latest', which is the warn label,
+not the enforce one — and would have ADMITTED. PSA enforcement is evaluated
+against PODS; against a batch/v1 Job it warns and admits. With PSA alone the
+Job object would exist and then never produce a Pod, the rejection surfacing
+only in Job controller events: a silent failure instead of a loud one. Second,
+the actual denial came from KYVERNO, and NOT for hostPID or hostPath. It fired
+restrict-registries, because docker.io/aquasec/* is outside the allow-list.
+Writing "Kyverno blocks kube-bench because it is privileged" would exceed
+enforced reality: no ValidatingPolicy in policies/ covers hostPID or hostPath
+at all. Note also that require-drop-all-capabilities did NOT fire on this
+spec, because the master Job drops ALL capabilities.
+
+1c) COUNTERPROOF for that last sentence — the NODE job spec, which adds
+DAC_READ_SEARCH back, in the same namespace. A SECOND Kyverno policy should
+now fire. Scratchpad copy of job-kube-bench-node.yaml with the namespace
+swapped to demo; not committed, because it exists only to produce this line.
+$ kubectl apply --server-side --dry-run=server -f <scratch>/node-in-demo.yaml
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), unrestricted capabilities (container "kube-bench" must not include "DAC_READ_SEARCH" in securityContext.capabilities.add), restricted volume types (volumes "etc-kubernetes", "var-lib-kubelet", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.; Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.
+(exit code: 1)
+
+=> CONFIRMED: with DAC_READ_SEARCH added, TWO policies fire —
+restrict-registries AND require-drop-all-capabilities. PSA still only warns at
+the Job level. So the precise, defensible sentence is: in demo, the scanner's
+POD is refused by Pod Security Admission for hostPID / hostPath / root, and
+the scanner's JOB is refused by Kyverno for registry (and, for the node
+job, for capability add-back) — two different controls, at two different
+stages, for two different reasons.
+
+1d) NOTHING WAS PERSISTED by any of the three dry runs, and demo is untouched:
+$ kubectl -n demo get jobs,pods
+NAME                              READY   STATUS    RESTARTS      AGE
+pod/nginx-775678cbbd-mmrxb        1/1     Running   1 (15h ago)   22h
+pod/nginx-775678cbbd-q7ddt        1/1     Running   1 (15h ago)   22h
+pod/signed-app-5d4c4ffff4-vrtps   1/1     Running   1 (15h ago)   20h
+(exit code: 0 — three workload pods, zero jobs, no kube-bench object)
+
+$ kubectl get ns demo --show-labels
+NAME   STATUS   AGE    LABELS
+demo   Active   5d4h   app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=demo,pod-security.kubernetes.io/enforce-version=v1.35,pod-security.kubernetes.io/enforce=restricted,pod-security.kubernetes.io/warn=restricted
+(exit code: 0)
+
+=> REPRODUCIBLE ACROSS TWO HOST REBOOTS. Section 1a and 1b were first captured
+2026-07-26, re-run 2026-07-28, and re-run again 2026-07-29 against the live
+cluster; the output is byte-identical all three times. The demo namespace
+still carries enforce=restricted with enforce-version=v1.35.
+
+============================================================
+2) THE RUN — where it had to go instead, that it landed on the right nodes,
+that the benchmark really is cis-1.12, and the headline counts. The namespace
+cis-benchmark carries enforce=privileged and warn=restricted, so every apply
+below PRINTS the exact restricted violations the scanner commits. That warning
+is part of the deliverable, not noise to be suppressed.
+$ kubectl apply -f docs/evidence/phase-5-cis/00-namespace-cis-benchmark.yaml
+$ kubectl get ns cis-benchmark --show-labels
+$ kubectl apply -f docs/evidence/phase-5-cis/job-kube-bench-master.yaml
+$ kubectl apply -f docs/evidence/phase-5-cis/job-kube-bench-node.yaml
+============================================================
+namespace/cis-benchmark unchanged
+(exit code: 0)
+
+NAME            STATUS   AGE   LABELS
+cis-benchmark   Active   15h   app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=cis-benchmark,pod-security.kubernetes.io/audit=restricted,pod-security.kubernetes.io/enforce=privileged,pod-security.kubernetes.io/warn=restricted
+(exit code: 0)
+
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), restricted volume types (volumes "etc-kubernetes", "var-lib-etcd", "var-lib-kubelet", "var-lib-cni", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+job.batch/kube-bench-master created
+(exit code: 0)
+
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), unrestricted capabilities (container "kube-bench" must not include "DAC_READ_SEARCH" in securityContext.capabilities.add), restricted volume types (volumes "etc-kubernetes", "var-lib-kubelet", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+job.batch/kube-bench-node created
+(exit code: 0)
+
+PLACEMENT MATTERS AND IS THEREFORE PROVEN: if the master Job did not land on
+seclab-control-plane, its 1.x and 2.x findings would be a scan of a machine
+with no control plane on it.
+$ kubectl -n cis-benchmark get pod -l app.kubernetes.io/component=cis-benchmark -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,IMAGE_ID:.status.containerStatuses[0].imageID'
+POD                       NODE                   PHASE       IMAGE_ID
+kube-bench-master-fr4dk   seclab-control-plane   Succeeded   docker.io/aquasec/kube-bench@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+kube-bench-node-cmwb8     seclab-worker          Succeeded   docker.io/aquasec/kube-bench@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+(exit code: 0)
+
+$ kubectl -n cis-benchmark get pod -o jsonpath='{range .items[*]}{.metadata.name}{"  caps.drop="}{.spec.containers[0].securityContext.capabilities.drop}{"  caps.add="}{.spec.containers[0].securityContext.capabilities.add}{"\n"}{end}'
+kube-bench-master-fr4dk  caps.drop=["ALL"]  caps.add=
+kube-bench-node-cmwb8  caps.drop=["ALL"]  caps.add=["DAC_READ_SEARCH"]
+(exit code: 0)
+
+THE BENCHMARK PIN — "Assuming default version 1.18" IS COSMETIC, AND THAT IS
+PROVED TWO INDEPENDENT WAYS RATHER THAN ASSERTED. A reader who sees that
+warning in sections 3 and 4 will reasonably conclude a v1.35 cluster was
+graded against the benchmark for v1.18. It was not.
+$ kubectl -n cis-benchmark get job kube-bench-master -o jsonpath='{.spec.template.spec.containers[0].command}'
+$ kubectl -n cis-benchmark get job kube-bench-node   -o jsonpath='{.spec.template.spec.containers[0].command}'
+["kube-bench","run","--v=1","--benchmark","cis-1.12","--targets","master,controlplane,etcd,policies","--include-test-output"]
+["kube-bench","run","--v=1","--benchmark","cis-1.12","--targets","node","--include-test-output"]
+(exit code: 0)
+
+PROOF 1 — the log lines must be read TOGETHER, not the warning alone. --v=1 is
+set on both Jobs precisely so the report is self-proving here. FOUR lines are
+common to both Jobs, in this order:
+  Warning: Kubernetes version was not auto-detected ... Assuming default version 1.18
+  util.go:395] Unable to get Kubernetes version from kubectl, using default version: 1.18
+  common.go:351] Kubernetes version: "" to Benchmark version: "cis-1.12"
+  common.go:274] Using config file: cfg/cis-1.12/config.yaml
+The FIFTH line is PER-JOB, not shared, because each Job loads the test file for
+its own target:
+  master Job: common.go:78] Using test file: cfg/cis-1.12/master.yaml
+  node Job:   common.go:78] Using test file: cfg/cis-1.12/node.yaml
+Both are under cfg/cis-1.12/, which is all the pin argument needs; the master
+Job goes on to load controlplane.yaml, etcd.yaml and policies.yaml from that
+same directory. Each line above appears at the top of section 3 (master) or
+section 4 (node) in full, with its glog timestamp and PID prefix; the only
+editing here is the '...' elision in the Warning line, which is bare stderr and
+carries no glog prefix.
+The kube version is the EMPTY STRING "" at the point the benchmark is
+resolved. The detected 1.18 was never consulted: in cmd/common.go,
+getBenchmarkVersion only looks at the detected version inside `if
+isEmpty(benchmarkVersion)`, and --benchmark cis-1.12 never enters that branch.
+The warning is printed by getPlatformInfo(), which Go evaluates as an ARGUMENT
+before the function runs, unconditionally, and whose kubectl probe fails
+because this Job sets automountServiceAccountToken: false and has no API
+credentials.
+
+PROOF 2 — the falsifiable one. If the 1.18 fallback HAD determined the
+benchmark, the loaded config would not be cis-1.12. Upstream's own mapping at
+tag v0.15.6:
+$ gh api repos/aquasecurity/kube-bench/contents/cfg/config.yaml?ref=v0.15.6 --jq .content | base64 -d | sed -n '/version_mapping/,/target_mapping/p'
+  "1.18": "cis-1.6"
+  ...
+  "1.32": "cis-1.12"
+  "1.33": "cis-1.12"
+  "1.34": "cis-1.12"
+(exit code: 0)
+
+=> 1.18 maps to cis-1.6, NOT cis-1.12, and the run demonstrably loaded
+cfg/cis-1.12/*. The two are mutually exclusive, so the run is conclusively
+against cis-1.12 and the warning is cosmetic. Recorded because an earlier
+working note in this project assumed 1.18 mapped to cis-1.5; it does not.
+
+THE HEADLINE COUNTS, which are kube-bench's own summary lines from sections 3
+and 4 added together:
+  master job (targets master, controlplane, etcd, policies) : 46 PASS  10 FAIL  50 WARN  0 INFO
+  node job   (target node)                                  : 17 PASS   2 FAIL   6 WARN  0 INFO
+  combined                                                  : 63 PASS  12 FAIL  56 WARN  0 INFO
+
+=> DO NOT READ THOSE THREE NUMBERS AT FACE VALUE, AND SECTIONS 5 AND 6 ARE
+WHY. 38 of the 56 WARNs were never evaluated at all, so they are not findings
+in either direction. And at least one of the 63 PASSes is wrong (section 6).
+The defensible phrasing is "63 checks kube-bench SCORED AS PASSING", not "63
+controls verified compliant". Applying this repo's own standard to the scanner
+itself: the claim must not exceed what was actually checked.
+
+============================================================
+3) FULL kube-bench REPORT — MASTER JOB, verbatim and unedited, on
+seclab-control-plane. Targets master,controlplane,etcd,policies. The four "==
+Summary <target> ==" blocks are kube-bench's, and the "== Summary total ==" at
+the end covers only this Job's four targets, not the node Job.
+$ kubectl -n cis-benchmark logs job/kube-bench-master
+============================================================
+I0726 17:24:40.383231    4206 util.go:650] Checking for oc
+I0726 17:24:40.383728    4206 util.go:679] Can't find oc command: exec: "oc": executable file not found in $PATH
+Warning: Kubernetes version was not auto-detected because kubectl could not connect to the Kubernetes server. This may be because the kubeconfig information is missing or has credentials that do not match the server. Assuming default version 1.18
+I0726 17:24:40.763230    4206 util.go:395] Unable to get Kubernetes version from kubectl, using default version: 1.18
+I0726 17:24:40.763319    4206 common.go:351] Kubernetes version: "" to Benchmark version: "cis-1.12"
+I0726 17:24:40.763731    4206 common.go:274] Using config file: cfg/cis-1.12/config.yaml
+I0726 17:24:40.764097    4206 common.go:78] Using test file: cfg/cis-1.12/master.yaml
+I0726 17:24:40.790772    4206 util.go:264] executable 'flanneld' not running
+I0726 17:24:40.794195    4206 util.go:264] executable 'hyperkube kubelet' not running
+I0726 17:24:41.969108    4206 common.go:78] Using test file: cfg/cis-1.12/controlplane.yaml
+I0726 17:24:41.980915    4206 common.go:78] Using test file: cfg/cis-1.12/etcd.yaml
+I0726 17:24:42.272164    4206 common.go:78] Using test file: cfg/cis-1.12/policies.yaml
+[INFO] 1 Control Plane Security Configuration
+[INFO] 1.1 Control Plane Node Configuration Files
+[PASS] 1.1.1 Ensure that the API server pod specification file permissions are set to 600 or more restrictive (Automated)
+[PASS] 1.1.2 Ensure that the API server pod specification file ownership is set to root:root (Automated)
+[PASS] 1.1.3 Ensure that the controller manager pod specification file permissions are set to 600 or more restrictive (Automated)
+[PASS] 1.1.4 Ensure that the controller manager pod specification file ownership is set to root:root (Automated)
+[PASS] 1.1.5 Ensure that the scheduler pod specification file permissions are set to 600 or more restrictive (Automated)
+[PASS] 1.1.6 Ensure that the scheduler pod specification file ownership is set to root:root (Automated)
+[PASS] 1.1.7 Ensure that the etcd pod specification file permissions are set to 600 or more restrictive (Automated)
+[PASS] 1.1.8 Ensure that the etcd pod specification file ownership is set to root:root (Automated)
+[WARN] 1.1.9 Ensure that the Container Network Interface file permissions are set to 600 or more restrictive (Manual)
+[WARN] 1.1.10 Ensure that the Container Network Interface file ownership is set to root:root (Manual)
+[PASS] 1.1.11 Ensure that the etcd data directory permissions are set to 700 or more restrictive (Automated)
+[FAIL] 1.1.12 Ensure that the etcd data directory ownership is set to etcd:etcd (Automated)
+	 root:root
+[PASS] 1.1.13 Ensure that the default administrative credential file permissions are set to 600 (Automated)
+[PASS] 1.1.14 Ensure that the default administrative credential file ownership is set to root:root (Automated)
+[PASS] 1.1.15 Ensure that the scheduler.conf file permissions are set to 600 or more restrictive (Automated)
+[PASS] 1.1.16 Ensure that the scheduler.conf file ownership is set to root:root (Automated)
+[PASS] 1.1.17 Ensure that the controller-manager.conf file permissions are set to 600 or more restrictive (Automated)
+[PASS] 1.1.18 Ensure that the controller-manager.conf file ownership is set to root:root (Automated)
+[PASS] 1.1.19 Ensure that the Kubernetes PKI directory and file ownership is set to root:root (Automated)
+[PASS] 1.1.20 Ensure that the Kubernetes PKI certificate file permissions are set to 644 or more restrictive (Manual)
+[PASS] 1.1.21 Ensure that the Kubernetes PKI key file permissions are set to 600 (Manual)
+[INFO] 1.2 API Server
+[WARN] 1.2.1 Ensure that the --anonymous-auth argument is set to false (Manual)
+[PASS] 1.2.2 Ensure that the --token-auth-file parameter is not set (Automated)
+[WARN] 1.2.3 Ensure that the --DenyServiceExternalIPs is set (Manual)
+[PASS] 1.2.4 Ensure that the --kubelet-client-certificate and --kubelet-client-key arguments are set as appropriate (Automated)
+[FAIL] 1.2.5 Ensure that the --kubelet-certificate-authority argument is set as appropriate (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[PASS] 1.2.6 Ensure that the --authorization-mode argument is not set to AlwaysAllow (Automated)
+[PASS] 1.2.7 Ensure that the --authorization-mode argument includes Node (Automated)
+[PASS] 1.2.8 Ensure that the --authorization-mode argument includes RBAC (Automated)
+[WARN] 1.2.9 Ensure that the admission control plugin EventRateLimit is set (Manual)
+[PASS] 1.2.10 Ensure that the admission control plugin AlwaysAdmit is not set (Automated)
+[WARN] 1.2.11 Ensure that the admission control plugin AlwaysPullImages is set (Manual)
+[PASS] 1.2.12 Ensure that the admission control plugin ServiceAccount is set (Automated)
+[PASS] 1.2.13 Ensure that the admission control plugin NamespaceLifecycle is set (Automated)
+[PASS] 1.2.14 Ensure that the admission control plugin NodeRestriction is set (Automated)
+[FAIL] 1.2.15 Ensure that the --profiling argument is set to false (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[FAIL] 1.2.16 Ensure that the --audit-log-path argument is set (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[FAIL] 1.2.17 Ensure that the --audit-log-maxage argument is set to 30 or as appropriate (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[FAIL] 1.2.18 Ensure that the --audit-log-maxbackup argument is set to 10 or as appropriate (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[FAIL] 1.2.19 Ensure that the --audit-log-maxsize argument is set to 100 or as appropriate (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[WARN] 1.2.20 Ensure that the --request-timeout argument is set as appropriate (Manual)
+[PASS] 1.2.21 Ensure that the --service-account-lookup argument is set to true (Automated)
+[PASS] 1.2.22 Ensure that the --service-account-key-file argument is set as appropriate (Automated)
+[PASS] 1.2.23 Ensure that the --etcd-certfile and --etcd-keyfile arguments are set as appropriate (Automated)
+[PASS] 1.2.24 Ensure that the --tls-cert-file and --tls-private-key-file arguments are set as appropriate (Automated)
+[PASS] 1.2.25 Ensure that the --client-ca-file argument is set as appropriate (Automated)
+[PASS] 1.2.26 Ensure that the --etcd-cafile argument is set as appropriate (Automated)
+[WARN] 1.2.27 Ensure that the --encryption-provider-config argument is set as appropriate (Manual)
+[WARN] 1.2.28 Ensure that encryption providers are appropriately configured (Manual)
+[WARN] 1.2.29 Ensure that the API Server only makes use of Strong Cryptographic Ciphers (Manual)
+[FAIL] 1.2.30 Ensure that the --service-account-extend-token-expiration parameter is set to false (Automated)
+	 root         597     394 12 16:17 ?        00:08:03 kube-apiserver --advertise-address=172.18.0.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+[INFO] 1.3 Controller Manager
+[WARN] 1.3.1 Ensure that the --terminated-pod-gc-threshold argument is set as appropriate (Manual)
+[FAIL] 1.3.2 Ensure that the --profiling argument is set to false (Automated)
+	 root         615     427  2 16:17 ?        00:01:52 kube-controller-manager --allocate-node-cidrs=true --authentication-kubeconfig=/etc/kubernetes/controller-manager.conf --authorization-kubeconfig=/etc/kubernetes/controller-manager.conf --bind-address=127.0.0.1 --client-ca-file=/etc/kubernetes/pki/ca.crt --cluster-cidr=10.244.0.0/16 --cluster-name=seclab --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt --cluster-signing-key-file=/etc/kubernetes/pki/ca.key --controllers=*,bootstrapsigner,tokencleaner --kubeconfig=/etc/kubernetes/controller-manager.conf --leader-elect=true --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --root-ca-file=/etc/kubernetes/pki/ca.crt --service-account-private-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --use-service-account-credentials=true --enable-hostpath-provisioner=true
+[PASS] 1.3.3 Ensure that the --use-service-account-credentials argument is set to true (Automated)
+[PASS] 1.3.4 Ensure that the --service-account-private-key-file argument is set as appropriate (Automated)
+[PASS] 1.3.5 Ensure that the --root-ca-file argument is set as appropriate (Automated)
+[PASS] 1.3.6 Ensure that the RotateKubeletServerCertificate argument is set to true (Automated)
+[PASS] 1.3.7 Ensure that the --bind-address argument is set to 127.0.0.1 (Automated)
+[INFO] 1.4 Scheduler
+[FAIL] 1.4.1 Ensure that the --profiling argument is set to false (Automated)
+	 root         611     460  1 16:17 ?        00:00:40 kube-scheduler --authentication-kubeconfig=/etc/kubernetes/scheduler.conf --authorization-kubeconfig=/etc/kubernetes/scheduler.conf --bind-address=127.0.0.1 --kubeconfig=/etc/kubernetes/scheduler.conf --leader-elect=true
+[PASS] 1.4.2 Ensure that the --bind-address argument is set to 127.0.0.1 (Automated)
+
+== Remediations master ==
+1.1.9 Run the below command (based on the file location on your system) on the control plane node.
+For example, chmod 600 <path/to/cni/files>
+
+1.1.10 Run the below command (based on the file location on your system) on the control plane node.
+For example,
+chown root:root <path/to/cni/files>
+
+1.1.12 On the etcd server node, get the etcd data directory, passed as an argument --data-dir,
+from the command 'ps -ef | grep etcd'.
+Run the below command (based on the etcd data directory found above).
+For example, chown etcd:etcd /var/lib/etcd
+
+1.2.1 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the below parameter.
+--anonymous-auth=false
+
+1.2.3 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and add the `DenyServiceExternalIPs` plugin
+to the enabled admission plugins, as such --enable-admission-plugin=DenyServiceExternalIPs.
+
+1.2.5 Follow the Kubernetes documentation and setup the TLS connection between
+the apiserver and kubelets. Then, edit the API server pod specification file
+/etc/kubernetes/manifests/kube-apiserver.yaml on the control plane node and set the
+--kubelet-certificate-authority parameter to the path to the cert file for the certificate authority.
+--kubelet-certificate-authority=<ca-string>
+
+1.2.9 Follow the Kubernetes documentation and set the desired limits in a configuration file.
+Then, edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+and set the below parameters.
+--enable-admission-plugins=...,EventRateLimit,...
+--admission-control-config-file=<path/to/configuration/file>
+
+1.2.11 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the --enable-admission-plugins parameter to include
+AlwaysPullImages.
+--enable-admission-plugins=...,AlwaysPullImages,...
+
+1.2.15 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the below parameter.
+--profiling=false
+
+1.2.16 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the --audit-log-path parameter to a suitable path and
+file where you would like audit logs to be written, for example,
+--audit-log-path=/var/log/apiserver/audit.log
+
+1.2.17 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the --audit-log-maxage parameter to 30
+or as an appropriate number of days, for example,
+--audit-log-maxage=30
+
+1.2.18 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the --audit-log-maxbackup parameter to 10 or to an appropriate
+value. For example,
+--audit-log-maxbackup=10
+
+1.2.19 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the --audit-log-maxsize parameter to an appropriate size in MB.
+For example, to set it as 100 MB, --audit-log-maxsize=100
+
+1.2.20 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+and set the below parameter as appropriate and if needed.
+For example, --request-timeout=300s
+
+1.2.27 Follow the Kubernetes documentation and configure a EncryptionConfig file.
+Then, edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the --encryption-provider-config parameter to the path of that file.
+For example, --encryption-provider-config=</path/to/EncryptionConfig/File>
+
+1.2.28 Follow the Kubernetes documentation and configure a EncryptionConfig file.
+In this file, choose aescbc, kms or secretbox as the encryption provider.
+
+1.2.29 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml
+on the control plane node and set the below parameter.
+--tls-cipher-suites=TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,
+TLS_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+
+1.2.30 Edit the API server pod specification file /etc/kubernetes/manifests/kube-apiserver.yaml on the Control Plane node and set the --service-account-extend-token-expiration parameter to false.
+`--service-account-extend-token-expiration=false`
+By default, this parameter is set to true.
+
+1.3.1 Edit the Controller Manager pod specification file /etc/kubernetes/manifests/kube-controller-manager.yaml
+on the control plane node and set the --terminated-pod-gc-threshold to an appropriate threshold,
+for example, --terminated-pod-gc-threshold=10
+
+1.3.2 Edit the Controller Manager pod specification file /etc/kubernetes/manifests/kube-controller-manager.yaml
+on the control plane node and set the below parameter.
+--profiling=false
+
+1.4.1 Edit the Scheduler pod specification file /etc/kubernetes/manifests/kube-scheduler.yaml file
+on the control plane node and set the below parameter.
+--profiling=false
+
+
+== Summary master ==
+39 checks PASS
+10 checks FAIL
+11 checks WARN
+0 checks INFO
+
+[INFO] 2 Etcd Node Configuration
+[INFO] 2 Etcd Node Configuration
+[PASS] 2.1 Ensure that the --cert-file and --key-file arguments are set as appropriate (Automated)
+[PASS] 2.2 Ensure that the --client-cert-auth argument is set to true (Automated)
+[PASS] 2.3 Ensure that the --auto-tls argument is not set to true (Automated)
+[PASS] 2.4 Ensure that the --peer-cert-file and --peer-key-file arguments are set as appropriate (Automated)
+[PASS] 2.5 Ensure that the --peer-client-cert-auth argument is set to true (Automated)
+[PASS] 2.6 Ensure that the --peer-auto-tls argument is not set to true (Automated)
+[PASS] 2.7 Ensure that a unique Certificate Authority is used for etcd (Manual)
+
+== Summary etcd ==
+7 checks PASS
+0 checks FAIL
+0 checks WARN
+0 checks INFO
+
+[INFO] 3 Control Plane Configuration
+[INFO] 3.1 Authentication and Authorization
+[WARN] 3.1.1 Client certificate authentication should not be used for users (Manual)
+[WARN] 3.1.2 Service account token authentication should not be used for users (Manual)
+[WARN] 3.1.3 Bootstrap token authentication should not be used for users (Manual)
+[INFO] 3.2 Logging
+[WARN] 3.2.1 Ensure that a minimal audit policy is created (Manual)
+[WARN] 3.2.2 Ensure that the audit policy covers key security concerns (Manual)
+
+== Remediations controlplane ==
+3.1.1 Alternative mechanisms provided by Kubernetes such as the use of OIDC should be
+implemented in place of client certificates.
+
+3.1.2 Alternative mechanisms provided by Kubernetes such as the use of OIDC should be implemented
+in place of service account tokens.
+
+3.1.3 Alternative mechanisms provided by Kubernetes such as the use of OIDC should be implemented
+in place of bootstrap tokens.
+
+3.2.1 Create an audit policy file for your cluster.
+
+3.2.2 Review the audit policy provided for the cluster and ensure that it covers
+at least the following areas,
+- Access to Secrets managed by the cluster. Care should be taken to only
+  log Metadata for requests to Secrets, ConfigMaps, and TokenReviews, in
+  order to avoid risk of logging sensitive data.
+- Modification of Pod and Deployment objects.
+- Use of `pods/exec`, `pods/portforward`, `pods/proxy` and `services/proxy`.
+For most requests, minimally logging at the Metadata level is recommended
+(the most basic level of logging).
+
+
+== Summary controlplane ==
+0 checks PASS
+0 checks FAIL
+5 checks WARN
+0 checks INFO
+
+[INFO] 5 Kubernetes Policies
+[INFO] 5.1 RBAC and Service Accounts
+[WARN] 5.1.1 Ensure that the cluster-admin role is only used where required (Manual)
+[WARN] 5.1.2 Minimize access to secrets (Manual)
+[WARN] 5.1.3 Minimize wildcard use in Roles and ClusterRoles (Manual)
+[WARN] 5.1.4 Minimize access to create pods (Manual)
+[WARN] 5.1.5 Ensure that default service accounts are not actively used (Manual)
+[WARN] 5.1.6 Ensure that Service Account Tokens are only mounted where necessary (Manual)
+[WARN] 5.1.7 Avoid use of system:masters group (Manual)
+[WARN] 5.1.8 Limit use of the Bind, Impersonate and Escalate permissions in the Kubernetes cluster (Manual)
+[WARN] 5.1.9 Minimize access to create persistent volumes (Manual)
+[WARN] 5.1.10 Minimize access to the proxy sub-resource of nodes (Manual)
+[WARN] 5.1.11 Minimize access to the approval sub-resource of certificatesigningrequests objects (Manual)
+[WARN] 5.1.12 Minimize access to webhook configuration objects (Manual)
+[WARN] 5.1.13 Minimize access to the service account token creation (Manual)
+[INFO] 5.2 Pod Security Standards
+[WARN] 5.2.1 Ensure that the cluster has at least one active policy control mechanism in place (Manual)
+[WARN] 5.2.2 Minimize the admission of privileged containers (Manual)
+[WARN] 5.2.3 Minimize the admission of containers wishing to share the host process ID namespace (Manual)
+[WARN] 5.2.4 Minimize the admission of containers wishing to share the host IPC namespace (Manual)
+[WARN] 5.2.5 Minimize the admission of containers wishing to share the host network namespace (Manual)
+[WARN] 5.2.6 Minimize the admission of containers with allowPrivilegeEscalation (Manual)
+[WARN] 5.2.7 Minimize the admission of root containers (Manual)
+[WARN] 5.2.8 Minimize the admission of containers with the NET_RAW capability (Manual)
+[WARN] 5.2.9 Minimize the admission of containers with capabilities assigned (Manual)
+[WARN] 5.2.10 Minimize the admission of Windows HostProcess containers (Manual)
+[WARN] 5.2.11 Minimize the admission of HostPath volumes (Manual)
+[WARN] 5.2.12 Minimize the admission of containers which use HostPorts (Manual)
+[INFO] 5.3 Network Policies and CNI
+[WARN] 5.3.1 Ensure that the CNI in use supports NetworkPolicies (Manual)
+[WARN] 5.3.2 Ensure that all Namespaces have NetworkPolicies defined (Manual)
+[INFO] 5.4 Secrets Management
+[WARN] 5.4.1 Prefer using Secrets as files over Secrets as environment variables (Manual)
+[WARN] 5.4.2 Consider external secret storage (Manual)
+[INFO] 5.5 Extensible Admission Control
+[WARN] 5.5.1 Configure Image Provenance using ImagePolicyWebhook admission controller (Manual)
+[INFO] 5.6 General Policies
+[WARN] 5.6.1 Create administrative boundaries between resources using namespaces (Manual)
+[WARN] 5.6.2 Ensure that the seccomp profile is set to docker/default in your Pod definitions (Manual)
+[WARN] 5.6.3 Apply SecurityContext to your Pods and Containers (Manual)
+[WARN] 5.6.4 The default namespace should not be used (Manual)
+
+== Remediations policies ==
+5.1.1 Identify all clusterrolebindings to the cluster-admin role. Check if they are used and
+if they need this role or if they could use a role with fewer privileges.
+Where possible, first bind users to a lower privileged role and then remove the
+clusterrolebinding to the cluster-admin role : kubectl delete clusterrolebinding [name]
+Condition: is_compliant is false if rolename is not cluster-admin and rolebinding is cluster-admin.
+
+5.1.2 Where possible, remove get, list and watch access to Secret objects in the cluster.
+
+5.1.3 Where possible replace any use of wildcards ["*"] in roles and clusterroles with specific
+objects or actions.
+Condition: role_is_compliant is false if ["*"] is found in rules.
+Condition: clusterrole_is_compliant is false if ["*"] is found in rules.
+
+5.1.4 Where possible, remove create access to pod objects in the cluster.
+
+5.1.5 Create explicit service accounts wherever a Kubernetes workload requires specific access
+to the Kubernetes API server.
+Modify the configuration of each default service account to include this value
+`automountServiceAccountToken: false`.
+
+5.1.6 Modify the definition of ServiceAccounts and Pods which do not need to mount service
+account tokens to disable it, with `automountServiceAccountToken: false`.
+If both the ServiceAccount and the Pod's .spec specify a value for automountServiceAccountToken, the Pod spec takes precedence.
+Condition: Pod is_compliant to true when
+  - ServiceAccount is automountServiceAccountToken: false and Pod is automountServiceAccountToken: false or notset
+  - ServiceAccount is automountServiceAccountToken: true notset and Pod is automountServiceAccountToken: false
+
+5.1.7 Remove the system:masters group from all users in the cluster.
+
+5.1.8 Where possible, remove the impersonate, bind and escalate rights from subjects.
+
+5.1.9 Where possible, remove create access to PersistentVolume objects in the cluster.
+
+5.1.10 Where possible, remove access to the proxy sub-resource of node objects.
+
+5.1.11 Where possible, remove access to the approval sub-resource of certificatesigningrequests objects.
+
+5.1.12 Where possible, remove access to the validatingwebhookconfigurations or mutatingwebhookconfigurations objects
+
+5.1.13 Where possible, remove access to the token sub-resource of serviceaccount objects.
+
+5.2.1 Ensure that either Pod Security Admission or an external policy control system is in place
+for every namespace which contains user workloads.
+
+5.2.2 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of privileged containers.
+Audit: the audit list all pods' containers to retrieve their .securityContext.privileged value.
+Condition: is_compliant is false if container's `.securityContext.privileged` is set to `true`.
+Default: by default, there are no restrictions on the creation of privileged containers.
+
+5.2.3 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of `hostPID` containers.
+Audit: the audit retrieves each Pod' spec.hostPID.
+Condition: is_compliant is false if Pod's spec.hostPID is set to `true`.
+Default: by default, there are no restrictions on the creation of hostPID containers.
+
+5.2.4 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of `hostIPC` containers.
+Audit: the audit retrieves each Pod' spec.IPC.
+Condition: is_compliant is false if Pod's spec.hostIPC is set to `true`.
+Default: by default, there are no restrictions on the creation of hostIPC containers.
+
+5.2.5 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of `hostNetwork` containers.
+Audit: the audit retrieves each Pod' spec.hostNetwork.
+Condition: is_compliant is false if Pod's spec.hostNetwork is set to `true`.
+Default: by default, there are no restrictions on the creation of hostNetwork containers.
+
+5.2.6 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of containers with `.securityContext.allowPrivilegeEscalation` set to `true`.
+Audit: the audit retrieves each Pod's container(s) `.securityContext.allowPrivilegeEscalation`.
+Condition: is_compliant is false if container's `.securityContext.allowPrivilegeEscalation` is set to `true`.
+Default: If notset, privilege escalation is allowed (default to true). However if PSP/PSA is used with a `restricted` profile,
+privilege escalation is explicitly disallowed unless configured otherwise.
+
+5.2.7 Create a policy for each namespace in the cluster, ensuring that either `MustRunAsNonRoot`
+or `MustRunAs` with the range of UIDs not including 0, is set.
+
+5.2.8 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of containers with the `NET_RAW` capability.
+
+5.2.9 Review the use of capabilities in applications running on your cluster. Where a
+namespace contains applications which do not require any Linux capabilities to operate
+consider adding a policy which forbids the admission of containers which do not drop all
+capabilities.
+
+5.2.10 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of containers that have `.securityContext.windowsOptions.hostProcess` set to `true`.
+
+5.2.11 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of containers with `hostPath` volumes.
+
+5.2.12 Add policies to each namespace in the cluster which has user workloads to restrict the
+admission of containers which use `hostPort` sections.
+
+5.3.1 If the CNI plugin in use does not support network policies, consideration should be given to
+making use of a different plugin, or finding an alternate mechanism for restricting traffic
+in the Kubernetes cluster.
+
+5.3.2 Follow the documentation and create NetworkPolicy objects as you need them.
+
+5.4.1 If possible, rewrite application code to read Secrets from mounted secret files, rather than
+from environment variables.
+
+5.4.2 Refer to the Secrets management options offered by your cloud provider or a third-party
+secrets management solution.
+
+5.5.1 Follow the Kubernetes documentation and setup image provenance.
+
+5.6.1 Follow the documentation and create namespaces for objects in your deployment as you need
+them.
+
+5.6.2 Use `securityContext` to enable the docker/default seccomp profile in your pod definitions.
+An example is as below:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+
+5.6.3 Follow the Kubernetes documentation and apply SecurityContexts to your Pods. For a
+suggested list of SecurityContexts, you may refer to the CIS Security Benchmark for Docker
+Containers.
+
+5.6.4 Ensure that namespaces are created to allow for appropriate segregation of Kubernetes
+resources and that all new resources are created in a specific namespace.
+
+
+== Summary policies ==
+0 checks PASS
+0 checks FAIL
+34 checks WARN
+0 checks INFO
+
+== Summary total ==
+46 checks PASS
+10 checks FAIL
+50 checks WARN
+0 checks INFO
+
+(exit code: 0)
+
+=> The container exits 0 with ten FAILs in the report because
+kube-bench --exit-code is left at its default. That is deliberate: findings
+belong in this transcript, not in a BackoffLimitExceeded loop. A zero exit here
+means "the scanner ran", not "the cluster passed".
+
+============================================================
+4) FULL kube-bench REPORT — NODE JOB, verbatim and unedited, on seclab-worker.
+Target node. seclab-worker2 is NOT covered by this or any other capture in this
+file.
+$ kubectl -n cis-benchmark logs job/kube-bench-node
+============================================================
+I0726 17:24:40.956942    2680 util.go:650] Checking for oc
+I0726 17:24:40.958265    2680 util.go:679] Can't find oc command: exec: "oc": executable file not found in $PATH
+Warning: Kubernetes version was not auto-detected because kubectl could not connect to the Kubernetes server. This may be because the kubeconfig information is missing or has credentials that do not match the server. Assuming default version 1.18
+I0726 17:24:41.462878    2680 util.go:395] Unable to get Kubernetes version from kubectl, using default version: 1.18
+I0726 17:24:41.462948    2680 common.go:351] Kubernetes version: "" to Benchmark version: "cis-1.12"
+I0726 17:24:41.463405    2680 common.go:274] Using config file: cfg/cis-1.12/config.yaml
+I0726 17:24:41.463664    2680 common.go:78] Using test file: cfg/cis-1.12/node.yaml
+I0726 17:24:41.514545    2680 util.go:264] executable 'hyperkube kubelet' not running
+[INFO] 4 Worker Node Security Configuration
+[INFO] 4.1 Worker Node Configuration Files
+[FAIL] 4.1.1 Ensure that the kubelet service file permissions are set to 600 or more restrictive (Automated)
+	 permissions=644
+[PASS] 4.1.2 Ensure that the kubelet service file ownership is set to root:root (Automated)
+[WARN] 4.1.3 If proxy kubeconfig file exists ensure permissions are set to 600 or more restrictive (Manual)
+[WARN] 4.1.4 If proxy kubeconfig file exists ensure ownership is set to root:root (Manual)
+[PASS] 4.1.5 Ensure that the --kubeconfig kubelet.conf file permissions are set to 600 or more restrictive (Automated)
+[PASS] 4.1.6 Ensure that the --kubeconfig kubelet.conf file ownership is set to root:root (Automated)
+[PASS] 4.1.7 Ensure that the certificate authorities file permissions are set to 644 or more restrictive (Manual)
+[PASS] 4.1.8 Ensure that the client certificate authorities file ownership is set to root:root (Manual)
+[FAIL] 4.1.9 If the kubelet config.yaml configuration file is being used validate permissions set to 600 or more restrictive (Automated)
+	 permissions=644
+[PASS] 4.1.10 If the kubelet config.yaml configuration file is being used validate file ownership is set to root:root (Automated)
+[INFO] 4.2 Kubelet
+[PASS] 4.2.1 Ensure that the --anonymous-auth argument is set to false (Automated)
+[PASS] 4.2.2 Ensure that the --authorization-mode argument is not set to AlwaysAllow (Automated)
+[PASS] 4.2.3 Ensure that the --client-ca-file argument is set as appropriate (Automated)
+[PASS] 4.2.4 Verify that if defined, the --read-only-port argument is set to 0 (Manual)
+[PASS] 4.2.5 Ensure that the --streaming-connection-idle-timeout argument is not set to 0 (Manual)
+[PASS] 4.2.6 Ensure that the --make-iptables-util-chains argument is set to true (Automated)
+[PASS] 4.2.7 Ensure that the --hostname-override argument is not set (Manual)
+[PASS] 4.2.8 Ensure that the eventRecordQPS argument is set to a level which ensures appropriate event capture (Manual)
+[WARN] 4.2.9 Ensure that the --tls-cert-file and --tls-private-key-file arguments are set as appropriate (Manual)
+[PASS] 4.2.10 Ensure that the --rotate-certificates argument is not set to false (Automated)
+[PASS] 4.2.11 Verify that the RotateKubeletServerCertificate argument is set to true (Manual)
+[WARN] 4.2.12 Ensure that the Kubelet only makes use of Strong Cryptographic Ciphers (Manual)
+[WARN] 4.2.13 Ensure that a limit is set on pod PIDs (Manual)
+[WARN] 4.2.14 Ensure that the --seccomp-default parameter is set to true (Manual)
+[INFO] 4.3 kube-proxy
+[PASS] 4.3.1 Ensure that the kube-proxy metrics service is bound to localhost (Automated)
+
+== Remediations node ==
+4.1.1 Run the below command (based on the file location on your system) on the each worker node.
+For example, chmod 600 /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+4.1.3 Run the below command (based on the file location on your system) on the each worker node.
+For example,
+chmod 600 /etc/kubernetes/proxy.conf
+
+4.1.4 Run the below command (based on the file location on your system) on the each worker node.
+For example, chown root:root /etc/kubernetes/proxy.conf
+
+4.1.9 Run the following command (using the config file location identified in the Audit step)
+chmod 600 /var/lib/kubelet/config.yaml
+
+4.2.9 If using a Kubelet config file, edit the file to set `tlsCertFile` to the location
+of the certificate file to use to identify this Kubelet, and `tlsPrivateKeyFile`
+to the location of the corresponding private key file.
+If using command line arguments, edit the kubelet service file
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf on each worker node and
+set the below parameters in KUBELET_CERTIFICATE_ARGS variable.
+--tls-cert-file=<path/to/tls-certificate-file>
+--tls-private-key-file=<path/to/tls-key-file>
+Based on your system, restart the kubelet service. For example,
+systemctl daemon-reload
+systemctl restart kubelet.service
+
+4.2.12 If using a Kubelet config file, edit the file to set `tlsCipherSuites` to
+TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+or to a subset of these values.
+If using executable arguments, edit the kubelet service file
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf on each worker node and
+set the --tls-cipher-suites parameter as follows, or to a subset of these values.
+--tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+Based on your system, restart the kubelet service. For example:
+systemctl daemon-reload
+systemctl restart kubelet.service
+
+4.2.13 Decide on an appropriate level for this parameter and set it,
+either via the --pod-max-pids command line parameter or the PodPidsLimit configuration file setting.
+
+4.2.14 Set the parameter, either via the --seccomp-default command line parameter or the
+seccompDefault configuration file setting.
+By default the seccomp profile is not enabled.
+
+
+== Summary node ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+
+== Summary total ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+
+(exit code: 0)
+
+============================================================
+5) THE TRIAGE — every FAIL and WARN classified. This section, not the counts,
+is what the phase is for. A list of 68 non-PASSes that nobody has read is not
+a security artifact; it is homework left undone.
+
+FIRST, THE METHODOLOGY, BECAUSE IT CHANGES THE ARITHMETIC. kube-bench emits
+WARN for two completely different reasons and the report does not distinguish
+them. Classified mechanically against cfg/cis-1.12/*.yaml at upstream tag
+v0.15.6 — for each check id, whether it has an audit command at all, and
+whether that command shells out to kubectl:
+  27 WARNs are checks with `type: "manual"` and NO audit command. kube-bench
+     NEVER EVALUATES these; it prints WARN plus remediation text
+     unconditionally.
+     3.1.1-3.1.3, 3.2.2, and 23 of section 5 are these.
+  11 WARNs are checks whose audit shells out to `kubectl`. These Jobs set
+     automountServiceAccountToken: false and hold no API credentials — the
+     same reason the version warning appears — so those audits produce no
+     output and the check WARNs. NOT EVALUATED either. (5.1.1-5.1.6,
+     5.2.2-5.2.6.)
+  18 WARNs DID run a local audit that did not pass. These ARE real results,
+     reported as WARN rather than FAIL only because the check carries
+     `scored: false`.
+So: 12 FAIL + 18 WARN = 30 checks were evaluated and did not pass. 38 were not
+assessed at all.
+
+=> THE TRAP, AND IT WOULD HAVE INVERTED THE TRUTH. 5.2.1 "Ensure that the
+cluster has at least one active policy control mechanism in place" WARNs — and
+this cluster runs BOTH PSA enforce=restricted on demo AND five Kyverno
+policies in Deny. 5.2.3 "Minimize the admission of containers wishing to share
+the host process ID namespace" and 5.2.11 "Minimize the admission of HostPath
+volumes" also WARN, while section 1 above shows PSA denying exactly those two
+things by name. Reading section 5's WARNs as failures would state the OPPOSITE
+of what this cluster enforces. They mean "not assessed", nothing more.
+Conversely, nothing in this run CREDITS the lab for phases 2a/2b/2c either —
+the whole policies target is unassessed, so this scan says nothing about the
+lab's RBAC, admission, NetworkPolicy or secrets posture in either direction.
+
+------------------------------------------------------------
+5a) REAL AND NOT PREVIOUSLY DOCUMENTED BY THIS REPO — 20 checks. Listed first
+because they are the only part of this file that is new information. Ordered
+by this analyst's severity judgement, loudest first; the ORDERING is
+judgement, the FINDINGS are the scanner's output plus the probes in 5d — with
+one exception, 1.1.9, which is a probe finding the scanner did not report at
+all and had itself mis-triaged as kind-inherent.
+------------------------------------------------------------
+  1.2.5   FAIL  High. --kubelet-certificate-authority is absent from the
+                apiserver command line (visible in the 1.2.5 test output in
+                section 3). The apiserver therefore does not verify kubelet
+                serving certificates, so an attacker positioned between
+                apiserver and kubelet can impersonate a kubelet. Pairs with
+                4.2.9 below: one end presents an unverifiable cert, the other
+                declines to check it.
+  1.2.1   WARN  Moderate. --anonymous-auth is not set to false. CONFIRMED BY
+                OBSERVATION, not inferred from a missing flag — see probe
+                5d-e: unauthenticated GETs of /version and /healthz return
+                HTTP 200 and disclose the exact patch version, git commit and
+                build date, a clean fingerprint for CVE matching. BOUNDED:
+                RBAC still returns 403 on /api/v1/secrets, so this is
+                information disclosure, not access.
+  4.2.9   WARN  Moderate. Kubelet tlsCertFile / tlsPrivateKeyFile are unset,
+                so the kubelet serves a self-signed certificate. The other
+                half of 1.2.5.
+  1.2.30  FAIL  Moderate. --service-account-extend-token-expiration is not set
+                to false, so legacy tokens get extended lifetimes. This check
+                is new in cis-1.12 and would not have appeared under an older
+                benchmark.
+  4.2.14  WARN  Moderate. seccompDefault is not set on the kubelet, so there
+                is no cluster-wide default seccomp profile. PSA enforces
+                RuntimeDefault in demo only; every unlabelled namespace on
+                this cluster gets no seccomp profile at all. This is a
+                concrete instance of threat-model 6.7 (policies are
+                namespace-scoped), and the cis-benchmark namespace itself is
+                another.
+  4.2.13  WARN  Moderate. podPidsLimit is not set, so a single container can
+                exhaust the node's PID table — a denial-of-service that needs
+                no privilege escalation.
+  1.2.11  WARN  Moderate. AlwaysPullImages is not in
+                --enable-admission-plugins. A pod can therefore run an image
+                already cached on the node without proving it is authorized to
+                pull it. Worth reading alongside phase 4: the signature gate
+                checks provenance at admission, but image-pull authorization
+                is a separate property and it is not enforced here.
+  1.2.15  FAIL  Moderate. apiserver --profiling is not false, exposing
+                /debug/pprof on the API port. Reachable by anyone who can
+                reach 6443 and pass authz.
+  1.3.2   FAIL  Low-moderate. Controller-manager --profiling is not false.
+  1.4.1   FAIL  Low-moderate. Scheduler --profiling is not false. Both are
+                mitigated, though not closed, by --bind-address=127.0.0.1,
+                which is visible in their own test output in section 3 and
+                PASSES as 1.3.7 and 1.4.2.
+  1.2.9   WARN  Low-moderate. EventRateLimit admission plugin is not enabled,
+                so nothing rate-limits event floods against the apiserver.
+  4.1.1   FAIL  Low. The kubelet service file is mode 644 where CIS wants 600.
+  4.1.9   FAIL  Low. /var/lib/kubelet/config.yaml is mode 644 where CIS wants
+                600. Both are kubeadm's own defaults, so they would appear on
+                a real kubeadm cluster too — this is NOT a kind artifact. Low
+                because both files are root-owned, not world-writable, and
+                hold no credentials. Confirmed present on seclab-worker2 as
+                well (probe 5d-d), which kube-bench never scanned.
+  1.1.9   WARN  Low — AND kube-bench's OWN AUDIT MISSED IT. The CNI config
+                file kind actually uses, /etc/cni/net.d/10-kindnet.conflist,
+                is mode 644 where CIS wants 600 or more restrictive, identical
+                on all three nodes (probe 5d-a). Same class as 4.1.1 and 4.1.9
+                directly above, and rated the same way: the 644 bits are
+                world-readable, but the containing directory /etc/cni/net.d is
+                700 root:root, so only root on the node can reach the file
+                today, and it holds no credentials. kube-bench NEVER READ THAT
+                FILE: its 1.1.9 audit stats only a directory derived from the
+                kubelet's --cni-conf-dir flag (not set here) and
+                /var/lib/cni/networks (does not exist), so it emitted a no-data
+                WARN instead of reporting the 644 — and /etc/cni is not among
+                the master Job's hostPath mounts either, so no run of this
+                manifest could have caught it. THAT MAKES THIS A SECOND
+                DEFECTIVE AUDIT IN THE SAME RUN, the sibling of the 4.2.5 false
+                PASS in section 6: there the tool scored a bad value it did
+                read as PASS, here it warned without ever reading the value.
+                Same lesson twice — the tool's output has to be checked
+                against the node, not trusted. This check sat in 5c as
+                kind-inherent until the file itself was stat-ed. 1.1.10
+                (ownership) is genuinely fine and stays in 5c.
+  1.1.12  FAIL  Low. /var/lib/etcd is owned root:root where CIS wants
+                etcd:etcd. Also NOT kind-specific: kubeadm runs etcd as a
+                static pod as root and creates no `etcd` OS user, so this
+                reads root:root on any kubeadm cluster. Consequence is small
+                because 1.1.11 PASSES at mode 700 — only root can read the
+                directory, so the control's intent is met by a different
+                mechanism.
+  1.2.3   WARN  Low. DenyServiceExternalIPs admission plugin not enabled.
+  1.2.29  WARN  Low. apiserver --tls-cipher-suites is not pinned to the strong
+                list; Go's defaults apply.
+  4.2.12  WARN  Low. Same for the kubelet's tlsCipherSuites.
+  1.2.20  WARN  Weak. --request-timeout is not set, so the 60s default applies
+                — which is itself a reasonable value. Kept in this bucket
+                rather than flattered into "not a finding", but a reviewer is
+                right to discount it.
+  1.3.1   WARN  Weak. --terminated-pod-gc-threshold is not set. Operational
+                hygiene rather than a security property. Same caveat as
+                1.2.20.
+
+=> NONE OF THESE 20 WAS REMEDIATED BY THIS PHASE. They are recorded, not
+fixed. Threat-model 6.3 concedes "no CIS remediation"; running the scanner
+does not discharge that concession, it only itemises it.
+
+------------------------------------------------------------
+5b) REAL AND ALREADY DOCUMENTED — 7 checks. The scanner independently
+rediscovers two residual risks this repo had already written down and
+conceded. That is a useful result: it is external corroboration that the
+concessions are real and were not hand-waved.
+------------------------------------------------------------
+  1.2.16  FAIL  --audit-log-path not set
+  1.2.17  FAIL  --audit-log-maxage not set
+  1.2.18  FAIL  --audit-log-maxbackup not set
+  1.2.19  FAIL  --audit-log-maxsize not set
+  3.2.1   WARN  no minimal audit policy exists -> all five are threat-model
+                6.2, "No audit logging", already stated. They also confirm the
+                honest caveat written into 00-namespace-cis-benchmark.yaml:
+                that namespace carries audit=restricted, and with no audit
+                backend that label records nothing today.
+  1.2.27  WARN  --encryption-provider-config not set
+  1.2.28  WARN  encryption providers not configured -> both are threat-model
+                6.1, "No encryption at rest for etcd", already stated. Note
+                the interaction with phase 3: sealed-secrets keeps plaintext
+                out of GIT, which is a different threat from plaintext at rest
+                in ETCD. This scan does not weaken the phase-3 claim; it
+                confirms the boundary phase 3 already drew.
+
+------------------------------------------------------------
+5c) KIND-INHERENT, NOT FINDINGS — 3 checks. Each was verified empirically
+rather than assumed, because "that's just kind" is exactly the excuse that
+hides real gaps. In all three the WARN is for ABSENCE OF DATA, not for a bad
+value. THIS BUCKET USED TO HOLD FOUR: 1.1.9 was moved out to 5a once the file
+that control is actually about was stat-ed and found at 644. Its WARN really
+was for absence of data, but absence of data in the scanner is not absence of
+a finding on the node — which is precisely the excuse this paragraph warns
+about, caught in this file's own triage.
+------------------------------------------------------------
+  1.1.10  WARN  CNI file ownership. /var/lib/cni/networks DOES NOT EXIST and
+                the kubelet carries no --cni-conf-dir flag (probe 5d-a), so
+                both audit branches emit nothing, no test item matches, and
+                kube-bench WARNs for lack of data — an artifact of kindnet,
+                which does not use host-local IPAM's networks directory. What
+                does exist, /var/lib/cni and /var/lib/cni/results, is 700
+                root:root and would pass. UNLIKE 1.1.9, this one survives the
+                stat: the CNI config kind actually uses,
+                /etc/cni/net.d/10-kindnet.conflist, is root:root on all three
+                nodes, which is exactly what this check wants (probe 5d-a).
+  4.1.3   WARN  proxy kubeconfig permissions
+  4.1.4   WARN  proxy kubeconfig ownership -> the check text literally begins
+                "If proxy kubeconfig file exists". /etc/kubernetes/proxy.conf
+                does not exist (probe 5d-b) because kubeadm and kind run
+                kube-proxy as a DaemonSet reading a ConfigMap at
+                /var/lib/kube-proxy/config.conf. WARN for absence.
+
+------------------------------------------------------------
+5d) GROUND-TRUTH PROBES — the observations that turned each classification
+above from a guess into a fact. Run against the live nodes, read-only. First
+captured 2026-07-28, re-run 2026-07-29 with identical results. ONE EXCEPTION,
+flagged where it appears: the second probe in 5d-a is new on 2026-07-29 and has
+no 2026-07-28 counterpart. It is the probe that was missing, and its absence is
+why 1.1.9 sat in the wrong bucket.
+------------------------------------------------------------
+
+5d-a) 1.1.9 / 1.1.10 — the CNI paths. TWO probes, and the difference between
+them is the whole point: the first reads only the paths kube-bench's audit
+shells out to, the second reads the file the CONTROL is about. They give
+opposite answers, and the second is the one that moved 1.1.9 out of 5c.
+
+FIRST — the paths the 1.1.9 / 1.1.10 audits actually touch:
+$ docker exec seclab-control-plane sh -c 'ls -la /var/lib/cni; ls -la /var/lib/cni/networks; ps -ef | grep kubele[t] | grep -o -- "--cni-conf-dir[= ][^ ]*"'
+total 12
+drwx------  3 root root 4096 Jul 21 12:37 .
+drwxr-xr-x 15 root root 4096 Jul 21 12:37 ..
+drwx------  2 root root 4096 Jul 28 13:09 results
+ls: cannot access '/var/lib/cni/networks': No such file or directory
+(flag absent)
+(exit code: 0)
+
+SECOND — where kind ACTUALLY puts the CNI config, on all three nodes. Captured
+2026-07-29; this probe is newer than the rest of section 5d and has no
+2026-07-28 counterpart, because until it was run 1.1.9 was mis-triaged.
+$ for n in seclab-control-plane seclab-worker seclab-worker2; do docker exec $n stat -c "%a %U:%G %n" /etc/cni/net.d /etc/cni/net.d/10-kindnet.conflist; done
+700 root:root /etc/cni/net.d
+644 root:root /etc/cni/net.d/10-kindnet.conflist
+700 root:root /etc/cni/net.d
+644 root:root /etc/cni/net.d/10-kindnet.conflist
+700 root:root /etc/cni/net.d
+644 root:root /etc/cni/net.d/10-kindnet.conflist
+(exit code: 0)
+
+=> THE TWO CHECKS SPLIT, AND ONLY THE SECOND PROBE COULD SHOW THAT. 1.1.9 is a
+REAL finding (5a): 644 where CIS wants 600 or more restrictive, identical on
+all three nodes. 1.1.10 is NOT a finding (5c): root:root is exactly what that
+check wants. kube-bench reported both as no-data WARNs and was wrong about one
+of them: its two audit branches are --cni-conf-dir (unset) and
+/var/lib/cni/networks (absent), neither of which is /etc/cni/net.d — and
+/etc/cni is not among the master Job's hostPath mounts either, so the file was
+unreachable from inside the scanner regardless. That makes this a SECOND
+DEFECTIVE AUDIT alongside the 4.2.5 false PASS of section 6: one WARNed without
+ever reading the value, the other PASSED a bad value it did read. Severity is
+Low, bounded the same way 1.1.12 is: the 644 bits are world-readable, but
+/etc/cni/net.d at 700 root:root means only root on the node can traverse to the
+file today, and it holds no credentials.
+
+5d-b) 4.1.3 / 4.1.4 — the proxy kubeconfig.
+$ docker exec seclab-worker sh -c 'ls -l /etc/kubernetes/proxy.conf; ps -ef | grep kube-prox[y]'
+ls: cannot access '/etc/kubernetes/proxy.conf': No such file or directory
+root         766     544  0 13:09 ?        00:00:00 /usr/local/bin/kube-proxy --config=/var/lib/kube-proxy/config.conf --hostname-override=seclab-worker
+(exit code: 0)
+
+5d-c) 1.1.12 — the etcd data directory.
+$ docker exec seclab-control-plane stat -c "%a %U:%G %n" /var/lib/etcd
+700 root:root /var/lib/etcd
+(exit code: 0)
+
+5d-d) 4.1.1 / 4.1.9 — kubelet file modes, INCLUDING the worker kube-bench
+never scanned.
+$ docker exec seclab-worker  sh -c 'stat -c "%a %U:%G %n" /var/lib/kubelet/config.yaml /etc/systemd/system/kubelet.service /etc/systemd/system/kubelet.service.d/10-kubeadm.conf'
+644 root:root /var/lib/kubelet/config.yaml
+644 root:root /etc/systemd/system/kubelet.service
+644 root:root /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+$ docker exec seclab-worker2 sh -c 'stat -c "%a %U:%G %n" /var/lib/kubelet/config.yaml /etc/systemd/system/kubelet.service.d/10-kubeadm.conf'
+644 root:root /var/lib/kubelet/config.yaml
+644 root:root /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+(exit code: 0)
+
+5d-e) 1.2.1 — anonymous auth, tested rather than inferred. No client
+certificate, no bearer token.
+$ curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:61949/version
+200
+$ curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:61949/healthz
+200
+$ curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:61949/api/v1/secrets
+403
+$ curl -sk https://127.0.0.1:61949/version
+{
+  "major": "1",
+  "minor": "35",
+  "emulationMajor": "1",
+  "emulationMinor": "35",
+  "minCompatibilityMajor": "1",
+  "minCompatibilityMinor": "34",
+  "gitVersion": "v1.35.5",
+  "gitCommit": "6636cbce3bbef91ff61d36658757179426f9e1b2",
+  "gitTreeState": "clean",
+  "buildDate": "2026-05-12T09:50:51Z",
+  "goVersion": "go1.25.9",
+  "compiler": "gc",
+  "platform": "linux/amd64"
+}
+(exit code: 0)
+
+=> ANONYMOUS ACCESS IS ENABLED AND IT WORKS. An unauthenticated caller gets
+the exact patch version, git commit and build date. It is bounded — RBAC still
+returns 403 on real resources — so this is information disclosure, not access,
+which is why 1.2.1 is ranked Moderate and not High.
+
+============================================================
+6) A FALSE PASS. DO NOT TRUST THE PASS COUNT ON THIS CHECK. Found by auditing
+the report against the live node configuration instead of reading the report
+alone — which is the only way this class of error is findable.
+$ for n in seclab-control-plane seclab-worker seclab-worker2; do docker exec $n grep -E "^streamingConnectionIdleTimeout" /var/lib/kubelet/config.yaml; done
+============================================================
+streamingConnectionIdleTimeout: 0s
+streamingConnectionIdleTimeout: 0s
+streamingConnectionIdleTimeout: 0s
+(exit code: 0)
+
+kube-bench reported, in section 4 above:
+  [PASS] 4.2.5 Ensure that the --streaming-connection-idle-timeout argument is not set to 0 (Manual)
+
+The configured value IS zero on all three nodes, which is exactly what the
+check forbids. Why it passed anyway, from cfg/cis-1.12/node.yaml at tag
+v0.15.6:
+      - id: 4.2.5
+        tests:
+          test_items:
+            - flag: --streaming-connection-idle-timeout
+              path: '{.streamingConnectionIdleTimeout}'
+              compare: {op: noteq, value: 0}
+            - flag: --streaming-connection-idle-timeout
+              path: '{.streamingConnectionIdleTimeout}'
+              set: false
+          bin_op: or
+
+=> THE VALUE IS THE STRING "0s", A GO DURATION, AND THE COMPARISON IS AGAINST
+THE INTEGER 0. "0s" != "0" is true, so the first test item passes and the
+or-clause short-circuits to PASS. The control's intent — that idle exec /
+attach / port-forward streams get reaped — is NOT met: 0s disables the timeout
+entirely. Because --include-test-output prints observed values only for
+NON-passing checks, this value never appears in sections 3 or 4, so a reader
+cannot catch it from the transcript alone.
+
+WHERE THE 0s CAME FROM IS UNVERIFIED — the one triage input in this phase with
+no probe behind it. The working note behind this phase asserted the setting is
+kind's doing and not kubeadm's, and that kubeadm's own default is 4h0m0s. NO
+COMMAND WAS RUN FOR EITHER HALF, so neither is repeated here as fact and the
+origin is NOT used to classify the setting. It would not change the finding if
+it were true: this phase refuses "it is the installer's default" as a defence
+for 4.1.1 / 4.1.9 and 1.1.12, and the same standard applies here. THE FINDING
+STANDS ON ITS OWN — 0s is the live value on all three nodes above, so idle
+exec / attach / port-forward streams are never reaped, and it is NOT
+remediated.
+
+And the METHODOLOGICAL POINT MUST NOT BE DROPPED EITHER: a kube-bench PASS is
+not proof of compliance. At least one PASS in this run is an artifact of a
+string-versus-integer comparison, and no systematic audit of the other 62 was
+performed. Report the figure as "63 checks kube-bench scored as passing", never
+as "63 controls verified compliant". That is this repo's own
+claims-must-not-exceed-reality standard applied to the scanner itself.
+
+============================================================
+7) FINAL STATE — the Jobs are deleted, the namespace is kept, and nothing else
+on the cluster moved. The reports above are the only surviving output, which
+is the point of committing them.
+$ kubectl -n cis-benchmark delete job kube-bench-master kube-bench-node
+$ kubectl -n cis-benchmark get jobs,pods
+$ kubectl get jobs -A
+============================================================
+job.batch "kube-bench-master" deleted from cis-benchmark namespace
+job.batch "kube-bench-node" deleted from cis-benchmark namespace
+(exit code: 0)
+
+No resources found in cis-benchmark namespace.
+(exit code: 0)
+
+No resources found
+(exit code: 0 — no Job anywhere on the cluster)
+
+$ kubectl get ns cis-benchmark --show-labels
+NAME            STATUS   AGE     LABELS
+cis-benchmark   Active   2d11h   app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=cis-benchmark,pod-security.kubernetes.io/audit=restricted,pod-security.kubernetes.io/enforce=privileged,pod-security.kubernetes.io/warn=restricted
+
+$ kubectl -n demo get deploy
+NAME         READY   UP-TO-DATE   AVAILABLE   AGE
+nginx        2/2     2            2           7d1h
+signed-app   1/1     1            1           3d16h
+
+$ kubectl get validatingpolicy,imagevalidatingpolicy
+NAME                                                                  AGE     READY
+validatingpolicy.policies.kyverno.io/disallow-latest-and-bare-tag     6d23h   true
+validatingpolicy.policies.kyverno.io/disallow-privileged-containers   6d23h   true
+validatingpolicy.policies.kyverno.io/require-drop-all-capabilities    6d23h   true
+validatingpolicy.policies.kyverno.io/restrict-registries              6d23h   true
+
+NAME                                                                    AGE     READY
+imagevalidatingpolicy.policies.kyverno.io/require-keyless-signed-ghcr   3d18h   true
+(exit code: 0)
+
+=> The namespace is KEPT on purpose: the committed manifests define it, so the
+phase stays re-appliable with kubectl apply -f docs/evidence/phase-5-cis/.
+demo is untouched, all five Kyverno policies are still READY=true, and all
+three nodes are Ready. The scan changed nothing on this cluster, which is the
+correct outcome for an assessment.
+
+============================================================
+NOT PROVEN HERE — stated so the evidence above is not read as more than it is.
+============================================================
+- NOTHING WAS REMEDIATED. Not one of the 30 evaluated non-passing checks was
+  fixed. Threat-model 6.3's concession "no CIS remediation" still stands in
+  full; the only honest amendment this phase earns is that kube-bench now
+  reports against CIS and the findings are recorded rather than unknown.
+- NO ENFORCEMENT WAS ADDED. This phase belongs in no "attack it blocks" or
+  "enforced scope" column, and it earns no row in the Control -> MITRE ATT&CK
+  table, whose own rule is that mappings are MITIGATIONS. A scanner mitigates
+  nothing.
+- IT IS NOT A DETECTIVE CONTROL EITHER. Threat-model 6.2 notes every control
+  in this lab is preventive and none is detective. A point-in-time benchmark
+  is neither: it ran twice, by hand, on demand. Nothing schedules it, nothing
+  alerts on it, and nothing re-runs it when the cluster changes. Tomorrow's
+  cluster is unassessed.
+- seclab-worker2 WAS NEVER SCANNED. A Job produces one Pod. The two node FAILs
+  were confirmed on worker2 by hand (probe 5d-d) and the false PASS of section
+  6 was confirmed on all three nodes, but no kube-bench result exists for that
+  node. Full coverage needs a DaemonSet, which this phase does not ship.
+- THE SECTION 5 (POLICIES) TARGET IS EFFECTIVELY UNASSESSED. All 34 of its
+  checks WARN: 11 because the Job deliberately holds no API credentials and 23
+  because they carry no audit command at all. So this run corroborates NOTHING
+  about the lab's RBAC, admission, NetworkPolicy or secrets posture, in either
+  direction. Those claims rest on phases 2a, 2b, 2c and 3, not on this file.
+- THE PASS COUNT WAS NOT SYSTEMATICALLY AUDITED. One false PASS was found
+  (section 6). The other 62 PASSes were not each re-checked against live
+  configuration, so the true PASS figure is 63 or fewer, not 63 or more.
+- THE SCANNER'S OWN SUPPLY CHAIN IS UNVERIFIED. The image is pinned by digest,
+  and that digest was cross-checked against
+  public.ecr.aws/aquasecurity/kube-bench:v0.15.6, but no signature was
+  verified: kube-bench publishes to Docker Hub and AWS public ECR only, so the
+  phase-4 ImageValidatingPolicy has nothing to say about it and no provenance
+  claim is made for it. The pin proves the bytes are stable, not that they are
+  trustworthy.
+- MOST PASSES ARE KUBEADM'S DOING, NOT THIS LAB'S. Threat-model 6.8 already
+  says NodeRestriction and Node,RBAC are kubeadm defaults rather than
+  hardening decisions this lab made. The same applies to the great majority of
+  the 63 PASSes. Nobody should read this report as the lab scoring well.
+- cis-1.12 IS APPLIED ONE MINOR VERSION AHEAD of the newest Kubernetes release
+  upstream mapped it to (1.34, against this cluster's 1.35.5). Checks that
+  changed in 1.35 may be graded by 1.34-era logic.

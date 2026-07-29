@@ -1,0 +1,184 @@
+# Phase 5 — kube-bench CIS Benchmark scan of a WORKER node.
+#
+# WHAT THIS IS: the worker-node half of the phase-5 assessment. Separate from
+# job-kube-bench-master.yaml because the `node` target must run ON a worker: it
+# reads that node's own kubelet service file, kubeconfig, config.yaml and live
+# kubelet process flags. Running it on the control-plane would assess the wrong
+# machine.
+#
+# The image pin, benchmark pin, --v=1 and --include-test-output rationale are
+# identical to job-kube-bench-master.yaml; see that file's header for the full
+# argument, including why the "Assuming default version 1.18" warning in the
+# output is cosmetic and what --v=1 prints to prove it.
+#
+# ONE CAPABILITY IS ADDED BACK, AND ONLY ONE: CAP_DAC_READ_SEARCH.
+# WHY: the 4.1.1/4.1.2 checks read the kubelet systemd unit and its dropins. The
+# kind node image ships
+#   drw-r--r--  2 root root  /etc/systemd/system/kubelet.service.d
+# — a DIRECTORY with mode 0644 and therefore NO execute (search) bit for anyone.
+# Traversing into a directory requires that bit; uid 0 normally bypasses the check
+# via CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH, and capabilities.drop: [ALL]
+# removes both. The result was a hard failure, not a silent FAIL:
+#   error looking for file /etc/systemd/system/kubelet.service.d/10-kubeadm.conf:
+#   stat ...: permission denied
+# Note "permission denied", not "no such file" — the path is present, it is
+# unreadable. This was isolated empirically with a two-container probe identical
+# in every respect except capabilities: with drop:[ALL] the container reported
+# CapEff 0000000000000000 and EACCES on every read inside that directory; with
+# drop:[ALL] + add:[DAC_READ_SEARCH] it reported CapEff 0000000000000004 (bit 2 =
+# CAP_DAC_READ_SEARCH) and read both dropins. The transcript is in the phase-5
+# evidence capture.
+# WHY NOT CAP_DAC_OVERRIDE: it is the strictly broader capability — it bypasses
+# write and execute permission checks too. DAC_READ_SEARCH bypasses read, and
+# directory read+search, and nothing else. A read-only auditor needs exactly that.
+# WHY NOT privileged: true: it would grant the full capability set plus device
+# access to satisfy a missing execute bit on one directory. That is the reflex
+# this repo exists to argue against.
+# NOTE this is a defect in the kind node image, not in the CIS benchmark or in
+# kube-bench, and it does not occur on a normal kubeadm host, where that directory
+# is 0755.
+#
+# SCHEDULING: no nodeSelector and no toleration. The control-plane node is
+# tainted node-role.kubernetes.io/control-plane:NoSchedule and this Pod tolerates
+# nothing, so the scheduler can only place it on seclab-worker or seclab-worker2
+# — which of the two is not pinned, because both are identical kind workers and
+# either is a valid subject. The node it actually landed on is recorded verbatim
+# in attack-output.txt rather than assumed.
+#
+# PRIVILEGES REQUESTED, AND WHY EACH IS NEEDED:
+#   hostPID: true      - checks 4.2.x read live kubelet flags via
+#                        `/bin/ps -fC kubelet`. Without the host PID namespace
+#                        the kubelet process is invisible and every 4.2.x check
+#                        degrades to a false FAIL.
+#   /etc/kubernetes    - kubelet.conf permissions/ownership (4.1.5, 4.1.6) and
+#                        the client CA at pki/ca.crt (4.1.7, 4.1.8).
+#   /var/lib/kubelet   - config.yaml permissions/ownership (4.1.9, 4.1.10) and
+#                        the audit_config fallback source for every 4.2.x check.
+#   /etc/systemd       - kubelet.service and its 10-kubeadm.conf dropin
+#                        (4.1.1, 4.1.2). kind runs systemd as PID 1 and the
+#                        kubelet is a real systemd unit here, so these apply.
+#   /lib/systemd       - the distro-shipped unit path kube-bench also probes.
+#   /etc/passwd,
+#   /etc/group         - needed for `stat -c %U:%G` to resolve uid/gid to names
+#                        in the ownership checks.
+# All mounts are readOnly: true. hostNetwork is NOT requested.
+#
+# UPSTREAM MOUNTS DELIBERATELY TRIMMED (upstream job-node.yaml has 12, this has
+# 6):
+#   /var/lib/etcd, /var/lib/cni     - no `node`-target check reads them, and
+#                                     /var/lib/etcd does not exist on a worker
+#                                     at all.
+#   /usr/bin                        - only needed for Kubernetes version
+#                                     auto-detection, which --benchmark makes
+#                                     unnecessary.
+#   /etc/cni/net.d, /opt/cni/bin    - not referenced by any cis-1.12 check.
+#   /srv/kubernetes,
+#   /var/lib/kube-scheduler,
+#   /var/lib/kube-controller-manager - do not exist on a kubeadm/kind node;
+#                                     typeless hostPath volumes would have the
+#                                     kubelet create them as empty root-owned
+#                                     directories, i.e. a read-only audit
+#                                     mutating the node.
+# Every volume that IS kept sets an explicit `type:`, so a missing path fails the
+# Pod loudly instead of being conjured into existence.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-bench-node
+  namespace: cis-benchmark
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    app.kubernetes.io/component: cis-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: k8s-security-lab
+        app.kubernetes.io/component: cis-benchmark
+    spec:
+      restartPolicy: Never
+      hostPID: true
+      automountServiceAccountToken: false
+      containers:
+        - name: kube-bench
+          image: docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+          command:
+            - kube-bench
+            - run
+            - --v=1
+            - --benchmark
+            - cis-1.12
+            - --targets
+            - node
+            - --include-test-output
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              # The single exception, argued in full in this file's header: the
+              # kind node image's kubelet.service.d is a 0644 directory, so
+              # without this even uid 0 cannot traverse into it to read the
+              # dropins that checks 4.1.1/4.1.2 assess.
+              add:
+                - DAC_READ_SEARCH
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: etc-kubernetes
+              mountPath: /etc/kubernetes
+              readOnly: true
+            - name: var-lib-kubelet
+              mountPath: /var/lib/kubelet
+              readOnly: true
+            - name: etc-systemd
+              mountPath: /etc/systemd
+              readOnly: true
+            - name: lib-systemd
+              mountPath: /lib/systemd
+              readOnly: true
+            - name: etc-passwd
+              mountPath: /etc/passwd
+              readOnly: true
+            - name: etc-group
+              mountPath: /etc/group
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: etc-kubernetes
+          hostPath:
+            path: /etc/kubernetes
+            type: Directory
+        - name: var-lib-kubelet
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: etc-systemd
+          hostPath:
+            path: /etc/systemd
+            type: Directory
+        - name: lib-systemd
+          hostPath:
+            path: /lib/systemd
+            type: Directory
+        - name: etc-passwd
+          hostPath:
+            path: /etc/passwd
+            type: File
+        - name: etc-group
+          hostPath:
+            path: /etc/group
+            type: File
+        - name: tmp
+          emptyDir: {}

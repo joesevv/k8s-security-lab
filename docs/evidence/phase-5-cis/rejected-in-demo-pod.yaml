@@ -1,0 +1,126 @@
+# Phase 5 — the Pod that job-kube-bench-master.yaml's template would create, sent
+# straight at the demo namespace so Pod Security Admission can answer for itself.
+#
+# WHY THIS FILE EXISTS SEPARATELY FROM rejected-in-demo-job.yaml: PSA is
+# evaluated against Pods. Against a batch/v1 Job it only WARNS and admits, so the
+# Job-level probe never shows a PSA denial — it shows Kyverno's. To make PSA name
+# itself, the Pod has to be the object under admission. This file is that Pod:
+# the same container, image, hostPID, mounts and securityContext as the Job
+# template, lifted into a bare Pod.
+#
+# Applied ONLY with `kubectl apply --server-side --dry-run=server`. Nothing is
+# persisted; the pod is never scheduled and never runs.
+#
+# EXPECTED VERDICT: Forbidden by PodSecurity "restricted:v1.35" — note the pinned
+# enforce-version, which is what distinguishes an enforce denial from the
+# restricted:latest WARN that the warn label produces. No Kyverno policy in
+# policies/ covers hostPID or hostPath; that gap is deliberate and PSA is what
+# closes it, exactly as in phase 2b's attack-hostpath-root.yaml.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-bench-master-pod
+  namespace: demo
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    app.kubernetes.io/component: cis-benchmark
+spec:
+  restartPolicy: Never
+  hostPID: true
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: kube-bench
+      image: docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+      command:
+        - kube-bench
+        - run
+        - --v=1
+        - --benchmark
+        - cis-1.12
+        - --targets
+        - master,controlplane,etcd,policies
+        - --include-test-output
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+      volumeMounts:
+        - name: etc-kubernetes
+          mountPath: /etc/kubernetes
+          readOnly: true
+        - name: var-lib-etcd
+          mountPath: /var/lib/etcd
+          readOnly: true
+        - name: var-lib-kubelet
+          mountPath: /var/lib/kubelet
+          readOnly: true
+        - name: var-lib-cni
+          mountPath: /var/lib/cni
+          readOnly: true
+        - name: etc-systemd
+          mountPath: /etc/systemd
+          readOnly: true
+        - name: lib-systemd
+          mountPath: /lib/systemd
+          readOnly: true
+        - name: etc-passwd
+          mountPath: /etc/passwd
+          readOnly: true
+        - name: etc-group
+          mountPath: /etc/group
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: etc-kubernetes
+      hostPath:
+        path: /etc/kubernetes
+        type: Directory
+    - name: var-lib-etcd
+      hostPath:
+        path: /var/lib/etcd
+        type: Directory
+    - name: var-lib-kubelet
+      hostPath:
+        path: /var/lib/kubelet
+        type: Directory
+    - name: var-lib-cni
+      hostPath:
+        path: /var/lib/cni
+        type: Directory
+    - name: etc-systemd
+      hostPath:
+        path: /etc/systemd
+        type: Directory
+    - name: lib-systemd
+      hostPath:
+        path: /lib/systemd
+        type: Directory
+    - name: etc-passwd
+      hostPath:
+        path: /etc/passwd
+        type: File
+    - name: etc-group
+      hostPath:
+        path: /etc/group
+        type: File
+    - name: tmp
+      emptyDir: {}

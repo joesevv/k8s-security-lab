@@ -1,0 +1,143 @@
+# Phase 5 — the SAME kube-bench Job spec, pointed at the demo namespace, to show
+# that the cluster's own hardening refuses the security scanner.
+#
+# This file is byte-for-byte the pod spec of job-kube-bench-master.yaml with one
+# change: namespace: demo instead of namespace: cis-benchmark. It is applied ONLY
+# with `kubectl apply --server-side --dry-run=server`, which sends a real
+# admission request and persists nothing. (A plain `--dry-run=server` against an
+# unchanged object computes an empty patch and never sends a request at all —
+# --server-side is what forces the round trip.)
+#
+# WHAT ACTUALLY REJECTS IT — read the verdict, do not assume it:
+# Two DIFFERENT controls fire at two DIFFERENT stages, and the Job-level answer
+# is NOT the one people expect.
+#
+#   Job admission (this file):  Pod Security Admission is evaluated against
+#                               PODS. Against a batch/v1 Job it emits a WARNING
+#                               and ADMITS. The actual denial comes from Kyverno
+#                               — and NOT for hostPID or hostPath, which no
+#                               ValidatingPolicy in policies/ covers. See
+#                               attack-output.txt for which policy names itself.
+#   Pod admission:              rejected-in-demo-pod.yaml is the Pod the Job
+#                               controller would have created. THAT is what PSA
+#                               rejects outright, naming restricted:v1.35.
+#
+# The failure mode this exposes is worth stating: with PSA alone, the Job object
+# would be created and would then never produce a Pod, with the rejection
+# surfacing only in Job controller events. Kyverno denying at the Job level is
+# what turns a silent failure into a loud one.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-bench-master
+  namespace: demo
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    app.kubernetes.io/component: cis-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: k8s-security-lab
+        app.kubernetes.io/component: cis-benchmark
+    spec:
+      restartPolicy: Never
+      hostPID: true
+      automountServiceAccountToken: false
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: kube-bench
+          image: docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+          command:
+            - kube-bench
+            - run
+            - --v=1
+            - --benchmark
+            - cis-1.12
+            - --targets
+            - master,controlplane,etcd,policies
+            - --include-test-output
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: etc-kubernetes
+              mountPath: /etc/kubernetes
+              readOnly: true
+            - name: var-lib-etcd
+              mountPath: /var/lib/etcd
+              readOnly: true
+            - name: var-lib-kubelet
+              mountPath: /var/lib/kubelet
+              readOnly: true
+            - name: var-lib-cni
+              mountPath: /var/lib/cni
+              readOnly: true
+            - name: etc-systemd
+              mountPath: /etc/systemd
+              readOnly: true
+            - name: lib-systemd
+              mountPath: /lib/systemd
+              readOnly: true
+            - name: etc-passwd
+              mountPath: /etc/passwd
+              readOnly: true
+            - name: etc-group
+              mountPath: /etc/group
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: etc-kubernetes
+          hostPath:
+            path: /etc/kubernetes
+            type: Directory
+        - name: var-lib-etcd
+          hostPath:
+            path: /var/lib/etcd
+            type: Directory
+        - name: var-lib-kubelet
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: var-lib-cni
+          hostPath:
+            path: /var/lib/cni
+            type: Directory
+        - name: etc-systemd
+          hostPath:
+            path: /etc/systemd
+            type: Directory
+        - name: lib-systemd
+          hostPath:
+            path: /lib/systemd
+            type: Directory
+        - name: etc-passwd
+          hostPath:
+            path: /etc/passwd
+            type: File
+        - name: etc-group
+          hostPath:
+            path: /etc/group
+            type: File
+        - name: tmp
+          emptyDir: {}
