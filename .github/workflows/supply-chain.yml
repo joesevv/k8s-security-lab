@@ -44,10 +44,12 @@
 #                              - that transcript out, if: always().
 #     Verify attestation (self-check vs the identity Kyverno pins)
 #                              - cosign verify-attestation, byte-identical
-#                                identity strings. Had not executed as of
-#                                2026-07-29: the workflow fires only on push to
-#                                main, so it is unproven until the first green
-#                                run there.
+#                                identity strings. First executed and proven
+#                                green 2026-07-29 by run 30480411426, whose
+#                                transcript is committed at
+#                                docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt.
+#                                ONE run, covering THAT run's build only - the
+#                                deployed digest still predates it.
 #     Upload cosign verify-attestation evidence
 #                              - that transcript out, if: always().
 #     Record signed digest     - writes the signed digest to the job summary.
@@ -279,13 +281,20 @@ jobs:
       # the EXACT identity the Kyverno ImageValidatingPolicy pins must fail the
       # job, not ship quietly. `shell: bash` is explicit so the runner uses
       # `-eo pipefail`: without pipefail the `| tee` would mask a non-zero cosign
-      # exit code. Also POST-publication, like every cosign call here - when it
-      # runs it will prove the attestation exists and is bound to this digest;
-      # it is NOT an admission-time control. Nothing in the cluster verifies attestations
-      # today: the Kyverno attestation check is a deliberate follow-up, deferred
-      # until an attested digest is actually deployed.
-      # cosign verify-attestation echoes the verified payload, so this transcript
-      # (and the summary block below) carries the whole SBOM and will be large.
+      # exit code. Also POST-publication, like every cosign call here - it
+      # proved once, in run 30480411426 on 2026-07-29, that the attestation
+      # exists and is bound to THAT run's digest, and each later run re-proves
+      # the same for its own build; it is NOT an admission-time control.
+      # Nothing in the cluster verifies attestations today: the Kyverno
+      # attestation check is a deliberate follow-up, deferred until an attested
+      # digest is actually deployed.
+      # cosign verify-attestation echoes the verified payload, so the transcript
+      # carries the whole SBOM and is large. The step summary below is TRUNCATED
+      # on purpose: in run 30480411426 (2026-07-29, the first green run of this
+      # step) the summary reached 1164k and exceeded GitHub's 1024k summary
+      # cap, so the summary upload aborted - the run itself still passed. The
+      # `tee` is deliberately untouched; the complete transcript ships as the
+      # cosign-verify-attestation artifact, which is the evidence path.
       - name: Verify attestation (self-check vs the identity Kyverno pins)
         shell: bash
         run: |
@@ -299,16 +308,19 @@ jobs:
             echo '### cosign verify-attestation (SBOM attestation self-check)'
             echo ''
             echo '```'
-            cat cosign-verify-attestation.txt
+            head -c 2000 cosign-verify-attestation.txt
+            echo ''
+            echo '[truncated at 2000 bytes - the full transcript is the cosign-verify-attestation artifact on this run]'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Download this and commit it as
-      # docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt after
-      # the first green run on main - until then the attest path has no evidence
-      # behind it. Separate artifact name so a failure here is distinguishable
-      # from a signature-verify failure. `if: always()` for the same reason as
-      # above: a FAILED verification is the transcript worth keeping.
+      # The transcript from run 30480411426 is committed as
+      # docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt; each
+      # later green run refreshes this artifact, so download it again if a newer
+      # capture is wanted. Separate artifact name so a failure here is
+      # distinguishable from a signature-verify failure. `if: always()` for the
+      # same reason as above: a FAILED verification is the transcript worth
+      # keeping.
       - name: Upload cosign verify-attestation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

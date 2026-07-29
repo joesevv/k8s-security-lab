@@ -387,3 +387,220 @@ NOT PROVEN HERE — stated so the evidence above is not read as more than it is.
 - Nothing here tests a COMPROMISED producer. An attacker who can push a workflow
   change to refs/heads/main gets a signature the cluster accepts. The control
   narrows trust to one workflow file on one ref; it does not protect that file.
+
+============================================================
+7) FIRST ATTEST RUN — APPENDED 2026-07-29. Everything above is the 2026-07-25
+capture and is unchanged, including its NOT PROVEN HERE close. This section is
+CI-ONLY: nothing in it touched the cluster. The `cosign attest` and
+`cosign verify-attestation` steps added to the sign job on 2026-07-29 fired for
+the FIRST time on the R2 merge to main, and both concluded success. Until this
+run the attest path was a static read of the YAML. It has now executed exactly
+ONCE, green. Read the scope narrowly: this run attested the image THAT RUN
+built, @sha256:7b5b8816...28a67 — which is NOT the image the cluster runs. The
+deployed digest b8483c58...@sha256:7fd13d22...3337b predates the step, carries
+no attestation, and stays UNATTESTED BY DESIGN.
+$ gh run view 30480411426 --repo joesevv/k8s-security-lab
+============================================================
+✓ main supply-chain · 30480411426
+Triggered via push about 25 minutes ago
+
+JOBS
+✓ build-scan in 50s (ID 90672799300)
+✓ sign in 18m59s (ID 90673038393)
+
+ANNOTATIONS
+X $GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got 1164k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary
+sign: .github#24
+
+
+ARTIFACTS
+cosign-verify-attestation
+cosign-verify
+joesevv~k8s-security-lab~A83FUK.dockerbuild
+sbom
+joesevv-k8s-security-lab-signed-app_sha256_7b5b8816f3de2b96fa244f22798c2e2ac65d6bc8de4964a7e0879b4e47828a67.spdx.json
+trivy-sarif
+
+For more information about a job, try: gh run view --job=<job-id>
+View this run on GitHub: https://github.com/joesevv/k8s-security-lab/actions/runs/30480411426
+(exit code: 0)
+
+CAUTION ON THAT ANNOTATION LINE: the run and the job both concluded "success",
+and the API nevertheless reports the annotation at level "failure". Both facts
+are recorded rather than reconciled:
+
+$ gh api repos/joesevv/k8s-security-lab/actions/jobs/90673038393 --jq '"\(.name)\t\(.status)\t\(.conclusion)"'
+sign	completed	success
+
+$ gh api repos/joesevv/k8s-security-lab/check-runs/90673038393/annotations --jq '.[] | "\(.annotation_level)\t\(.message)"'
+failure	$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got 1164k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary
+
+=> the step-summary UPLOAD was aborted; the step, the job and the run were not
+failed by it. The transcript itself is untouched: cosign's output is written to
+disk by `tee` and uploaded as its own artifact, and that artifact downloads
+whole (see below). Only the GitHub-rendered summary was lost.
+
+$ gh run view 30480411426 --repo joesevv/k8s-security-lab --json headSha,conclusion,status,createdAt,updatedAt
+{"conclusion":"success","createdAt":"2026-07-29T18:32:49Z","headSha":"1b1f8398c8700c78bd6bbbc0edf374bde1ee358b","status":"completed","updatedAt":"2026-07-29T18:52:47Z"}
+
+headSha 1b1f8398c8700c78bd6bbbc0edf374bde1ee358b is the merge commit that
+carried the attest steps onto main, so this is the first push that could have
+run them. createdAt -> updatedAt is 18:32:49Z -> 18:52:47Z: 19m58s wall clock.
+
+$ gh run view 30480411426 --repo joesevv/k8s-security-lab --job=90673038393
+✓ main supply-chain · 30480411426
+Triggered via push about 25 minutes ago
+
+✓ sign in 18m59s (ID 90673038393)
+  ✓ Set up job
+  ✓ Log in to GHCR
+  ✓ Download SBOM artifact
+  ✓ Install cosign
+  ✓ Keyless sign image by digest
+  ✓ Attest SBOM to the image digest
+  ✓ Verify signature (self-check vs the identity Kyverno pins)
+  ✓ Upload cosign verify evidence
+  ✓ Verify attestation (self-check vs the identity Kyverno pins)
+  ✓ Upload cosign verify-attestation evidence
+  ✓ Record signed digest
+  ✓ Post Log in to GHCR
+  ✓ Complete job
+
+ANNOTATIONS
+X $GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got 1164k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary
+sign: .github#24
+
+
+To see the full job log, try: gh run view --log --job=90673038393
+View this run on GitHub: https://github.com/joesevv/k8s-security-lab/actions/runs/30480411426
+(exit code: 0)
+
+=> every step of the sign job carries a ✓, including the two that had never
+executed before today: "Attest SBOM to the image digest" and "Verify
+attestation (self-check vs the identity Kyverno pins)".
+
+$ gh api repos/joesevv/k8s-security-lab/actions/runs/30480411426/artifacts --jq '.artifacts[] | "\(.name)\t\(.size_in_bytes)\t\(.expired)"'
+cosign-verify-attestation	180330	false
+cosign-verify	530	false
+joesevv~k8s-security-lab~A83FUK.dockerbuild	18881	false
+sbom	121200	false
+joesevv-k8s-security-lab-signed-app_sha256_7b5b8816f3de2b96fa244f22798c2e2ac65d6bc8de4964a7e0879b4e47828a67.spdx.json	121406	false
+trivy-sarif	20404	false
+(columns: name / size_in_bytes / expired)
+
+cosign-verify-attestation is 180330 bytes compressed and not expired. It was
+downloaded and committed VERBATIM — zero edits — matching how cosign-verify.txt
+was handled for the signature self-check:
+
+$ gh run download 30480411426 --repo joesevv/k8s-security-lab -n cosign-verify-attestation --dir docs/evidence/phase-4-supply-chain/
+(exit code: 0 — writes cosign-verify-attestation.txt into that directory)
+
+$ sha256sum docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt
+49af20e3dc6dbc50fcb50c0ba0ea9addd8729c2f26a265ee6f65db69e77cac00 *docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt
+
+$ wc -l -c docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt
+      7 1192177 docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt
+
+PAYLOAD ELIDED HERE ON PURPOSE: the transcript is 7 lines. Line 1 is empty and
+line 7 is the base64 in-toto payload — 1191769 bytes on one line, the whole
+SBOM. It is NOT reproduced in this capture because the complete file is
+committed alongside it at
+docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt and that file,
+not this excerpt, is the authoritative copy. Lines 2-6 are the verification
+result, quoted verbatim and in full:
+
+Verification for ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7b5b8816f3de2b96fa244f22798c2e2ac65d6bc8de4964a7e0879b4e47828a67 --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - Existence of the claims in the transparency log was verified offline
+  - The code-signing certificate was verified using trusted certificate authority certificates
+
+=> cosign resolved an spdxjson attestation on that digest and accepted it
+against the EXACT identity pair the cluster policy pins (issuer
+https://token.actions.githubusercontent.com, subject
+https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main).
+NOTE THE WORDING COSIGN ACTUALLY PRINTS: there is no "Verification succeeded"
+string anywhere in the file. The success signal is the "Verification for
+<digest> --" header, the three checks listed above, and the step's exit status.
+
+TIMING, OBSERVED ON 2026-07-29 — one run is one sample, not a benchmark:
+
+$ gh api repos/joesevv/k8s-security-lab/actions/jobs/90673038393 --jq '.steps[] | "\(.number)\t\(.name)\t\(.conclusion)\t\(.started_at)\t\(.completed_at)"'
+1	Set up job	success	2026-07-29T18:33:48Z	2026-07-29T18:33:50Z
+2	Log in to GHCR	success	2026-07-29T18:33:50Z	2026-07-29T18:33:51Z
+3	Download SBOM artifact	success	2026-07-29T18:33:51Z	2026-07-29T18:33:52Z
+4	Install cosign	success	2026-07-29T18:33:52Z	2026-07-29T18:33:53Z
+5	Keyless sign image by digest	success	2026-07-29T18:33:53Z	2026-07-29T18:33:58Z
+6	Attest SBOM to the image digest	success	2026-07-29T18:33:58Z	2026-07-29T18:34:05Z
+7	Verify signature (self-check vs the identity Kyverno pins)	success	2026-07-29T18:34:05Z	2026-07-29T18:34:07Z
+8	Upload cosign verify evidence	success	2026-07-29T18:34:07Z	2026-07-29T18:34:09Z
+9	Verify attestation (self-check vs the identity Kyverno pins)	success	2026-07-29T18:34:09Z	2026-07-29T18:52:41Z
+10	Upload cosign verify-attestation evidence	success	2026-07-29T18:52:41Z	2026-07-29T18:52:43Z
+11	Record signed digest	success	2026-07-29T18:52:43Z	2026-07-29T18:52:43Z
+22	Post Log in to GHCR	success	2026-07-29T18:52:43Z	2026-07-29T18:52:43Z
+23	Complete job	success	2026-07-29T18:52:43Z	2026-07-29T18:52:43Z
+(columns: number / name / conclusion / started_at / completed_at)
+
+build-scan took 50s. The sign job took 18m59s, and 18m32s of that is step 9,
+"Verify attestation" (18:34:09Z -> 18:52:41Z). Every other step in the job
+finished in 7s or less. The step log narrows WHERE the time went; it does not
+say why:
+
+$ gh run view --log --job=90673038393 --repo joesevv/k8s-security-lab
+sign	Verify attestation (self-check vs the identity Kyverno pins)	2026-07-29T18:34:11.1068053Z Verification for ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7b5b8816f3de2b96fa244f22798c2e2ac65d6bc8de4964a7e0879b4e47828a67 --
+sign	Verify attestation (self-check vs the identity Kyverno pins)	2026-07-29T18:34:11.1072031Z   - The code-signing certificate was verified using trusted certificate authority certificates
+sign	Upload cosign verify-attestation evidence	2026-07-29T18:52:41.4858134Z ##[group]Run actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+(a UTF-8 BOM precedes the timestamp on each step's first log line; stripped
+from the third line above so it is readable — nothing else altered)
+
+=> cosign's own output is timestamped ~2 seconds after the step began. The
+retrieved log then holds NO further line for that step, and the next line in
+the job log belongs to the FOLLOWING step, 18 minutes later. THE LOG STATES NO
+CAUSE FOR THAT GAP AND NONE IS ASSERTED HERE.
+
+THE 1024k STEP-SUMMARY CAP — an operational lesson, not a security finding. As
+it stood in run 30480411426 the verify-attestation step appended the WHOLE
+transcript to $GITHUB_STEP_SUMMARY:
+
+          {
+            echo '### cosign verify-attestation (SBOM attestation self-check)'
+            echo ''
+            echo '```'
+            cat cosign-verify-attestation.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+That transcript is 1192177 bytes = 1164.2 KiB, and the annotation above reports
+"got 1164k" against a cap of 1024k. The same commit that lands this capture
+changes only that summary block to a bounded excerpt and leaves the `tee`
+exactly as it is, because the artifact — not the summary — is the evidence path.
+
+============================================================
+WHAT RUN 30480411426 PROVES, AND WHAT IT DOES NOT
+============================================================
+PROVEN, ONCE, ON 2026-07-29:
+- `cosign attest --type spdxjson` and `cosign verify-attestation` both executed
+  on a real push to main and both concluded success. The attest path is no
+  longer a static read of the YAML.
+- That run's attestation binds THAT run's SBOM to THAT run's digest,
+  @sha256:7b5b8816...28a67, and verifies against the exact keyless identity the
+  ImageValidatingPolicy pins. The transcript proving it is committed.
+
+NOT PROVEN, NOT CHANGED, AND NOT TO BE READ IN:
+- The DEPLOYED digest b8483c58...@sha256:7fd13d22...3337b is still UNATTESTED,
+  BY DESIGN. It was built 2026-07-25, before the step existed; the repo pins the
+  digest it verified rather than repointing the cluster at an untested build to
+  make a document look tidier. Nothing in this section changes what the cluster
+  runs.
+- NO admission policy requires or verifies an attestation. The
+  ImageValidatingPolicy checks SIGNATURES only, so the attestation proves
+  nothing at admission time. The Kyverno attestation check stays deferred until
+  an attested digest is actually deployed.
+- The attestation BINDS the SBOM to the digest; it does not VOUCH for what the
+  SBOM says. The predicate is produced in build-scan and attested verbatim by
+  sign, so a compromised build job yields a forged-but-signed predicate.
+- Like every cosign call in this workflow, attest and verify-attestation run
+  AFTER the image and the attestation are already in GHCR. Post-publication
+  self-check, not a gate.
+- ONE green run is one green run. Nothing here says the next run will pass, and
+  the 18m59s sign job is a single observation from a single day.
