@@ -1,0 +1,204 @@
+# Phase 5 addendum (2026-07-29) — kube-bench CIS Benchmark scan of EVERY worker
+# node, as a DaemonSet.
+#
+# WHY THIS FILE EXISTS: job-kube-bench-node.yaml scans ONE worker, because a Job
+# schedules ONE Pod. On 2026-07-26 that Pod landed on seclab-worker, and
+# seclab-worker2 was never scanned by kube-bench at all — a gap this repo
+# disclosed in attack-output.txt, the runbook and the README rather than papered
+# over. A DaemonSet schedules one Pod PER ELIGIBLE NODE, so coverage stops
+# depending on which worker the scheduler happened to pick. That is the entire
+# reason for this manifest.
+#
+# THE POD SPEC IS THE JOB'S, DELIBERATELY UNCHANGED: same digest-pinned image,
+# same `kube-bench run --v=1 --benchmark cis-1.12 --targets node
+# --include-test-output`, same securityContext down to the single
+# DAC_READ_SEARCH add-back, same hostPID: true, same
+# automountServiceAccountToken: false, the same six readOnly hostPath mounts
+# with an explicit `type:` on each, the same emptyDir /tmp and the same resource
+# requests and limits. Every one of those choices is argued in full in
+# job-kube-bench-node.yaml's header — the capability, the trimmed mount list,
+# the explicit volume types, the benchmark pin — and that argument is NOT
+# repeated here. If the two specs ever diverge FUNCTIONALLY on anything but the
+# four items below, this file is wrong: the point is to run the SAME scan on
+# both workers, not a different one.
+#
+# FOUR FUNCTIONAL DIFFERENCES FROM THE JOB, AND THEY ARE PROVABLE RATHER THAN
+# PROMISED: strip comments and blank lines from both manifests and diff them,
+# and these four — and nothing else — are what is left. That capture is in
+# attack-output.txt section 8b. COMMENTS ARE A DIFFERENT MATTER AND ARE NOT
+# CLAIMED TO MATCH: this header is rewritten for the DaemonSet throughout, and
+# even the one inline comment carried over (the DAC_READ_SEARCH note below) is
+# rewrapped and repointed at job-kube-bench-node.yaml's header rather than at
+# "this file's". A comment-stripped diff cannot see that, which is exactly why
+# the claim is scoped to what the diff can see.
+#
+# 1. restartPolicy: Always, BECAUSE A DAEMONSET HAS NO OTHER OPTION. The Job
+#    sets Never. A DaemonSet cannot: kubernetes/kubernetes at tag v1.35.5
+#    (the version this cluster runs), pkg/apis/apps/validation/validation.go,
+#    ValidateDaemonSetSpec:
+#      if spec.Template.Spec.RestartPolicy != api.RestartPolicyAlways {
+#        allErrs = append(allErrs, field.NotSupported(...))
+#      }
+#    so `Never` is rejected by the API server, not merely discouraged.
+#
+# 2. THE COMMAND IS WRAPPED IN A SHELL THAT HOLDS THE POD OPEN AFTER THE SCAN.
+#    This follows directly from (1). kube-bench exits when the scan finishes;
+#    under restartPolicy: Always the kubelet restarts an exited container, so an
+#    unwrapped container would scan, exit 0, be restarted, scan again, and
+#    settle into CrashLoopBackOff — with each report stranded in a previous,
+#    eventually-discarded container's log. `sh -c '<scan>; while true; do sleep
+#    3600; done'` runs the scan exactly once and then idles, so `kubectl logs`
+#    returns the whole report for as long as the Pod lives.
+#    WHY A LOOP AND NOT `sleep infinity`: `infinity` is a GNU coreutils
+#    extension that BusyBox's sleep rejects with an invalid-number error, and
+#    which of the two this image ships was not tested. A loop over a finite
+#    sleep behaves identically under both, so the question is designed out
+#    instead of guessed at.
+#    TWO CONSEQUENCES, STATED PLAINLY. The container's exit code is no longer
+#    kube-bench's — it never exits, so the Job's "exit 0 means the scanner ran"
+#    reading does not apply here and the log is the only evidence. And the
+#    DaemonSet does not clean itself up: it must be deleted by hand when the
+#    capture is done (`kubectl -n cis-benchmark delete daemonset
+#    kube-bench-node-ds`).
+#
+# 3. THE REPORT IS READ PER POD, NOT PER CONTROLLER. `kubectl logs job/<name>`
+#    resolves to that Job's single Pod. A DaemonSet has one Pod per node, and
+#    `kubectl logs daemonset/<name>` would return exactly one of them without
+#    saying which node it came from — which is the ambiguity this file exists to
+#    remove. Read the Pods by name and attribute each to its .spec.nodeName;
+#    attack-output.txt section 8 does that, with the placement table printed
+#    first so every report below it is tied to a node.
+#
+# 4. LABELS. The Job's two labels are kept so existing `-l
+#    app.kubernetes.io/component=cis-benchmark` queries still find these Pods,
+#    plus app.kubernetes.io/name: kube-bench-node-ds, which distinguishes the
+#    DaemonSet's Pods from the Jobs' and is what the selector matches on.
+#
+# STILL NO TOLERATION AND STILL NO nodeSelector — both deliberate:
+#   no toleration - the control-plane node is tainted
+#                   node-role.kubernetes.io/control-plane:NoSchedule and this
+#                   manifest asks for no toleration of it, so the Pod can only
+#                   be placed on seclab-worker or seclab-worker2. "Tolerates
+#                   nothing" would be the wrong way to say that: the DaemonSet
+#                   controller injects six node-condition tolerations of its
+#                   own (not-ready, unreachable, disk-pressure, memory-pressure,
+#                   pid-pressure, unschedulable), and the point is that NONE of
+#                   them matches the control-plane taint — printed rather than
+#                   asserted in attack-output.txt section 8c.
+#                   That is the intent, not a limitation: `--targets node` is
+#                   the WORKER-node benchmark, and the control-plane machine is
+#                   assessed by job-kube-bench-master.yaml against its own
+#                   targets. A toleration here would scan the control-plane with
+#                   the wrong benchmark section.
+#   no nodeSelector - any selector could only narrow the set below "every
+#                   worker", which is the one property this manifest exists to
+#                   guarantee.
+# Which nodes it ACTUALLY landed on is recorded verbatim in attack-output.txt
+# section 8 rather than assumed.
+#
+# WHAT THIS STILL IS NOT: enforcement. It measures, exactly as the Jobs did.
+# Nothing here remediates a single CIS finding; scanning the second worker only
+# means that worker's findings are now kube-bench output instead of a hand-run
+# `stat` (probe 5d-d). The phase's "nothing in this phase enforces anything"
+# caveat applies to this file word for word.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-bench-node-ds
+  namespace: cis-benchmark
+  labels:
+    app.kubernetes.io/part-of: k8s-security-lab
+    app.kubernetes.io/component: cis-benchmark
+    app.kubernetes.io/name: kube-bench-node-ds
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-bench-node-ds
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: k8s-security-lab
+        app.kubernetes.io/component: cis-benchmark
+        app.kubernetes.io/name: kube-bench-node-ds
+    spec:
+      restartPolicy: Always
+      hostPID: true
+      automountServiceAccountToken: false
+      containers:
+        - name: kube-bench
+          image: docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+          command:
+            - sh
+            - -c
+            - 'kube-bench run --v=1 --benchmark cis-1.12 --targets node --include-test-output; while true; do sleep 3600; done'
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              # The single exception, argued in full in
+              # job-kube-bench-node.yaml's header: the kind node image's
+              # kubelet.service.d is a 0644 directory, so without this even
+              # uid 0 cannot traverse into it to read the dropins that checks
+              # 4.1.1/4.1.2 assess.
+              add:
+                - DAC_READ_SEARCH
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: etc-kubernetes
+              mountPath: /etc/kubernetes
+              readOnly: true
+            - name: var-lib-kubelet
+              mountPath: /var/lib/kubelet
+              readOnly: true
+            - name: etc-systemd
+              mountPath: /etc/systemd
+              readOnly: true
+            - name: lib-systemd
+              mountPath: /lib/systemd
+              readOnly: true
+            - name: etc-passwd
+              mountPath: /etc/passwd
+              readOnly: true
+            - name: etc-group
+              mountPath: /etc/group
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: etc-kubernetes
+          hostPath:
+            path: /etc/kubernetes
+            type: Directory
+        - name: var-lib-kubelet
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: etc-systemd
+          hostPath:
+            path: /etc/systemd
+            type: Directory
+        - name: lib-systemd
+          hostPath:
+            path: /lib/systemd
+            type: Directory
+        - name: etc-passwd
+          hostPath:
+            path: /etc/passwd
+            type: File
+        - name: etc-group
+          hostPath:
+            path: /etc/group
+            type: File
+        - name: tmp
+          emptyDir: {}

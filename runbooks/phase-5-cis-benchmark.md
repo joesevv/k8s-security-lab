@@ -7,8 +7,13 @@ the control-plane node for the `master,controlplane,etcd,policies` targets and
 one on a worker for the `node` target — a recorded demonstration that the same
 scanner spec is REFUSED by `demo`, as a Pod by PSA and as a Job by Kyverno,
 and a triage of every FAIL and WARN the run produced, split into kind-inherent,
-already-documented and genuinely new. Commands are in execution order; each
-has a one-line purpose and the observed output.
+already-documented and genuinely new. Sections 0-4 are that original run, dated
+2026-07-26. Section 5 is an addendum dated 2026-07-29: the `node` target re-run
+as a **DaemonSet**, because a Job schedules one Pod and `seclab-worker2` was
+therefore never scanned — same digest, same benchmark, one Pod per worker. It
+closes a coverage gap and nothing else; the phase still enforces nothing.
+Commands are in execution order; each has a one-line purpose and the observed
+output.
 
 Host: Windows 11 + Docker Desktop (WSL2). Commands were run from Git Bash
 unless noted. Kubernetes node image v1.35.5, kube-bench v0.15.6
@@ -85,7 +90,10 @@ Two specific over-claims to refuse. First, the `policies` target (CIS section
 5) is effectively unassessed here — all 34 of its checks WARN, for the reasons
 in section 3 — so this run corroborates **nothing** about the lab's RBAC,
 admission, NetworkPolicy or secrets posture in either direction. Second, a Job
-produces one Pod, so `seclab-worker2` was never scanned at all.
+produces one Pod, so `seclab-worker2` was never scanned at all. That second
+gap was closed 2026-07-29 by the DaemonSet run in section 5 — both workers now
+have kube-bench `node` reports (evidence section 8); the first over-claim
+stands unchanged, because nothing about the `policies` target was re-run.
 
 ### The benchmark is pinned — the "default version 1.18" warning is cosmetic
 
@@ -323,11 +331,23 @@ kubectl -n cis-benchmark get pod -l app.kubernetes.io/component=cis-benchmark \
 # POD                       NODE                   PHASE       IMAGE_ID
 # kube-bench-master-fr4dk   seclab-control-plane   Succeeded   docker.io/aquasec/kube-bench@sha256:861900910eec...
 # kube-bench-node-cmwb8     seclab-worker          Succeeded   docker.io/aquasec/kube-bench@sha256:861900910eec...
+
+# The same question asked of the 2026-07-29 DaemonSet run (section 5). Two rows,
+# one per worker, is the whole point of that run:
+kubectl -n cis-benchmark get pods -l app.kubernetes.io/name=kube-bench-node-ds \
+  -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+# NAME                       NODE             STATUS
+# kube-bench-node-ds-6nhfh   seclab-worker    Running
+# kube-bench-node-ds-vm7cw   seclab-worker2   Running
 ```
 
 **A Job produces ONE Pod, so `seclab-worker2` was never scanned.** Stated here
 rather than left for a reader to work out. Covering every worker needs a
-DaemonSet, which this phase does not ship.
+DaemonSet, which this phase does not ship. **Closed 2026-07-29:** that
+DaemonSet now exists — `docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml`
+— and it ran, so both workers have kube-bench `node` reports. Method in
+section 5, full captures in evidence section 8. The sentence above is left
+standing because it is true of the 2026-07-26 Job run it describes.
 
 The two Jobs differ in one privilege, and the asymmetry is deliberate rather
 than an oversight:
@@ -372,6 +392,25 @@ The raw counts, which are kube-bench's own summary lines added together:
 | master (`master,controlplane,etcd,policies`) | 46 | 10 | 50 | 0 |
 | node (`node`) | 17 | 2 | 6 | 0 |
 | combined | 63 | 12 | 56 | 0 |
+
+That table is the 2026-07-26 Job run and is left exactly as it was. The
+`node` target was re-run on 2026-07-29 as a DaemonSet (section 5), which
+produces a report **per worker** rather than one report from whichever worker
+the scheduler picked:
+
+| Run | Node | PASS | FAIL | WARN | INFO |
+| --- | --- | --- | --- | --- | --- |
+| Job, 2026-07-26 | `seclab-worker` | 17 | 2 | 6 | 0 |
+| DaemonSet, 2026-07-29 | `seclab-worker` | 17 | 2 | 6 | 0 |
+| DaemonSet, 2026-07-29 | `seclab-worker2` | 17 | 2 | 6 | 0 |
+
+Each node matches the 2026-07-26 node Job exactly, **as of 2026-07-29 on this
+cluster** — and the match is stronger than the counts: strip the glog
+timestamp lines and each DaemonSet report is byte-identical to the Job's,
+checked with `diff` in evidence section 8f. The combined 63 / 12 / 56 is
+deliberately **not** restated to include `seclab-worker2`: adding a second copy
+of the same worker configuration would inflate PASS by 17 for no new
+information. What the DaemonSet bought is coverage, not new findings.
 
 **Do not read those numbers at face value.** Two corrections apply before the
 triage in 3c, and between them they are what the phase is actually for.
@@ -501,6 +540,10 @@ docker exec seclab-worker2 sh -c 'stat -c "%a %U:%G %n" /var/lib/kubelet/config.
 # 644 root:root /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
 # => 4.1.1/4.1.9 are kubeadm defaults, real, and present on the worker
 #    kube-bench never scanned. Confirmed by hand, which is not a kube-bench result.
+#    Since 2026-07-29 there IS a kube-bench result for that worker: the DaemonSet
+#    run in section 5 reports the same two FAILs on seclab-worker2 (evidence
+#    section 8e). The hand check above stays a hand check — it is not promoted
+#    retroactively; it is now corroborated by scanner output taken on that node.
 ```
 
 And the one finding tested rather than inferred from a missing flag:
@@ -584,7 +627,163 @@ kubectl delete -f docs/evidence/phase-5-cis/00-namespace-cis-benchmark.yaml
 ```
 
 The namespace manifest is named explicitly rather than using
-`kubectl delete -f docs/evidence/phase-5-cis/`, which would also read the two
-Job manifests (already deleted) and the two rejection probes (which never
-existed in `demo`, because that is the whole point of section 1) and report
-NotFound for all four.
+`kubectl delete -f docs/evidence/phase-5-cis/`, which would also read the other
+five manifests in that directory — the two Job manifests and the DaemonSet
+(the Jobs deleted here, the DaemonSet deleted in section 5's cleanup) and the
+two rejection probes (which never existed in `demo`, because that is the whole
+point of section 1) — and report NotFound for all five. Ordering matters while
+section 5 is mid-run: with the DaemonSet still applied, that directory-wide
+delete would really delete it rather than print NotFound, which is why section
+5 tears its own object down explicitly.
+
+---
+
+## 5. Scanning every worker — the DaemonSet run (2026-07-29)
+
+Placed after the teardown because that is execution order: this ran on
+2026-07-29, after section 4 had already deleted both Jobs, as an addendum to
+the phase rather than part of the original run. It closes exactly one thing —
+**coverage** — and adds no
+control, no policy and no remediation. A DaemonSet full of scanners still
+enforces nothing.
+
+**Why a DaemonSet.** A Job schedules ONE Pod, so on 2026-07-26 the `node`
+target assessed whichever worker the scheduler picked (`seclab-worker`) and
+`seclab-worker2` was never scanned by kube-bench at all. A DaemonSet schedules
+one Pod per eligible node, so coverage stops depending on that choice.
+
+**The manifest is the Job's spec** —
+`docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml`: same digest-pinned
+image, same `--v=1 --benchmark cis-1.12 --targets node --include-test-output`,
+same `hostPID: true`, same `automountServiceAccountToken: false`, the same six
+read-only `hostPath` mounts with explicit types, the same
+`drop: [ALL]` + `add: [DAC_READ_SEARCH]`. Four differences, and they are shown
+with `diff` rather than asserted (evidence section 8b):
+
+1. `kind: DaemonSet` and the name `kube-bench-node-ds`.
+2. A `selector`, plus the third label `app.kubernetes.io/name:
+   kube-bench-node-ds` it matches on; `backoffLimit: 0` has no DaemonSet
+   equivalent and is gone.
+3. `restartPolicy: Always` — a DaemonSet template accepts no other value
+   (`ValidateDaemonSetSpec`, kubernetes/kubernetes at tag `v1.35.5`).
+4. The scan wrapped in a shell that holds the Pod open afterwards, which
+   follows from (3): kube-bench exits when it is done, the kubelet restarts an
+   exited container, and an unwrapped Pod would rescan-and-exit into
+   `CrashLoopBackOff` with each report stranded in a discarded container log.
+   The hold is `while true; do sleep 3600; done` rather than `sleep infinity`
+   because `infinity` is a GNU coreutils extension BusyBox's `sleep` rejects,
+   and which of the two this image ships was not tested.
+
+**Still no `nodeSelector` and no toleration**, deliberately. The
+`node-role.kubernetes.io/control-plane:NoSchedule` taint keeps the DaemonSet
+off `seclab-control-plane`, which is the intent: `--targets node` is the
+worker-node benchmark, and the control-plane machine is assessed by the master
+Job against its own targets.
+
+```bash
+kubectl apply -f docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml
+# Warning: would violate PodSecurity "restricted:latest": host namespaces
+# (hostPID=true), unrestricted capabilities (container "kube-bench" must not
+# include "DAC_READ_SEARCH" in securityContext.capabilities.add), restricted
+# volume types (...), runAsNonRoot != true, runAsUser=0
+# daemonset.apps/kube-bench-node-ds created                            (exit 0)
+
+# The warning is character-for-character the one the node Job drew on
+# 2026-07-26. Printed rather than asserted — both lines live in the evidence
+# file, so they are diffed where they sit (line 163 is the Job's, line 1376 the
+# DaemonSet's):
+diff <(sed -n '163p' docs/evidence/phase-5-cis/attack-output.txt) \
+     <(sed -n '1376p' docs/evidence/phase-5-cis/attack-output.txt)
+# (no output)                                                          (exit 0)
+# => the controller kind changed; the violations did not.
+
+kubectl -n cis-benchmark rollout status daemonset/kube-bench-node-ds --timeout=180s
+# Waiting for daemon set "kube-bench-node-ds" rollout to finish: 1 of 2 updated
+#   pods are available...
+# daemon set "kube-bench-node-ds" successfully rolled out              (exit 0)
+```
+
+**Placement is checked, not assumed — two rows, or it did not work:**
+
+```bash
+kubectl -n cis-benchmark get pods -l app.kubernetes.io/name=kube-bench-node-ds \
+  -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+# NAME                       NODE             STATUS
+# kube-bench-node-ds-6nhfh   seclab-worker    Running
+# kube-bench-node-ds-vm7cw   seclab-worker2   Running
+```
+
+**Read the reports per Pod, not per controller.** `kubectl logs
+daemonset/kube-bench-node-ds` returns one Pod's log without saying which node
+it came from — the exact ambiguity this section exists to remove — so the loop
+resolves `.spec.nodeName` for each Pod first:
+
+```bash
+for p in $(kubectl -n cis-benchmark get pods -l app.kubernetes.io/name=kube-bench-node-ds -o name); do
+  echo "=== $p on $(kubectl -n cis-benchmark get $p -o jsonpath='{.spec.nodeName}')"
+  kubectl -n cis-benchmark logs $p
+done
+# === pod/kube-bench-node-ds-6nhfh on seclab-worker
+# ...97 lines of report, elided here; verbatim in evidence section 8d...
+# == Summary node ==
+# 17 checks PASS
+# 2 checks FAIL
+# 6 checks WARN
+# 0 checks INFO
+# === pod/kube-bench-node-ds-vm7cw on seclab-worker2
+# ...97 lines of report, elided here; verbatim in evidence section 8e...
+# == Summary node ==
+# 17 checks PASS
+# 2 checks FAIL
+# 6 checks WARN
+# 0 checks INFO
+```
+
+Per-node counts and the comparison against 2026-07-26 are in the second table
+in section 3. **`seclab-worker2`'s report contains no finding
+`seclab-worker`'s did not already contain** — same two mode-644 FAILs, same
+six WARNs, same 4.2.5 false PASS — which is the expected result for two
+containers off one kind node image. What changed is the class of evidence: the
+findings probe 5d-d confirmed by hand on that worker are now scanner output.
+
+**The hold, and what it costs.** The container never exits, so section 2's
+`kubectl wait --for=condition=complete` has no analogue here; readiness is the
+signal instead. Observed at 2m40s of DaemonSet age: `READY 2` of `DESIRED 2`,
+`restartCount 0` on both Pods, which is what a working hold looks like and is
+not what `CrashLoopBackOff` looks like.
+
+**Cleanup — run 2026-07-29, after the reports above were captured:**
+
+```bash
+kubectl -n cis-benchmark delete daemonset kube-bench-node-ds
+# daemonset.apps "kube-bench-node-ds" deleted from cis-benchmark namespace
+#                                                                      (exit 0)
+
+kubectl -n cis-benchmark get daemonset,pods
+# No resources found in cis-benchmark namespace.                       (exit 0)
+
+kubectl get daemonset -A
+# falco         falco        3   3   3   3   3
+# kube-system   kindnet      3   3   3   3   3
+# kube-system   kube-proxy   3   3   3   3   3
+# => three DaemonSets survive and none is this phase's: falco is phase 6's
+#    sensor, kindnet and kube-proxy are kind's own. No kube-bench DaemonSet
+#    exists anywhere on the cluster.
+
+kubectl get ns cis-benchmark --show-labels
+# cis-benchmark   Active   3d15h   app.kubernetes.io/part-of=k8s-security-lab,
+#   kubernetes.io/metadata.name=cis-benchmark,
+#   pod-security.kubernetes.io/audit=restricted,
+#   pod-security.kubernetes.io/enforce=privileged,
+#   pod-security.kubernetes.io/warn=restricted                         (exit 0)
+```
+
+The DaemonSet was left `Running` between the capture and this teardown on
+purpose, so the live cluster could be checked against the evidence rather than
+taken on trust. The namespace is **kept**, for section 4's reason exactly: the
+committed manifests define it and the phase stays re-appliable. Verbatim
+captures of all four commands are in evidence section 8g. With the DaemonSet
+gone, section 4's closing paragraph is true again — every object manifest in
+`docs/evidence/phase-5-cis/` now reports NotFound, so the only thing a
+directory-wide `kubectl delete -f` would still find is the namespace itself,
+which is why that command names the namespace manifest explicitly.
