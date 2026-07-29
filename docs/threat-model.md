@@ -467,11 +467,28 @@ admitted image may carry a critical CVE and this lab will run it. Making the
 gate blocking is a one-line change; it is left report-only so the pipeline
 always produces a signed artifact for the demo to consume.
 
-**6.6 The SBOM is unattested.** Syft produces an SPDX-JSON SBOM, and the
-workflow uploads it as a **CI artifact**. It is not a `cosign attest`
-attestation bound to the image digest, so no admission policy can require or
-verify it. The SBOM is documentation of that build, not a control — it proves
-nothing at admission time.
+**6.6 The SBOM is attested for future builds only, and nothing verifies it at
+admission.** Syft produces an SPDX-JSON SBOM and the workflow uploads it as a
+**CI artifact**. Since 2026-07-29 the `sign` job also runs `cosign attest
+--type spdxjson --predicate sbom.spdx.json` against the build digest (commit
+pending merge), so every FUTURE build binds its SBOM to its own immutable
+digest and records the attestation in Rekor. Four limits keep this on the
+residual-risk list. The step has **never run** — the workflow fires only on
+`push` to `main`, so this records a static change to the YAML, not observed
+behaviour; the first green run on main owes a `cosign verify-attestation`
+transcript to `docs/evidence/phase-4-supply-chain/`. The digest the cluster
+runs today (`b8483c58...@sha256:7fd13d22...`) predates the step and stays
+**unattested by design**, because the repo pins the digest it actually
+verified. **The attestation's integrity extends trust to the build job that
+produced the SBOM:** `build-scan` generates `sbom.spdx.json` and `sign`
+attests it verbatim, so a compromised build job yields a forged-but-signed
+predicate — the digest is content-addressed and cannot be swapped, but the
+predicate is free-form JSON, and cosign **binds** it rather than **vouching**
+for it. And **no admission policy requires or verifies an attestation** — the
+`ImageValidatingPolicy` checks signatures only. The SBOM is documentation of
+that build, not a control — it still proves **nothing at admission time**. A
+Kyverno attestation check is a deliberate follow-up, deferred until an
+attested digest is actually deployed.
 
 **6.7 Policies are namespace-scoped, not cluster-wide.** All four
 `ValidatingPolicy` resources and the `ImageValidatingPolicy` select only

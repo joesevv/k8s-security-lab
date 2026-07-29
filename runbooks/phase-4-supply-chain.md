@@ -94,18 +94,22 @@ build-scan:              # contents: read, packages: write   — NO id-token
 
 sign:                    # contents: read, packages: write, id-token: write
   needs: build-scan
-  # GHCR login, cosign-installer, cosign sign --yes <image>@<digest>,
-  # cosign verify self-check, evidence upload
+  # GHCR login, download THIS run's `sbom` artifact, cosign-installer,
+  # cosign sign --yes <image>@<digest>, cosign attest --type spdxjson,
+  # cosign verify + cosign verify-attestation self-checks, two evidence
+  # uploads, record the signed digest
 ```
 
 `id-token: write` is the permission that lets a job mint the OIDC token whose
-subject Kyverno trusts. **Every third-party action runs in `build-scan`, where
-that permission is denied** — docker, trivy, syft and upload-artifact cannot
-mint the signing identity even if one of them is compromised or its tag is
-moved. The `sign` job holds `id-token: write` but runs nothing except GHCR
-login and cosign, and does **not** check out the repo, so no source tree exists
-in the privileged job. Every action is pinned to a 40-char commit SHA for the
-same reason a tag is not trusted for images.
+subject Kyverno trusts. **Every third-party action runs in `build-scan`, which
+holds no `id-token`** — docker, trivy and syft cannot mint the signing identity
+even if one of them is compromised or its tag is moved. The `sign` job holds
+`id-token: write` and runs GHCR login, cosign, and the first-party `actions/*`
+artifact steps that move this run's own SBOM in and the verify transcripts out —
+nothing else. It does **not** check out the repo, so no source tree exists in
+the privileged job. Every action is pinned to a 40-char commit SHA for the same
+reason a tag is not trusted for images. What the SBOM download costs in trust is
+stated in section 1a: `sign` now attests bytes that `build-scan` produced.
 
 The signing and self-check steps:
 
@@ -149,11 +153,121 @@ transcript, downloaded from that run's `cosign-verify` artifact, is at
   deliberate — a lab that cannot produce a signed image because upstream shipped
   a HIGH in libc teaches nothing about signing — but it means **the signature
   says nothing about vulnerabilities.**
-- **The SBOM is a CI artifact, not an attestation.** `sbom.spdx.json` is
-  uploaded with `actions/upload-artifact`; it is not `cosign attest`-ed against
-  the image digest, so it is not bound to the image and **no admission policy
-  can verify it.** Closing this means switching to a cosign attestation and
-  adding an attestation check to the policy. Not done.
+- **The SBOM is attested as of 2026-07-29 — for FUTURE builds, and not yet
+  proven by a run.** Until that date this bullet read, in full: "**The SBOM is a
+  CI artifact, not an attestation.** `sbom.spdx.json` is uploaded with
+  `actions/upload-artifact`; it is not `cosign attest`-ed against the image
+  digest, so it is not bound to the image and **no admission policy can verify
+  it.** Closing this means switching to a cosign attestation and adding an
+  attestation check to the policy. Not done." Half of that is now addressed and
+  half is not, so it stays in this list. The `sign` job now runs `cosign attest
+  --type spdxjson` against the build digest (section 1a), which binds the SBOM
+  of every FUTURE build to that build's digest. Still open, precisely: the step
+  has **never executed** — the workflow fires only on `push` to `main`, so the
+  claim rests on a static read of the YAML until the first green run on main
+  hands back a `cosign verify-attestation` transcript for
+  `docs/evidence/phase-4-supply-chain/`; the digest the cluster runs today
+  (`b8483c58...@sha256:7fd13d22...`) was built before the step existed and stays
+  **unattested by design**, because the repo pins the digest it actually
+  verified rather than repointing at an untested one; and **admission still
+  verifies signatures only** — no policy checks attestations. A Kyverno
+  attestation check is a deliberate follow-up, deferred until an attested digest
+  is actually deployed.
+
+---
+
+## 1a. The SBOM attestation — added 2026-07-29, not yet exercised
+
+Four steps were added to the `sign` job on 2026-07-29 so the SBOM stops being a
+CI artifact that nothing can tie to an image: the three below, plus the evidence
+upload that carries the transcript out. **None of them have run.** The
+workflow triggers only on `push` to `main` (paths-filtered, plus
+`workflow_dispatch`), so what follows documents what the YAML says, not what a
+run observed — the first green run on main owes the transcript.
+
+**1a-i. Move the SBOM into the privileged job.** It is generated in `build-scan`,
+the job that deliberately cannot sign, so it crosses the job boundary as an
+artifact:
+
+```yaml
+- name: Download SBOM artifact
+  uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+  with:
+    name: sbom          # byte-identical to build-scan's upload name
+```
+
+A same-run download needs no token input and no extra permission — the runner's
+`ACTIONS_RUNTIME_TOKEN` already scopes it to this run — and it drops
+`sbom.spdx.json` in the workspace root. That file is the only thing the `sign`
+job reads from disk; the job still does not check out the repo.
+
+**1a-ii. Attest the SBOM against the digest.**
+
+```yaml
+- name: Attest SBOM to the image digest
+  run: |
+    cosign attest --yes \
+      --type spdxjson \
+      --predicate sbom.spdx.json \
+      ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }}
+```
+
+cosign wraps the SBOM in an in-toto statement whose subject is that digest,
+signs it with the same keyless OIDC identity as the image signature, publishes
+it alongside the image in GHCR and records it in the public Rekor transparency
+log. The SBOM is then a signed claim about one immutable digest instead of a
+loose build artifact.
+
+**1a-iii. Self-check the attestation.**
+
+```yaml
+- name: Verify attestation (self-check vs the identity Kyverno pins)
+  shell: bash                    # explicit: -eo pipefail, without which `| tee`
+  run: |                         # masks cosign's exit code (as in section 1)
+    cosign verify-attestation \
+      --type spdxjson \
+      --certificate-identity 'https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main' \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }} \
+      2>&1 | tee cosign-verify-attestation.txt
+```
+
+The identity and issuer strings are byte-identical to the signature self-check
+in section 1 and to the pair the `ImageValidatingPolicy` pins. The transcript
+uploads as its own `cosign-verify-attestation` artifact with `if: always()` — a
+FAILED verification is the one worth keeping — and belongs at
+`docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt` once a run
+has produced one. Expect it to be large: `cosign verify-attestation` echoes the
+verified payload, which is the whole SBOM.
+
+**Where this sits in the pipeline — stated precisely.** Every cosign call in
+this workflow, the two old ones and the two new ones, runs **after** the image
+has already been pushed to GHCR. The attestation is created post-publication,
+and neither self-check gates the push. A failing self-check fails the job loudly
+after the fact; that is worth having, and it is not the same thing as a gate.
+
+Three things this does **not** buy, said plainly so nobody reads more into it:
+
+- **An attestation is not a truthful SBOM.** The SBOM is generated in
+  `build-scan` and attested in `sign`, so the attestation extends trust to the
+  build job: a compromised `build-scan` could emit a forged `sbom.spdx.json` and
+  `sign` would attest it verbatim, under the exact identity Kyverno pins. The
+  digest is content-addressed, so that attacker still cannot make `sign` attest
+  a **different image** than the one `build-scan` pushed; the predicate is
+  free-form JSON, so its contents are only as good as `build-scan`'s runtime.
+  This is the accepted cost of attesting a build-job SBOM — generating the SBOM
+  inside the privileged job would be worse, because it would put third-party
+  syft under `id-token: write`. cosign **binds** the predicate to the digest; it
+  does not **vouch** for what the predicate says.
+- **The deployed digest is not covered.** `b8483c58...@sha256:7fd13d22...` was
+  built on 2026-07-25, before this step existed. It carries no attestation and
+  will not grow one — the repo pins the digest it verified rather than
+  repointing the cluster at an untested build to make a document look tidier.
+- **Nothing verifies attestations at admission.** The `ImageValidatingPolicy`
+  checks signatures only, so an attestation adds no admission-time value today.
+  A Kyverno attestation check is a deliberate follow-up, deferred until an
+  attested digest is actually deployed — writing the check first would leave the
+  cluster enforcing a rule that the running image cannot satisfy.
 
 ---
 

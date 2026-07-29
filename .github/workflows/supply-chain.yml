@@ -1,36 +1,83 @@
 # ==============================================================================
-# Supply-chain CI (phase-4)  -  build -> scan -> SBOM  ||  keyless-sign-by-digest
+# Supply-chain CI (phase-4) - build->scan->SBOM || keyless sign+attest by digest
 # ------------------------------------------------------------------------------
 # This workflow is the trusted producer of container images for the lab. It is
 # split into TWO jobs so the signing privilege is isolated to one of them:
 #
-#   build-scan   (contents: read, packages: write  -  NO id-token)
-#     1. build   - build app/signed-app and push it to GHCR by per-commit tag.
-#     2. scan    - Trivy scans the pushed image (by digest) for CRITICAL/HIGH
-#                  CVEs and emits SARIF. Report-only (exit-code 0) so a signed
-#                  image is always produced even when findings exist.
-#     3. SBOM    - anchore/syft generates an SPDX-JSON SBOM of the same digest.
-#                  The immutable digest is exposed as a job output.
+#   build-scan   (contents: read, packages: write  -  NO id-token)   7 steps:
+#     Checkout                 - persist-credentials: false; nothing after it
+#                                needs the git credential.
+#     Log in to GHCR           - push credentials for the build.
+#     Build and push image     - build app/signed-app, push to GHCR under a
+#                                per-commit tag. The immutable digest becomes a
+#                                job output the sign job consumes.
+#     Trivy scan (report-only) - CRITICAL/HIGH -> SARIF. exit-code 0 by choice,
+#                                so a signed image is produced even when
+#                                findings exist.
+#     Upload Trivy SARIF       - the findings leave as a build artifact.
+#     Generate SBOM            - anchore/syft, SPDX-JSON, of that same digest.
+#     Upload SBOM              - leaves as the `sbom` artifact, which the sign
+#                                job downloads (see TRUST EXTENSION below).
 #
-#   sign         (contents: read, packages: write, id-token: write)
-#     4. sign    - cosign KEYLESS-signs the image BY DIGEST (not the tag) using
-#                  the workflow's ambient GitHub OIDC identity (id-token: write).
-#                  No private key is stored; the signature is bound to this
-#                  workflow's OIDC subject and recorded in the Rekor log.
-#     5. verify  - cosign verify re-checks the signature it just made against
-#                  the EXACT keyless identity Kyverno pins. A failure here fails
-#                  the pipeline; the output is kept as evidence.
+#   sign         (contents: read, packages: write, id-token: write)  10 steps:
+#     Log in to GHCR           - cosign pushes the signature and attestation
+#                                artifacts to GHCR.
+#     Download SBOM artifact   - THIS run's own `sbom` artifact, via first-party
+#                                actions/download-artifact; no token input.
+#     Install cosign           - pinned cosign release.
+#     Keyless sign image by digest
+#                              - cosign KEYLESS-signs the image BY DIGEST (not
+#                                the tag) using the workflow's ambient GitHub
+#                                OIDC identity (id-token: write). No private key
+#                                is stored; the signature is bound to this
+#                                workflow's OIDC subject and logged in Rekor.
+#     Attest SBOM to the image digest
+#                              - cosign attest --type spdxjson binds the SBOM to
+#                                that same digest, same identity, same log.
+#                                Added 2026-07-29; FUTURE builds only.
+#     Verify signature (self-check vs the identity Kyverno pins)
+#                              - cosign verify re-checks the signature it just
+#                                made against the EXACT keyless identity Kyverno
+#                                pins. A failure here fails the pipeline; the
+#                                output is kept as evidence.
+#     Upload cosign verify evidence
+#                              - that transcript out, if: always().
+#     Verify attestation (self-check vs the identity Kyverno pins)
+#                              - cosign verify-attestation, byte-identical
+#                                identity strings. Had not executed as of
+#                                2026-07-29: the workflow fires only on push to
+#                                main, so it is unproven until the first green
+#                                run there.
+#     Upload cosign verify-attestation evidence
+#                              - that transcript out, if: always().
+#     Record signed digest     - writes the signed digest to the job summary.
+#
+# All four cosign calls run AFTER the image is already in GHCR: they are
+# post-publication self-checks that fail the pipeline, never gates on publishing.
 #
 # WHY THE SPLIT: `id-token: write` is the permission that lets a job mint the
-# OIDC token whose subject Kyverno trusts. Every third-party action (docker,
-# trivy, syft, upload-artifact) runs in build-scan, where that permission is
-# DENIED - so a compromised or retagged third-party action cannot mint the OIDC
-# identity Kyverno admits on, and cannot forge a signature the cluster accepts.
-# The `sign` job holds id-token: write but runs nothing except GHCR login and
-# cosign - it does NOT check out the repo, so no source tree is present there
-# and no step reads one. For the same reason every action is pinned to an
-# immutable 40-char commit SHA (a tag can be moved by the upstream owner), and
-# workflow-level permissions are `{}` - deny by default, granted per job.
+# OIDC token whose subject Kyverno trusts. build-scan runs every third-party
+# build/scan action (docker, trivy, syft) and holds NO id-token - so a
+# compromised or retagged third-party action cannot mint the OIDC identity
+# Kyverno admits on, and cannot forge a signature the cluster accepts. The
+# `sign` job holds id-token: write and runs GHCR login, cosign, and the
+# first-party actions/* artifact steps that move THIS run's own SBOM in and the
+# verify transcripts out - nothing else. It does NOT check out the repo, so no
+# source tree is present there and no step reads one. For the same reason every
+# action is pinned to an immutable 40-char commit SHA (a tag can be moved by the
+# upstream owner), and workflow-level permissions are `{}` - deny by default,
+# granted per job.
+#
+# TRUST EXTENSION, written down rather than left for a reader to discover: since
+# 2026-07-29 the sign job ingests bytes that build-scan produced
+# (sbom.spdx.json) and attests them under the OIDC identity Kyverno pins. The
+# digest is content-addressed, so build-scan cannot make sign attest a DIFFERENT
+# image than the one it pushed. The predicate is not: it is free-form JSON, so a
+# compromised build-scan gets a forged-but-signed SBOM. That is the accepted
+# cost of attesting a build-job SBOM - generating the SBOM inside the privileged
+# job would be worse, because it would put third-party syft under
+# id-token: write. cosign BINDS the predicate to the digest; it does not VOUCH
+# for what the predicate says.
 #
 # Kyverno's ImageValidatingPolicy admits ONLY images signed by THIS workflow's
 # OIDC identity, and it matches the glob ghcr.io/joesevv/k8s-security-lab/* in
@@ -152,6 +199,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The SBOM is produced in build-scan (the job that must NOT be able to
+      # sign) and consumed here (the job that can), so it has to cross the job
+      # boundary as an artifact. A same-run download needs no token input and no
+      # extra permission: the runner's ACTIONS_RUNTIME_TOKEN already scopes it to
+      # THIS run, so this step cannot reach another run's or another repo's
+      # artifacts. `name` must stay byte-identical to build-scan's upload name.
+      # The file lands in the workspace root as sbom.spdx.json - the only thing
+      # this job ever reads from disk; it still does NOT check out the repo.
+      # Pinned to the v7 major to match the upload-artifact (v7.0.1) that writes
+      # the artifact rather than the newer v8 - one moving part fewer. v7.0.0 is
+      # the newest release on that major.
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: sbom
+
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
@@ -159,6 +222,24 @@ jobs:
 
       - name: Keyless sign image by digest
         run: cosign sign --yes ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }}
+
+      # Bind THIS build's SBOM to THIS build's digest. cosign wraps
+      # sbom.spdx.json in an in-toto statement whose subject is the digest, signs
+      # it with the same keyless OIDC identity as the signature above, pushes it
+      # to GHCR alongside the image and records it in the public Rekor log. That
+      # turns the SBOM from an expiring CI artifact nobody can tie to an image
+      # into a signed claim about one immutable digest.
+      # Like every cosign call in this workflow it runs AFTER the image was
+      # published: the attestation is created post-publication, it does not gate
+      # the push. Added 2026-07-29, so it applies to FUTURE builds only - the
+      # digest the cluster runs today was built before this step existed and is
+      # deliberately left unattested (the repo pins the digest it verified).
+      - name: Attest SBOM to the image digest
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate sbom.spdx.json \
+            ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }}
 
       # Self-check: prove the signature we just made satisfies the EXACT keyless
       # identity the Kyverno ImageValidatingPolicy pins. If this fails the job
@@ -192,6 +273,48 @@ jobs:
         with:
           name: cosign-verify
           path: cosign-verify.txt
+
+      # Self-check on the attestation, same shape and same reason as the
+      # signature self-check above: an attestation that does not verify against
+      # the EXACT identity the Kyverno ImageValidatingPolicy pins must fail the
+      # job, not ship quietly. `shell: bash` is explicit so the runner uses
+      # `-eo pipefail`: without pipefail the `| tee` would mask a non-zero cosign
+      # exit code. Also POST-publication, like every cosign call here - when it
+      # runs it will prove the attestation exists and is bound to this digest;
+      # it is NOT an admission-time control. Nothing in the cluster verifies attestations
+      # today: the Kyverno attestation check is a deliberate follow-up, deferred
+      # until an attested digest is actually deployed.
+      # cosign verify-attestation echoes the verified payload, so this transcript
+      # (and the summary block below) carries the whole SBOM and will be large.
+      - name: Verify attestation (self-check vs the identity Kyverno pins)
+        shell: bash
+        run: |
+          cosign verify-attestation \
+            --type spdxjson \
+            --certificate-identity 'https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            ghcr.io/joesevv/k8s-security-lab/signed-app@${{ needs.build-scan.outputs.digest }} \
+            2>&1 | tee cosign-verify-attestation.txt
+          {
+            echo '### cosign verify-attestation (SBOM attestation self-check)'
+            echo ''
+            echo '```'
+            cat cosign-verify-attestation.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Download this and commit it as
+      # docs/evidence/phase-4-supply-chain/cosign-verify-attestation.txt after
+      # the first green run on main - until then the attest path has no evidence
+      # behind it. Separate artifact name so a failure here is distinguishable
+      # from a signature-verify failure. `if: always()` for the same reason as
+      # above: a FAILED verification is the transcript worth keeping.
+      - name: Upload cosign verify-attestation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cosign-verify-attestation
+          path: cosign-verify-attestation.txt
 
       - name: Record signed digest
         run: |
