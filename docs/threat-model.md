@@ -673,14 +673,24 @@ cluster. Nothing was remediated, no manifest changed, and no evidence directory
 shows any of them closed. That is the correct outcome for a measurement phase,
 but it makes this section a list of open gaps rather than a changelog, and
 items 1 and 2 would be the first things to fix on a cluster that mattered.
-**Two scope caveats.** The node scan produced a single Pod, which ran on
-`seclab-worker`; `seclab-worker2` was never scanned, so the node-level findings
-are confirmed by kube-bench on one of two workers — except 4.2.5 and 1.1.9,
-which items 5 and 7 record from a direct read of all three nodes rather than
-from the scan. And per §6.8, a kind cluster passes and fails a great many CIS
-checks because of what kubeadm chose, not because of a hardening decision this
-lab made — the scan measures the substrate at least as much as it measures the
-lab.
+**Two scope caveats, one of them now closed.** The node scan of 2026-07-26
+produced a single Pod, which ran on `seclab-worker`; `seclab-worker2` was not
+scanned by kube-bench at all, so the node-level findings rested on the scanner
+having seen one of two workers. **Closed 2026-07-29:** the `node` target was
+re-run as a DaemonSet
+(`docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml`), which schedules
+one Pod per eligible node. Both workers were scanned, and both returned 17 PASS
+/ 2 FAIL / 6 WARN / 0 INFO — reports that are byte-identical to the 2026-07-26
+Job's once glog timestamps are stripped (evidence §8). That closed a
+**coverage** gap and nothing else: no item above was remediated by it, and a
+DaemonSet of scanners enforces nothing. The second caveat stands unchanged:
+4.2.5 and 1.1.9, which items 5 and 7 record from a **direct read** of all three
+nodes rather than from the scan, are still direct reads. The DaemonSet run
+reproduced 4.2.5's false PASS on both workers without re-testing the value
+behind it, and it says nothing at all about 1.1.9, which is a `master`-target
+check. And per §6.8, a kind cluster passes and fails a great many CIS checks
+because of what kubeadm chose, not because of a hardening decision this lab
+made — the scan measures the substrate at least as much as it measures the lab.
 
 **6.13 The runtime sensor is itself privileged, ungated and unwatched.** §6.4
 records what phase 6 bought and what it does not do with it; this item records

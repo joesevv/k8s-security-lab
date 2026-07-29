@@ -81,6 +81,11 @@
 #                                     mutating the node.
 # Every volume that IS kept sets an explicit `type:`, so a missing path fails the
 # Pod loudly instead of being conjured into existence.
+#
+# SUPERSEDED FOR COVERAGE ONLY, 2026-07-29: a Job schedules ONE Pod, so this
+# manifest can only ever scan one worker. daemonset-kube-bench-node.yaml runs
+# the same spec on every worker; see attack-output.txt section 8. The scan,
+# the pins and every argument above are unchanged and still current.
 apiVersion: batch/v1
 kind: Job
 metadata:

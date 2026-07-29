@@ -1224,3 +1224,557 @@ NOT PROVEN HERE — stated so the evidence above is not read as more than it is.
 - cis-1.12 IS APPLIED ONE MINOR VERSION AHEAD of the newest Kubernetes release
   upstream mapped it to (1.34, against this cluster's 1.35.5). Checks that
   changed in 1.35 may be graded by 1.34-era logic.
+
+============================================================
+8) COVERAGE GAP CLOSED, 2026-07-29 — the node target re-run as a DaemonSet, so
+BOTH workers are scanned by kube-bench instead of one. Appended rather than
+merged into sections 2 and 4 on purpose: nothing above this line was rewritten,
+because the 2026-07-26 Job run said exactly what it said and this is what
+changed afterwards. WHAT CHANGES IS COVERAGE, AND ONLY COVERAGE. A DaemonSet of
+scanners enforces nothing, remediates nothing and gates nothing, precisely like
+the two Jobs before it.
+$ diff <(grep -v '^\s*#' docs/evidence/phase-5-cis/job-kube-bench-node.yaml | grep -v '^\s*$') <(grep -v '^\s*#' docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml | grep -v '^\s*$')
+$ kubectl apply -f docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml
+$ kubectl -n cis-benchmark rollout status daemonset/kube-bench-node-ds --timeout=180s
+$ kubectl -n cis-benchmark get pods -l app.kubernetes.io/name=kube-bench-node-ds -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+$ kubectl -n cis-benchmark logs kube-bench-node-ds-6nhfh
+$ kubectl -n cis-benchmark logs kube-bench-node-ds-vm7cw
+============================================================
+
+------------------------------------------------------------
+8a) WHAT THIS SUPERSEDES — QUOTED, NOT EDITED. Three passages above disclosed
+the gap. None of the three was altered, and the line numbers they occupy are
+unchanged by this append, because an append moves nothing.
+------------------------------------------------------------
+This file's preamble, lines 38-43:
+  SCOPE OF THE SCAN, STATED BEFORE THE NUMBERS: a Job produces ONE Pod, so the
+  node target ran on seclab-worker only. seclab-worker2 was NEVER scanned by
+  kube-bench. Its two node findings were confirmed by hand (probe 5d-d), as was
+  the 1.1.9 CNI file mode on all three nodes (probe 5d-a), but those are manual
+  checks, not kube-bench results. Scanning every worker needs a DaemonSet, which
+  this phase does not ship.
+
+Section 4's header, lines 687-689:
+  4) FULL kube-bench REPORT — NODE JOB, verbatim and unedited, on seclab-worker.
+  Target node. seclab-worker2 is NOT covered by this or any other capture in this
+  file.
+
+The NOT PROVEN HERE list, lines 1201-1204:
+  - seclab-worker2 WAS NEVER SCANNED. A Job produces one Pod. The two node FAILs
+    were confirmed on worker2 by hand (probe 5d-d) and the false PASS of section
+    6 was confirmed on all three nodes, but no kube-bench result exists for that
+    node. Full coverage needs a DaemonSet, which this phase does not ship.
+
+=> WHAT CHANGES, PRECISELY AND ONLY THIS: the DaemonSet those three passages
+say the phase does not ship now exists —
+docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml — it ran on
+2026-07-29, and seclab-worker2 has a real kube-bench node report as of that
+date, captured in 8e from a Pod that ran on that node. All three passages stay
+TRUE OF THE RUN THEY DESCRIBE, the 2026-07-26 Jobs, which is exactly why they
+are quoted here rather than rewritten there.
+=> WHAT DOES NOT CHANGE, STATED SO THIS IS NOT READ AS MORE THAN IT IS. Probes
+5d-d and 5d-a are still manual `docker exec` checks and are still not
+kube-bench results; this run does not promote them, it only means 5d-d's two
+findings are now independently visible in scanner output taken on the node
+5d-d was standing in for. And NOTHING HERE ENFORCES ANYTHING: no policy was
+added, no namespace label changed, no apiserver flag altered, and not one of
+the 30 evaluated non-passing checks was remediated. This is still assessment.
+The NOT PROVEN HERE list above stands in full, with one of its nine bullets —
+seclab-worker2 — qualified by this section rather than deleted, and the other
+eight untouched. That includes the false PASS of section 6, which reads [PASS]
+again in both reports below; nothing in this run re-tested the value behind
+that check, so section 6 stands exactly as written.
+
+------------------------------------------------------------
+8b) THE DAEMONSET RUNS THE NODE JOB'S SPEC, AND THAT IS CHECKED RATHER THAN
+ASSERTED. If the scan itself had changed, worker2's numbers would not be
+comparable with 2026-07-26's and this section would prove nothing. Comments and
+blank lines stripped from both manifests:
+------------------------------------------------------------
+$ diff <(grep -v '^\s*#' docs/evidence/phase-5-cis/job-kube-bench-node.yaml | grep -v '^\s*$') <(grep -v '^\s*#' docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml | grep -v '^\s*$')
+1,2c1,2
+< apiVersion: batch/v1
+< kind: Job
+---
+> apiVersion: apps/v1
+> kind: DaemonSet
+4c4
+<   name: kube-bench-node
+---
+>   name: kube-bench-node-ds
+8a9
+>     app.kubernetes.io/name: kube-bench-node-ds
+10c11,13
+<   backoffLimit: 0
+---
+>   selector:
+>     matchLabels:
+>       app.kubernetes.io/name: kube-bench-node-ds
+15a19
+>         app.kubernetes.io/name: kube-bench-node-ds
+17c21
+<       restartPolicy: Never
+---
+>       restartPolicy: Always
+24,31c28,30
+<             - kube-bench
+<             - run
+<             - --v=1
+<             - --benchmark
+<             - cis-1.12
+<             - --targets
+<             - node
+<             - --include-test-output
+---
+>             - sh
+>             - -c
+>             - 'kube-bench run --v=1 --benchmark cis-1.12 --targets node --include-test-output; while true; do sleep 3600; done'
+(exit code: 1 = the files differ, by exactly those hunks)
+
+=> SEVEN HUNKS, FOUR SUBSTANTIVE CHANGES, NONE OF THEM TOUCHING WHAT IS
+SCANNED. (i) the controller kind and its name; (ii) the label/selector pair a
+DaemonSet requires — the third label app.kubernetes.io/name: kube-bench-node-ds
+on both object and template, the matchLabels that selects it, and the Job-only
+backoffLimit: 0 dropped because a DaemonSet has no equivalent; (iii)
+restartPolicy Never -> Always; (iv) the command wrapped in a shell. The image
+digest, the securityContext, the DAC_READ_SEARCH add-back, hostPID: true,
+automountServiceAccountToken: false, all six hostPath mounts with their
+explicit types, the emptyDir and the resources are untouched, and the scan
+arguments inside the wrapper are the Job's own, in the Job's own order.
+
+CHANGE (iii) IS NOT A PREFERENCE, IT IS THE ONLY VALUE THE API ACCEPTS.
+Verified against upstream source rather than by trying it against this cluster:
+$ gh api repos/kubernetes/kubernetes/contents/pkg/apis/apps/validation/validation.go?ref=v1.35.5 --jq .content | base64 -d | sed -n '/^func ValidateDaemonSetSpec/,/^}/p' | grep -A2 'RestartPolicy'
+	// RestartPolicy has already been first-order validated as per ValidatePodTemplateSpec().
+	if spec.Template.Spec.RestartPolicy != api.RestartPolicyAlways {
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("template", "spec", "restartPolicy"), spec.Template.Spec.RestartPolicy, []string{string(api.RestartPolicyAlways)}))
+	}
+	if spec.Template.Spec.ActiveDeadlineSeconds != nil {
+(exit code: 0 — tag v1.35.5, the version this cluster runs)
+
+=> AND CHANGE (iv) FOLLOWS FROM (iii). kube-bench exits when the scan finishes;
+under restartPolicy: Always the kubelet restarts an exited container, so an
+unwrapped DaemonSet Pod would scan, exit, be restarted, scan again and settle
+into CrashLoopBackOff, with each report stranded in a discarded container's
+log. `sh -c '<scan>; while true; do sleep 3600; done'` runs the scan exactly
+once and then idles, so `kubectl logs` returns the whole report for as long as
+the Pod lives. A LOOP RATHER THAN `sleep infinity` BECAUSE `infinity` IS A GNU
+COREUTILS EXTENSION that BusyBox's sleep rejects, and which of the two this
+image ships was not tested — a loop over a finite sleep behaves the same under
+either, so the question is designed out instead of guessed at. THE PRICE, PAID
+KNOWINGLY: the container's exit code is no longer kube-bench's, because it
+never exits. Section 4's "a zero exit means the scanner ran" reading does not
+apply here; the log is the only evidence, and the DaemonSet must be deleted by
+hand rather than completing on its own.
+
+------------------------------------------------------------
+8c) THE RUN, AND THE PLACEMENT PROOF THIS SECTION EXISTS FOR. One Pod per
+eligible node is the DaemonSet's guarantee; that it actually produced one Pod
+on EACH worker is the claim, so it is printed rather than assumed.
+------------------------------------------------------------
+$ kubectl apply -f docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), unrestricted capabilities (container "kube-bench" must not include "DAC_READ_SEARCH" in securityContext.capabilities.add), restricted volume types (volumes "etc-kubernetes", "var-lib-kubelet", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+daemonset.apps/kube-bench-node-ds created
+(exit code: 0)
+
+=> THE POD SECURITY WARNING IS CHARACTER-FOR-CHARACTER THE ONE THE NODE JOB
+DREW ON 2026-07-26. NOT ASSERTED — PRINTED: line 163 of this file is that Job's
+apply warning from 2026-07-26, line 1376 immediately above is the DaemonSet's
+from 2026-07-29, and they are compared where they sit rather than by eye.
+$ diff <(sed -n '163p' docs/evidence/phase-5-cis/attack-output.txt) <(sed -n '1376p' docs/evidence/phase-5-cis/attack-output.txt)
+(exit code: 0 — no output at all, which is what an empty diff looks like; the
+two lines are byte-identical)
+
+=> SAME VIOLATIONS, DIFFERENT CONTROLLER: same hostPID, same DAC_READ_SEARCH,
+same six hostPath volumes, same runAsNonRoot and runAsUser=0. The controller
+kind changed; the restricted-profile violations the scanner commits did not.
+And as in section 2 the warning is part of the deliverable — cis-benchmark
+carries warn=restricted precisely so every apply prints what it is getting away
+with.
+
+$ kubectl -n cis-benchmark rollout status daemonset/kube-bench-node-ds --timeout=180s
+Waiting for daemon set "kube-bench-node-ds" rollout to finish: 1 of 2 updated pods are available...
+daemon set "kube-bench-node-ds" successfully rolled out
+(exit code: 0)
+
+$ kubectl -n cis-benchmark get pods -l app.kubernetes.io/name=kube-bench-node-ds -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+NAME                       NODE             STATUS
+kube-bench-node-ds-6nhfh   seclab-worker    Running
+kube-bench-node-ds-vm7cw   seclab-worker2   Running
+(exit code: 0)
+
+=> TWO PODS, TWO DIFFERENT WORKERS, BOTH Running. That is the entire point of
+this section: seclab-worker2 is on the list. NO PLACEMENT WAS PINNED TO GET
+THERE — the manifest carries no nodeSelector and asks for no toleration, so the
+control-plane node's node-role.kubernetes.io/control-plane:NoSchedule taint
+keeps the DaemonSet off it, deliberately, since `--targets node` is the
+worker-node benchmark and seclab-control-plane is assessed by the master Job
+against its own targets. Two eligible nodes, two Pods, no third.
+
+BE PRECISE ABOUT THAT, BECAUSE "TOLERATES NOTHING" WOULD BE FALSE. The
+DaemonSet controller injects tolerations of its own into every Pod it creates:
+$ kubectl -n cis-benchmark get pod kube-bench-node-ds-vm7cw -o jsonpath='{range .spec.tolerations[*]}{.key}{" op="}{.operator}{" eff="}{.effect}{"\n"}{end}'
+node.kubernetes.io/not-ready op=Exists eff=NoExecute
+node.kubernetes.io/unreachable op=Exists eff=NoExecute
+node.kubernetes.io/disk-pressure op=Exists eff=NoSchedule
+node.kubernetes.io/memory-pressure op=Exists eff=NoSchedule
+node.kubernetes.io/pid-pressure op=Exists eff=NoSchedule
+node.kubernetes.io/unschedulable op=Exists eff=NoSchedule
+(exit code: 0)
+
+$ kubectl get node seclab-control-plane -o jsonpath='{range .spec.taints[*]}{.key}{"="}{.value}{":"}{.effect}{"\n"}{end}'
+node-role.kubernetes.io/control-plane=:NoSchedule
+(exit code: 0)
+
+=> READ THE TWO TOGETHER. The Pod carries six tolerations, all of them
+node-condition tolerations the DaemonSet controller adds, and NOT ONE OF THEM
+MATCHES node-role.kubernetes.io/control-plane:NoSchedule — which is the only
+taint on seclab-control-plane. So the accurate sentence is not "the Pod
+tolerates nothing"; it is "nothing the Pod tolerates matches the control-plane
+taint, and the manifest asks for no toleration that would".
+
+$ kubectl -n cis-benchmark get daemonset kube-bench-node-ds
+NAME                 DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+kube-bench-node-ds   2         2         2       2            2           <none>          2m40s
+(exit code: 0)
+
+$ kubectl -n cis-benchmark get daemonset kube-bench-node-ds -o jsonpath='{.spec.template.spec.restartPolicy}'
+Always
+(exit code: 0 — no trailing newline in jsonpath output)
+
+$ kubectl -n cis-benchmark get daemonset kube-bench-node-ds -o jsonpath='{.spec.template.spec.containers[0].command}'
+["sh","-c","kube-bench run --v=1 --benchmark cis-1.12 --targets node --include-test-output; while true; do sleep 3600; done"]
+(exit code: 0 — no trailing newline in jsonpath output)
+
+$ kubectl -n cis-benchmark get pods -l app.kubernetes.io/name=kube-bench-node-ds -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[0].restartCount,IMAGE_ID:.status.containerStatuses[0].imageID
+NAME                       NODE             RESTARTS   IMAGE_ID
+kube-bench-node-ds-6nhfh   seclab-worker    0          docker.io/aquasec/kube-bench@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+kube-bench-node-ds-vm7cw   seclab-worker2   0          docker.io/aquasec/kube-bench@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+(exit code: 0)
+
+=> THE HOLD HOLDS, AND THAT IS AN OBSERVATION RATHER THAN A DESIGN CLAIM: at
+2m40s of DaemonSet age the controller still reports READY 2 of DESIRED 2 and
+both Pods still report restartCount 0, which is what a working hold looks like
+and is not what CrashLoopBackOff looks like.
+Both containers report the same digest the manifest pins,
+sha256:861900910eec...70f5, so the bytes that produced the two reports below
+are the bytes section 2 recorded for the Jobs. The benchmark pin is visible in
+the live command above and the "Assuming default version 1.18" warning in both
+logs is cosmetic for the reasons proved two ways in section 2; nothing about
+that argument changes when the controller kind changes.
+
+------------------------------------------------------------
+8d) FULL kube-bench REPORT — DAEMONSET POD kube-bench-node-ds-6nhfh, ON
+seclab-worker. Verbatim and unedited, 2026-07-29. This is the node the
+2026-07-26 Job also landed on, so it is the control: if this report disagreed
+with section 4, the DaemonSet would be measuring something else.
+------------------------------------------------------------
+$ kubectl -n cis-benchmark logs kube-bench-node-ds-6nhfh
+I0729 17:34:02.396978   14721 util.go:650] Checking for oc
+I0729 17:34:02.397582   14721 util.go:679] Can't find oc command: exec: "oc": executable file not found in $PATH
+Warning: Kubernetes version was not auto-detected because kubectl could not connect to the Kubernetes server. This may be because the kubeconfig information is missing or has credentials that do not match the server. Assuming default version 1.18
+I0729 17:34:02.521756   14721 util.go:395] Unable to get Kubernetes version from kubectl, using default version: 1.18
+I0729 17:34:02.521793   14721 common.go:351] Kubernetes version: "" to Benchmark version: "cis-1.12"
+I0729 17:34:02.522270   14721 common.go:274] Using config file: cfg/cis-1.12/config.yaml
+I0729 17:34:02.522713   14721 common.go:78] Using test file: cfg/cis-1.12/node.yaml
+I0729 17:34:02.534397   14721 util.go:264] executable 'hyperkube kubelet' not running
+[INFO] 4 Worker Node Security Configuration
+[INFO] 4.1 Worker Node Configuration Files
+[FAIL] 4.1.1 Ensure that the kubelet service file permissions are set to 600 or more restrictive (Automated)
+	 permissions=644
+[PASS] 4.1.2 Ensure that the kubelet service file ownership is set to root:root (Automated)
+[WARN] 4.1.3 If proxy kubeconfig file exists ensure permissions are set to 600 or more restrictive (Manual)
+[WARN] 4.1.4 If proxy kubeconfig file exists ensure ownership is set to root:root (Manual)
+[PASS] 4.1.5 Ensure that the --kubeconfig kubelet.conf file permissions are set to 600 or more restrictive (Automated)
+[PASS] 4.1.6 Ensure that the --kubeconfig kubelet.conf file ownership is set to root:root (Automated)
+[PASS] 4.1.7 Ensure that the certificate authorities file permissions are set to 644 or more restrictive (Manual)
+[PASS] 4.1.8 Ensure that the client certificate authorities file ownership is set to root:root (Manual)
+[FAIL] 4.1.9 If the kubelet config.yaml configuration file is being used validate permissions set to 600 or more restrictive (Automated)
+	 permissions=644
+[PASS] 4.1.10 If the kubelet config.yaml configuration file is being used validate file ownership is set to root:root (Automated)
+[INFO] 4.2 Kubelet
+[PASS] 4.2.1 Ensure that the --anonymous-auth argument is set to false (Automated)
+[PASS] 4.2.2 Ensure that the --authorization-mode argument is not set to AlwaysAllow (Automated)
+[PASS] 4.2.3 Ensure that the --client-ca-file argument is set as appropriate (Automated)
+[PASS] 4.2.4 Verify that if defined, the --read-only-port argument is set to 0 (Manual)
+[PASS] 4.2.5 Ensure that the --streaming-connection-idle-timeout argument is not set to 0 (Manual)
+[PASS] 4.2.6 Ensure that the --make-iptables-util-chains argument is set to true (Automated)
+[PASS] 4.2.7 Ensure that the --hostname-override argument is not set (Manual)
+[PASS] 4.2.8 Ensure that the eventRecordQPS argument is set to a level which ensures appropriate event capture (Manual)
+[WARN] 4.2.9 Ensure that the --tls-cert-file and --tls-private-key-file arguments are set as appropriate (Manual)
+[PASS] 4.2.10 Ensure that the --rotate-certificates argument is not set to false (Automated)
+[PASS] 4.2.11 Verify that the RotateKubeletServerCertificate argument is set to true (Manual)
+[WARN] 4.2.12 Ensure that the Kubelet only makes use of Strong Cryptographic Ciphers (Manual)
+[WARN] 4.2.13 Ensure that a limit is set on pod PIDs (Manual)
+[WARN] 4.2.14 Ensure that the --seccomp-default parameter is set to true (Manual)
+[INFO] 4.3 kube-proxy
+[PASS] 4.3.1 Ensure that the kube-proxy metrics service is bound to localhost (Automated)
+
+== Remediations node ==
+4.1.1 Run the below command (based on the file location on your system) on the each worker node.
+For example, chmod 600 /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+4.1.3 Run the below command (based on the file location on your system) on the each worker node.
+For example,
+chmod 600 /etc/kubernetes/proxy.conf
+
+4.1.4 Run the below command (based on the file location on your system) on the each worker node.
+For example, chown root:root /etc/kubernetes/proxy.conf
+
+4.1.9 Run the following command (using the config file location identified in the Audit step)
+chmod 600 /var/lib/kubelet/config.yaml
+
+4.2.9 If using a Kubelet config file, edit the file to set `tlsCertFile` to the location
+of the certificate file to use to identify this Kubelet, and `tlsPrivateKeyFile`
+to the location of the corresponding private key file.
+If using command line arguments, edit the kubelet service file
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf on each worker node and
+set the below parameters in KUBELET_CERTIFICATE_ARGS variable.
+--tls-cert-file=<path/to/tls-certificate-file>
+--tls-private-key-file=<path/to/tls-key-file>
+Based on your system, restart the kubelet service. For example,
+systemctl daemon-reload
+systemctl restart kubelet.service
+
+4.2.12 If using a Kubelet config file, edit the file to set `tlsCipherSuites` to
+TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+or to a subset of these values.
+If using executable arguments, edit the kubelet service file
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf on each worker node and
+set the --tls-cipher-suites parameter as follows, or to a subset of these values.
+--tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+Based on your system, restart the kubelet service. For example:
+systemctl daemon-reload
+systemctl restart kubelet.service
+
+4.2.13 Decide on an appropriate level for this parameter and set it,
+either via the --pod-max-pids command line parameter or the PodPidsLimit configuration file setting.
+
+4.2.14 Set the parameter, either via the --seccomp-default command line parameter or the
+seccompDefault configuration file setting.
+By default the seccomp profile is not enabled.
+
+
+== Summary node ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+
+== Summary total ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+
+(exit code: 0 — kubectl logs exited 0; at the moment this log was read the
+container had not exited and never would have on its own, see 8b; it was
+deleted with the DaemonSet in 8g)
+
+------------------------------------------------------------
+8e) FULL kube-bench REPORT — DAEMONSET POD kube-bench-node-ds-vm7cw, ON
+seclab-worker2. Verbatim and unedited, 2026-07-29. THIS IS THE NEW EVIDENCE IN
+THIS FILE: the first kube-bench result that has ever existed for this node.
+------------------------------------------------------------
+$ kubectl -n cis-benchmark logs kube-bench-node-ds-vm7cw
+I0729 17:34:06.345559   11915 util.go:650] Checking for oc
+I0729 17:34:06.346233   11915 util.go:679] Can't find oc command: exec: "oc": executable file not found in $PATH
+Warning: Kubernetes version was not auto-detected because kubectl could not connect to the Kubernetes server. This may be because the kubeconfig information is missing or has credentials that do not match the server. Assuming default version 1.18
+I0729 17:34:06.439443   11915 util.go:395] Unable to get Kubernetes version from kubectl, using default version: 1.18
+I0729 17:34:06.439481   11915 common.go:351] Kubernetes version: "" to Benchmark version: "cis-1.12"
+I0729 17:34:06.439609   11915 common.go:274] Using config file: cfg/cis-1.12/config.yaml
+I0729 17:34:06.439767   11915 common.go:78] Using test file: cfg/cis-1.12/node.yaml
+I0729 17:34:06.513897   11915 util.go:264] executable 'hyperkube kubelet' not running
+[INFO] 4 Worker Node Security Configuration
+[INFO] 4.1 Worker Node Configuration Files
+[FAIL] 4.1.1 Ensure that the kubelet service file permissions are set to 600 or more restrictive (Automated)
+	 permissions=644
+[PASS] 4.1.2 Ensure that the kubelet service file ownership is set to root:root (Automated)
+[WARN] 4.1.3 If proxy kubeconfig file exists ensure permissions are set to 600 or more restrictive (Manual)
+[WARN] 4.1.4 If proxy kubeconfig file exists ensure ownership is set to root:root (Manual)
+[PASS] 4.1.5 Ensure that the --kubeconfig kubelet.conf file permissions are set to 600 or more restrictive (Automated)
+[PASS] 4.1.6 Ensure that the --kubeconfig kubelet.conf file ownership is set to root:root (Automated)
+[PASS] 4.1.7 Ensure that the certificate authorities file permissions are set to 644 or more restrictive (Manual)
+[PASS] 4.1.8 Ensure that the client certificate authorities file ownership is set to root:root (Manual)
+[FAIL] 4.1.9 If the kubelet config.yaml configuration file is being used validate permissions set to 600 or more restrictive (Automated)
+	 permissions=644
+[PASS] 4.1.10 If the kubelet config.yaml configuration file is being used validate file ownership is set to root:root (Automated)
+[INFO] 4.2 Kubelet
+[PASS] 4.2.1 Ensure that the --anonymous-auth argument is set to false (Automated)
+[PASS] 4.2.2 Ensure that the --authorization-mode argument is not set to AlwaysAllow (Automated)
+[PASS] 4.2.3 Ensure that the --client-ca-file argument is set as appropriate (Automated)
+[PASS] 4.2.4 Verify that if defined, the --read-only-port argument is set to 0 (Manual)
+[PASS] 4.2.5 Ensure that the --streaming-connection-idle-timeout argument is not set to 0 (Manual)
+[PASS] 4.2.6 Ensure that the --make-iptables-util-chains argument is set to true (Automated)
+[PASS] 4.2.7 Ensure that the --hostname-override argument is not set (Manual)
+[PASS] 4.2.8 Ensure that the eventRecordQPS argument is set to a level which ensures appropriate event capture (Manual)
+[WARN] 4.2.9 Ensure that the --tls-cert-file and --tls-private-key-file arguments are set as appropriate (Manual)
+[PASS] 4.2.10 Ensure that the --rotate-certificates argument is not set to false (Automated)
+[PASS] 4.2.11 Verify that the RotateKubeletServerCertificate argument is set to true (Manual)
+[WARN] 4.2.12 Ensure that the Kubelet only makes use of Strong Cryptographic Ciphers (Manual)
+[WARN] 4.2.13 Ensure that a limit is set on pod PIDs (Manual)
+[WARN] 4.2.14 Ensure that the --seccomp-default parameter is set to true (Manual)
+[INFO] 4.3 kube-proxy
+[PASS] 4.3.1 Ensure that the kube-proxy metrics service is bound to localhost (Automated)
+
+== Remediations node ==
+4.1.1 Run the below command (based on the file location on your system) on the each worker node.
+For example, chmod 600 /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+4.1.3 Run the below command (based on the file location on your system) on the each worker node.
+For example,
+chmod 600 /etc/kubernetes/proxy.conf
+
+4.1.4 Run the below command (based on the file location on your system) on the each worker node.
+For example, chown root:root /etc/kubernetes/proxy.conf
+
+4.1.9 Run the following command (using the config file location identified in the Audit step)
+chmod 600 /var/lib/kubelet/config.yaml
+
+4.2.9 If using a Kubelet config file, edit the file to set `tlsCertFile` to the location
+of the certificate file to use to identify this Kubelet, and `tlsPrivateKeyFile`
+to the location of the corresponding private key file.
+If using command line arguments, edit the kubelet service file
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf on each worker node and
+set the below parameters in KUBELET_CERTIFICATE_ARGS variable.
+--tls-cert-file=<path/to/tls-certificate-file>
+--tls-private-key-file=<path/to/tls-key-file>
+Based on your system, restart the kubelet service. For example,
+systemctl daemon-reload
+systemctl restart kubelet.service
+
+4.2.12 If using a Kubelet config file, edit the file to set `tlsCipherSuites` to
+TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+or to a subset of these values.
+If using executable arguments, edit the kubelet service file
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf on each worker node and
+set the --tls-cipher-suites parameter as follows, or to a subset of these values.
+--tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+Based on your system, restart the kubelet service. For example:
+systemctl daemon-reload
+systemctl restart kubelet.service
+
+4.2.13 Decide on an appropriate level for this parameter and set it,
+either via the --pod-max-pids command line parameter or the PodPidsLimit configuration file setting.
+
+4.2.14 Set the parameter, either via the --seccomp-default command line parameter or the
+seccompDefault configuration file setting.
+By default the seccomp profile is not enabled.
+
+
+== Summary node ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+
+== Summary total ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+
+(exit code: 0 — kubectl logs exited 0; at the moment this log was read the
+container had not exited and never would have on its own, see 8b; it was
+deleted with the DaemonSet in 8g)
+
+------------------------------------------------------------
+8f) THE COUNTS, PER NODE AND DATE-SCOPED, AND THE COMPARISON AGAINST THE
+2026-07-26 JOB RUN. kube-bench's own "== Summary node ==" and "== Summary total
+==" blocks; on this target the two are identical because the node Job and the
+DaemonSet each run one target.
+------------------------------------------------------------
+  run / date            node             PASS  FAIL  WARN  INFO   source
+  Job, 2026-07-26       seclab-worker      17     2     6     0   section 4
+  DaemonSet, 2026-07-29 seclab-worker      17     2     6     0   8d
+  DaemonSet, 2026-07-29 seclab-worker2     17     2     6     0   8e
+
+=> EACH NODE MATCHES THE 2026-07-26 NODE JOB EXACTLY: 17 PASS / 2 FAIL / 6 WARN
+/ 0 INFO on seclab-worker, and the same on seclab-worker2. AS OF 2026-07-29,
+ON THIS CLUSTER — the numbers are a statement about this run, not a property of
+the nodes, and a later run on a changed cluster can make them stale without
+making this line false.
+
+THE MATCH IS STRONGER THAN THE COUNTS, AND IT WAS CHECKED MECHANICALLY. Strip
+the glog lines (timestamps and PIDs, which differ per container by
+construction) and the version Warning, and each DaemonSet report is identical
+to section 4's Job report line for line:
+$ diff <(sed -n '692,788p' docs/evidence/phase-5-cis/attack-output.txt | tr -d '\r' | grep -v -e '^I07' -e '^Warning: Kubernetes version') <(kubectl -n cis-benchmark logs kube-bench-node-ds-6nhfh | grep -v -e '^I07' -e '^Warning: Kubernetes version')
+(exit code: 0 — no output at all; identical)
+$ diff <(sed -n '692,788p' docs/evidence/phase-5-cis/attack-output.txt | tr -d '\r' | grep -v -e '^I07' -e '^Warning: Kubernetes version') <(kubectl -n cis-benchmark logs kube-bench-node-ds-vm7cw | grep -v -e '^I07' -e '^Warning: Kubernetes version')
+(exit code: 0 — no output at all; identical)
+
+$ kubectl get nodes -o custom-columns=NAME:.metadata.name,OS_IMAGE:.status.nodeInfo.osImage,KERNEL:.status.nodeInfo.kernelVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,KUBELET:.status.nodeInfo.kubeletVersion
+NAME                   OS_IMAGE                       KERNEL                              RUNTIME              KUBELET
+seclab-control-plane   Debian GNU/Linux 13 (trixie)   6.18.33.2-microsoft-standard-WSL2   containerd://2.3.1   v1.35.5
+seclab-worker          Debian GNU/Linux 13 (trixie)   6.18.33.2-microsoft-standard-WSL2   containerd://2.3.1   v1.35.5
+seclab-worker2         Debian GNU/Linux 13 (trixie)   6.18.33.2-microsoft-standard-WSL2   containerd://2.3.1   v1.35.5
+(exit code: 0)
+
+=> READ THAT CAREFULLY, BECAUSE IT IS NOT A DISCOVERY. seclab-worker2's report
+contains no finding that seclab-worker's did not already contain: the same
+4.1.1 and 4.1.9 mode-644 FAILs, the same six WARNs, the same 4.2.5 false PASS.
+The two workers report the same OS image, the same kernel, the same container
+runtime and the same kubelet version — they are two containers from one kind
+node image on one WSL2 kernel — so identical output is the EXPECTED result,
+and probe 5d-d had already confirmed by hand that 4.1.1 and 4.1.9 were present
+on worker2. WHAT CHANGED IS THE CLASS
+OF EVIDENCE, NOT THE POSTURE: those two findings on worker2 are now kube-bench
+output rather than a hand-run stat, and the six WARNs on worker2 — which no
+probe ever covered — exist as scanner results for the first time. A reader who
+takes this section as "new problems were found" has it backwards; a reader who
+takes it as "the second worker was finally measured instead of inferred" has it
+right.
+
+=> AND THE HEADLINE COUNTS IN SECTION 2 ARE NOT RESTATED HERE ON PURPOSE. The
+combined 63 PASS / 12 FAIL / 56 WARN covers one master-target Job and one
+node-target Job. Adding worker2's 17/2/6 to it would double-count a second
+copy of the same worker configuration and inflate the PASS figure by 17 for no
+new information — precisely the kind of arithmetic this file's preamble warns
+against. The honest statement is per node, as tabulated above.
+
+------------------------------------------------------------
+8g) FINAL STATE, 2026-07-29 — the DaemonSet is deleted, the namespace is kept,
+and this transcript is the only surviving output. Section 7 ended the Job run
+exactly this way; the addendum ends the same way, because an assessment that
+leaves its scanner running has changed the cluster it was measuring.
+------------------------------------------------------------
+$ kubectl -n cis-benchmark delete daemonset kube-bench-node-ds
+daemonset.apps "kube-bench-node-ds" deleted from cis-benchmark namespace
+(exit code: 0)
+
+$ kubectl -n cis-benchmark get daemonset,pods
+No resources found in cis-benchmark namespace.
+(exit code: 0 — both scanner Pods went with the controller that created them)
+
+$ kubectl get daemonset -A
+NAMESPACE     NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
+falco         falco        3         3         3       3            3           <none>                   174m
+kube-system   kindnet      3         3         3       3            3           kubernetes.io/os=linux   8d
+kube-system   kube-proxy   3         3         3       3            3           kubernetes.io/os=linux   8d
+(exit code: 0)
+
+=> READ THAT LAST ONE PRECISELY RATHER THAN AS "NOTHING LEFT": three DaemonSets
+do survive on this cluster and NOT ONE OF THEM IS THIS PHASE'S. falco is phase
+6's sensor, kindnet and kube-proxy are kind's own. No kube-bench DaemonSet
+exists anywhere. The wording matters because section 7 could honestly write "no
+Job anywhere on the cluster" and this section cannot write the DaemonSet
+equivalent.
+
+$ kubectl get ns cis-benchmark --show-labels
+NAME            STATUS   AGE     LABELS
+cis-benchmark   Active   3d15h   app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=cis-benchmark,pod-security.kubernetes.io/audit=restricted,pod-security.kubernetes.io/enforce=privileged,pod-security.kubernetes.io/warn=restricted
+(exit code: 0)
+
+=> THE NAMESPACE IS KEPT FOR SECTION 7'S REASON, UNCHANGED: the committed
+manifests define it, so the phase stays re-appliable with kubectl apply -f
+docs/evidence/phase-5-cis/ — a directory that now holds six manifests (the
+namespace, two Jobs, one DaemonSet and the two rejection probes) rather than
+five. Its labels are identical to section 7's capture, enforce=privileged
+included, so nothing about the written-down PSA exemption moved.
+=> AND THE ADDENDUM CHANGED NOTHING ELSE, WHICH IS THE ONLY CORRECT OUTCOME FOR
+AN ASSESSMENT. The DaemonSet read files and process arguments on two worker
+nodes for the length of this capture and no longer; what survives is 8d and 8e.
+Every caveat in 8a still stands over it: a coverage gap was closed, no control
+was added, no policy was written, and not one CIS finding in this file was
+remediated.
