@@ -1,0 +1,799 @@
+Phase 5b — CIS remediation via cluster config-as-code, delivered as a full DR
+drill (before-capture and predictions written 2026-07-30; the recreate and the
+after-capture are NOT in this file yet).
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, 3 nodes
+(seclab-control-plane, seclab-worker, seclab-worker2).
+Scanner: kube-bench v0.15.6, image docker.io/aquasec/kube-bench:v0.15.6
+@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5,
+CIS config cis-1.12 — the same digest and the same benchmark pin as phase 5,
+so the before/after delta is a comparison of the cluster and not of the
+scanner.
+
+WHAT THIS PHASE IS. Phase 5 measured and triaged; it changed nothing, and said
+so loudly. Phase 5b changes something. It takes the subset of the phase-5
+triage that is fixable in cluster configuration — threat model §6.12 — and
+fixes it in clusters/kind-config.yaml, then rebuilds the cluster from that
+file. The remediation is therefore also a disaster-recovery drill: the entire
+lab is destroyed and rebuilt from git, and every phase's controls have to come
+back. That is deliberate. A config-as-code claim that has never survived a
+`kind delete` is an untested claim.
+
+APPEND-ONLY. This file is written in order and not rewritten. Section 0 is the
+predictions, and it is dated and committed BEFORE the cluster is destroyed
+precisely so that it can be wrong in public. Sections 1 and 2 are the
+before-capture. The recreate, the after-capture and the reconciliation against
+section 0 are appended later, by the drill, and section 0 is not edited when
+they land. If a prediction misses, the miss stays on the page.
+
+NOTHING IN THIS FILE HAS REBUILT ANYTHING YET. As of the last line of section
+2 the cluster is still the 2026-07-29 cluster, unremediated, with the phase-5
+findings intact. Every "will" and "predicted" below is a claim about a future
+run, not a result. A reader who takes section 0 as an outcome has read this
+backwards.
+
+SCOPE — WHAT 5b DELIBERATELY DOES NOT FIX. The config change is small on
+purpose, and the items left alone are left alone for stated reasons, not
+because they were missed:
+  - audit logging (1.2.16-1.2.19). Needs a log volume and a policy file on the
+    control-plane node; on kind that means hostPath plumbing whose failure
+    mode is a control plane that will not boot. Out of scope.
+  - encryption at rest (1.2.29-1.2.30). Needs an EncryptionConfiguration file
+    mounted into the apiserver. Same failure mode, same reason.
+  - anonymous auth (1.2.1). kubeadm's own bootstrap and kind's readiness
+    probing depend on it during boot; turning it off is a real change with a
+    real chance of bricking the rebuild, and it is not a one-line patch.
+  - 1.2.30 specifically is also left because the lab's secrets story is
+    sealed-secrets, which is about what is IN git, not what is in etcd.
+  - no scanner exception is added. kube-bench still runs in cis-benchmark with
+    its documented PSA exemption; nothing is granted an exception to make a
+    number move.
+The honest summary is that 5b fixes the flags and kubelet fields that are one
+line of config each, and leaves everything that needs a mounted file.
+
+============================================================
+0) PREDICTIONS, WRITTEN BEFORE THE RECREATE
+============================================================
+
+These are written against the scanner's ACTUAL check definitions, read out of
+the pinned image rather than remembered. The cfg directory is not where the
+phase-5 runbook's prose implies; it was located first:
+
+$ docker run --rm --entrypoint sh docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5 -c 'ls /etc/kube-bench/cfg'
+ls: /etc/kube-bench/cfg: No such file or directory
+(exit code: 1 — wrong path; the image keeps its configs under /opt)
+[raw: t3-cfg-dirs.txt]
+
+$ docker run --rm --entrypoint sh <same image> -c 'find / -maxdepth 4 -type d -name cfg'
+/opt/kube-bench/cfg
+(exit code: 0)
+[raw: t3-cfg-locate.txt]
+
+The two files quoted throughout this section are therefore
+/opt/kube-bench/cfg/cis-1.12/master.yaml (930 lines) and
+/opt/kube-bench/cfg/cis-1.12/node.yaml (492 lines), captured whole.
+[raw: t3-cis-1.12-master.yaml, t3-cis-1.12-node.yaml]
+
+------------------------------------------------------------
+0a) FIRST, THE STRUCTURAL QUESTION: IS ANY OF THE EIGHT STUCK?
+------------------------------------------------------------
+
+Phase 5 established that kube-bench emits WARN for two reasons that are not
+findings — checks with `type: "manual"` and no audit command at all, and
+checks whose audit shells out to kubectl from a Pod with no ServiceAccount
+token. Those checks can never change status no matter what the cluster does.
+The committed classification names them exactly (attack-output.txt section 5,
+runbook §3a): `type: manual` is 3.1.1-3.1.3, 3.2.2 and 23 of section 5;
+kubectl-shellout is 5.1.1-5.1.6 and 5.2.2-5.2.6.
+
+NONE OF THE EIGHT CHECKS THIS PHASE TARGETS IS IN EITHER LIST, and the cfg
+stanzas confirm it independently — all eight carry a real audit command:
+
+  1.2.5, 1.2.11, 1.2.15   audit: "/bin/ps -ef | grep $apiserverbin | grep -v grep"
+  1.3.2                   audit: "/bin/ps -ef | grep $controllermanagerbin | grep -v grep"
+  1.4.1                   audit: "/bin/ps -ef | grep $schedulerbin | grep -v grep"
+  4.2.9, 4.2.13, 4.2.14   audit: "/bin/ps -fC $kubeletbin"
+                          audit_config: "/bin/cat $kubeletconf"
+[raw: t3-stanzas-master.txt, t3-stanzas-node.txt]
+
+=> THE TWO SOURCES AGREE. The committed phase-5 classification and a fresh
+read of the pinned image's cfg files put all eight in the "audit really runs"
+category. There is no disagreement to flag. Every one of the eight is a check
+whose status is a function of the cluster, so every one of them is capable of
+flipping.
+
+------------------------------------------------------------
+0b) THE `scored: false` TRAP, RESOLVED BY CONTROL RATHER THAN BY ASSERTION
+------------------------------------------------------------
+
+Four of the eight (1.2.11, 4.2.9, 4.2.13, 4.2.14) carry `scored: false`. Phase
+5 documented what that does to a FAILING check — it prints WARN instead of
+FAIL. It did NOT document what a `scored: false` check prints when it PASSES,
+and the whole prediction for three of the four turns on that. Rather than
+assume, two checks that are `scored: false` AND currently passing on this
+cluster were used as controls:
+
+        - id: 4.2.4
+          text: "Verify that if defined, the --read-only-port argument is set to 0 (Manual)"
+...
+          scored: false
+
+        - id: 4.2.11
+          text: "Verify that the RotateKubeletServerCertificate argument is set to true (Manual)"
+...
+          scored: false
+
+and in the same run that produced the before-capture in section 2:
+
+[PASS] 4.2.4 Verify that if defined, the --read-only-port argument is set to 0 (Manual)
+[PASS] 4.2.11 Verify that the RotateKubeletServerCertificate argument is set to true (Manual)
+(exit code: 0)
+[raw: t3-scored-false-pass-control.txt, t3-scored-false-pass-control2.txt]
+
+=> A `scored: false` CHECK PRINTS PASS WHEN ITS AUDIT PASSES. Proven on this
+cluster, in this benchmark version, not inferred from the tool's source. So
+WARN -> PASS is an available transition for 1.2.11, 4.2.13 and 4.2.14.
+
+------------------------------------------------------------
+0c) THE TABLE. Current status is from the before-run in section 2.
+------------------------------------------------------------
+
+1.2.15 — apiserver --profiling   [FAIL] -> predicted [PASS]
+  Decisive cfg:
+            - flag: "--profiling"
+              compare:
+                op: eq
+                value: false
+          scored: true
+  The audit is the apiserver ps line and the test is an equality compare. The
+  flag is absent today (section 2e), and absent fails an `eq false` compare.
+  The patch adds --profiling=false to the ps line, which satisfies it exactly.
+  Ground-truth probe, independent of kube-bench: the apiserver ps line on
+  seclab-control-plane must contain --profiling=false.
+
+1.3.2 — controller-manager --profiling   [FAIL] -> predicted [PASS]
+1.4.1 — scheduler --profiling            [FAIL] -> predicted [PASS]
+  Identical stanzas to 1.2.15 against $controllermanagerbin and $schedulerbin,
+  both scored: true. Same reasoning, same probe on the other two ps lines.
+
+1.2.5 — apiserver --kubelet-certificate-authority   [FAIL] -> predicted [PASS]
+  Decisive cfg:
+          tests:
+            test_items:
+              - flag: "--kubelet-certificate-authority"
+          scored: true
+  A bare presence test — no compare. The flag is absent today; the patch adds
+  it with value /etc/kubernetes/pki/ca.crt, so presence alone satisfies it.
+  Ground-truth probe: the flag on the apiserver ps line, AND the behavioural
+  half — with the apiserver now verifying kubelet serving certificates against
+  the cluster CA, `kubectl logs` against a pod on a node whose kubelet is
+  still self-signing must FAIL, and must start working the moment that node's
+  kubelet-serving CSR is approved. That logs-broken -> CSR-approved -> logs-work
+  flip is the real proof; the flag is only the cause.
+
+1.2.11 — apiserver AlwaysPullImages   [WARN] -> predicted [PASS]
+  Decisive cfg:
+            - flag: "--enable-admission-plugins"
+              compare:
+                op: has
+                value: "AlwaysPullImages"
+          scored: false
+  NOTE THE MECHANISM, BECAUSE IT IS NOT WHAT THE FLAG NAME SUGGESTS: the flag
+  is ALREADY PRESENT today as --enable-admission-plugins=NodeRestriction
+  (section 2e). The check does not WARN because the flag is missing; it WARNs
+  because the `has` compare does not find AlwaysPullImages in the value. The
+  patch changes the value to NodeRestriction,AlwaysPullImages. Combined with
+  0b, a passing scored:false check prints PASS.
+  Ground-truth probe: a pod created with NO imagePullPolicy field, in
+  demo-kyverno-only. Today admission defaults it to IfNotPresent (section 2g).
+  Under AlwaysPullImages the admission plugin must MUTATE it to Always. That
+  mutation, not the flag string, is the proof the plugin is live.
+
+4.2.14 — kubelet seccompDefault   [WARN] -> predicted [PASS]
+  Decisive cfg:
+            - flag: --seccomp-default
+              path: '{.seccompDefault}'
+          scored: false
+  A bare presence test with a JSONPath into the kubelet config FILE — the
+  audit_config is `/bin/cat $kubeletconf`, i.e. /var/lib/kubelet/config.yaml,
+  NOT the /configz endpoint. seccompDefault is absent from that file on all
+  three nodes today (section 2d). The KubeletConfiguration patch makes kubeadm
+  write `seccompDefault: true` into it, so the JSONPath resolves and the
+  presence test passes.
+  Ground-truth probe: see 0d — the obvious probe does not work here.
+
+4.2.13 — kubelet podPidsLimit   [WARN] -> predicted [PASS]
+  Decisive cfg:
+            - flag: --pod-max-pids
+              path: '{.podPidsLimit}'
+          scored: false
+  Same shape as 4.2.14, same file, same absence today. Note that the check has
+  NO compare — it asks only that the field exist, which is why 4096 is a free
+  choice and not a derived one.
+  Ground-truth probe: a pod's /sys/fs/cgroup/pids.max must read 4096.
+
+4.2.9 — kubelet --tls-cert-file / --tls-private-key-file   [WARN] -> predicted [WARN], UNCHANGED
+  THIS IS THE ONE PREDICTED NOT TO MOVE, AND IT IS THE MOST USEFUL PREDICTION
+  IN THE TABLE. Decisive cfg:
+          tests:
+            test_items:
+              - flag: --tls-cert-file
+                path: '{.tlsCertFile}'
+              - flag: --tls-private-key-file
+                path: '{.tlsPrivateKeyFile}'
+          scored: false
+  Two test_items with no bin_op, so both must be satisfied, against the
+  kubelet config FILE. serverTLSBootstrap: true does not write tlsCertFile or
+  tlsPrivateKeyFile into that file — it does the opposite, it stops the
+  kubelet using a locally generated pair and makes it request one from the CSR
+  API instead. So the file still has neither field and the check still WARNs.
+  THE SECURITY POSTURE IMPROVES WHILE THE SCANNER OUTPUT DOES NOT MOVE. That
+  gap is the point: today every kubelet serves a certificate it signed itself
+  with an ad-hoc per-node CA (section 2f); after the change each serves one
+  issued by the cluster CA. kube-bench cannot see that distinction at all.
+  Ground-truth probe: the serving-certificate issuer per node must change from
+  CN=<node>-ca@<epoch> to the cluster CA. That is the only evidence that will
+  exist for this item, so if it is not captured, 4.2.9 has no evidence.
+
+------------------------------------------------------------
+0d) THE 4.2.14 GROUND-TRUTH PROBE HAD TO BE REDESIGNED, AND THE ORIGINAL WOULD
+HAVE PRODUCED A FALSE CONFIRMATION
+------------------------------------------------------------
+
+The intended before/after probe for seccompDefault was "an unconfined pod
+shows `Seccomp: 0` in /proc/1/status today and `Seccomp: 2` afterwards". The
+before-leg was run (section 2g) and the before value is ALREADY 2:
+
+Seccomp:	2
+Seccomp_filters:	1
+(exit code: 0)
+[raw: t4-probe-readings.txt]
+
+On kind the "node" is itself a Docker container carrying Docker's own default
+seccomp profile, and every process inside it — kubelet, containerd and every
+pod container — inherits that one filter. `Seccomp: 0` is not reachable on
+this platform. An after-run showing `Seccomp: 2` would therefore have
+"confirmed" seccompDefault while proving nothing whatsoever.
+
+The replacement discriminator was established by control, on this cluster, in
+the same session. The control is an existing nginx pod in `demo`, which
+declares seccompProfile: RuntimeDefault explicitly; the subject is the probe
+pod, which declares no seccompProfile at all:
+
+  CONTROL  nginx-775678cbbd-mmrxb (seccompProfile: RuntimeDefault)
+    crictl inspect ->           "seccomp": {}
+      and an OCI spec block with "architectures" and a full syscall list
+    /proc/1/status ->           Seccomp:	2
+                                Seccomp_filters:	2
+
+  SUBJECT  r3-seccomp-pids-probe (no seccompProfile field)
+    crictl inspect ->           "seccomp": {
+                                  "profile_type": 1
+                                }
+      and no OCI seccomp block at all
+    /proc/1/status ->           Seccomp:	2
+                                Seccomp_filters:	1
+(exit code: 0)
+[raw: t4-seccomp-control-vs-subject.txt]
+
+=> THE DISCRIMINATOR IS Seccomp_filters, NOT Seccomp. One filter means nothing
+above the inherited Docker profile was applied; two means Kubernetes applied
+RuntimeDefault on top. The after-probe for 4.2.14 must therefore assert that
+an identical pod with NO seccompProfile field shows `Seccomp_filters:	2` and
+a crictl seccomp block that is no longer `"profile_type": 1`. Asserting
+`Seccomp: 2` proves nothing and must not be used.
+
+------------------------------------------------------------
+0e) PREDICTED SUMMARY-COUNT DELTAS
+------------------------------------------------------------
+
+Conditional on the classification in 0a-0c, and on nothing else changing.
+
+MASTER target (before: 46 PASS / 10 FAIL / 50 WARN / 0 INFO, 106 checks)
+  1.2.15 FAIL -> PASS
+  1.3.2  FAIL -> PASS
+  1.4.1  FAIL -> PASS
+  1.2.5  FAIL -> PASS
+  1.2.11 WARN -> PASS
+  predicted after: 51 PASS / 6 FAIL / 49 WARN / 0 INFO  (106 checks)
+
+NODE target, EACH worker (before: 17 PASS / 2 FAIL / 6 WARN / 0 INFO, 25 checks)
+  4.2.13 WARN -> PASS
+  4.2.14 WARN -> PASS
+  4.2.9  WARN -> WARN (unchanged, see 0c)
+  predicted after: 19 PASS / 2 FAIL / 4 WARN / 0 INFO  (25 checks)
+
+=> AND THE STRONGER CLAIM, WHICH IS THE ONE WORTH CHECKING: every check NOT in
+the list above must be byte-identical between the before and after reports.
+Five master checks and two node checks are supposed to move. If anything else
+moves, the rebuild changed something this phase did not intend, and that is a
+finding regardless of whether the number went up or down. The delta method in
+the runbook §9 diffs the whole report for exactly that reason — the counts are
+the headline, the line-by-line diff is the evidence.
+
+============================================================
+1) THE PULL-GATE — WHETHER AlwaysPullImages COULD BE INCLUDED AT ALL
+============================================================
+
+AlwaysPullImages forces the kubelet to pull every image on every pod create,
+so it converts "the image happens to be on the node" into "the registry must
+serve the image, now". kind side-loads its own system images into the node
+image; if any of them cannot actually be pulled from a registry, a cluster
+built with AlwaysPullImages never gets CNI or DNS and the rebuild strands the
+lab. So the plugin was gated on a real pull of each image, from a real node,
+before the entry was written into the config.
+
+METHOD, AND A NEGATIVE CONTROL FIRST. Every ref was pulled with
+`docker exec seclab-worker crictl pull <ref>`. A success prints either a
+download or "Image is up to date". That second form only counts as evidence if
+crictl actually contacts the registry rather than short-circuiting on a local
+hit, so a deliberately bogus tag was pulled first:
+
+$ docker exec seclab-worker crictl pull docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST
+E0730 13:11:31.744212    1958 remote_image.go:250] "PullImage from image service failed" err="rpc error: code = NotFound desc = failed to pull and unpack image \"docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST\": failed to resolve reference \"docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST\": docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST: not found" image="docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST"
+time="2026-07-30T13:11:31Z" level=fatal msg="pulling image: rpc error: code = NotFound desc = failed to pull and unpack image \"docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST\": failed to resolve reference \"docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST\": docker.io/kindest/kindnetd:v20260528-DOES-NOT-EXIST: not found"
+(exit code: 1 — "failed to resolve reference"; crictl really does go to the
+registry, so "Image is up to date" below means the registry served the
+manifest and not that crictl skipped the work)
+[raw: pullgate-negative-control-bogus-tag.txt]
+
+------------------------------------------------------------
+1a) GATE GROUP — all four must pass or AlwaysPullImages is omitted entirely
+------------------------------------------------------------
+
+$ docker exec seclab-worker crictl pull docker.io/kindest/kindnetd:v20260528-9350166c
+Image is up to date for sha256:e44e5463fce88882cdd5da8c626840ac5d980a30d322c3d4484009f548ba76de
+(exit code: 0)
+[raw: pullgate-kindnetd.txt]
+
+$ docker exec seclab-worker crictl pull docker.io/kindest/local-path-provisioner:v20260521-9fb22683
+Image is up to date for sha256:e5e695fbdadac88d9ee437aaabe9419819eecf2b6e2eb26d8b0a27b747bc658a
+(exit code: 0)
+[raw: pullgate-local-path-provisioner.txt]
+
+$ docker exec seclab-worker crictl pull registry.k8s.io/kube-proxy:v1.35.5
+Image is up to date for sha256:08e6c80e827133462025be7207d0919ae2c8ba9265466e3e30697a3e24951e31
+(exit code: 0)
+[raw: pullgate-kube-proxy.txt]
+
+$ docker exec seclab-worker crictl pull registry.k8s.io/coredns/coredns:v1.13.1
+Image is up to date for sha256:aa5e3ebc0dfed0566805186b9e47110d8f9122291d8bad1497e78873ad291139
+(exit code: 0)
+[raw: pullgate-coredns.txt]
+
+------------------------------------------------------------
+1b) PREREQ GROUP — must pass regardless of AlwaysPullImages
+------------------------------------------------------------
+
+These two are side-loaded onto the nodes today with TAG <none>. A rebuilt
+cluster has no side-loaded copy and must pull them from the registry whether
+or not the admission plugin is enabled, so a failure here blocks the entire
+recreate and not just the plugin.
+
+$ docker exec seclab-worker crictl pull ghcr.io/joesevv/k8s-security-lab/signed-app:b8483c5892a16afb16c1a15aaaa35b3c8436dd65@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
+Image is up to date for sha256:48b9999797cf5004ba57f1b0aa2cb388032f95b42349e2905d49c756a41a3515
+(exit code: 0 — the tag@digest form was accepted as given; no substitution needed)
+[raw: pullgate-signed-app.txt]
+
+$ docker exec seclab-worker crictl pull docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec45b54a97e4a2af81b16fae7203d768f7f8e7de3b7456807870f5
+Image is up to date for sha256:7e4aa99f099bd7bc16991ec8668a5607d01a859e300575a50a072729296b1392
+(exit code: 0)
+[raw: pullgate-kube-bench.txt]
+
+------------------------------------------------------------
+1c) SANITY GROUP
+------------------------------------------------------------
+
+$ docker exec seclab-worker crictl pull docker.io/nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+Image is up to date for sha256:7312fa98595737958df41e20f21a2880dd9775f455c6bf76e638024dc755d201
+(exit code: 0)
+[raw: pullgate-nginx-unprivileged.txt]
+
+$ docker exec seclab-worker crictl pull docker.io/curlimages/curl:8.16.0
+Image is up to date for sha256:51674a38c3309d85352d13cf0955f588d7fe6a49cbb0c8b049c544c36441f6dc
+(exit code: 0)
+[raw: pullgate-curl.txt]
+
+------------------------------------------------------------
+1d) THE DECISION
+------------------------------------------------------------
+
+  group    ref                                              result
+  GATE     kindest/kindnetd:v20260528-9350166c              pass (exit 0)
+  GATE     kindest/local-path-provisioner:v20260521-9fb22683 pass (exit 0)
+  GATE     registry.k8s.io/kube-proxy:v1.35.5               pass (exit 0)
+  GATE     registry.k8s.io/coredns/coredns:v1.13.1          pass (exit 0)
+  PREREQ   ghcr.io/.../signed-app:b8483c58...@sha256:7fd13d22 pass (exit 0)
+  PREREQ   aquasec/kube-bench:v0.15.6@sha256:86190091        pass (exit 0)
+  SANITY   nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56a pass (exit 0)
+  SANITY   curlimages/curl:8.16.0                            pass (exit 0)
+
+=> ALL FOUR GATE REFS PULLED, SO AlwaysPullImages IS INCLUDED. The config
+carries `enable-admission-plugins: NodeRestriction,AlwaysPullImages`. Had any
+one of the four failed, the rule was to omit that extraArgs entry entirely and
+leave kubeadm's default NodeRestriction untouched — not to write
+NodeRestriction back by hand, which would have been the same value by a longer
+route and would have implied a decision that was not made.
+
+=> BOTH PREREQ REFS PULLED, so the recreate is not blocked on image
+availability. THIS RESULT HAS A SHELF LIFE. It is a statement about 2026-07-30
+from a host that could reach docker.io, registry.k8s.io and ghcr.io. The gate
+is cheap; re-run it before any later rebuild rather than trusting this page.
+
+============================================================
+2) BEFORE-CAPTURE — THE STATE THE AFTER-RUN IS MEASURED AGAINST
+============================================================
+
+Everything in this section describes the CURRENT, UNREMEDIATED cluster.
+
+------------------------------------------------------------
+2a) PRE-FLIGHT: inotify limits
+------------------------------------------------------------
+
+Docker Desktop restarted on the morning of 2026-07-30, and the phase-1 §1 fix
+is not persistent, so the limits were re-read before anything else:
+
+$ wsl -d docker-desktop sysctl fs.inotify.max_user_watches fs.inotify.max_user_instances
+fs.inotify.max_user_watches = 1048576
+fs.inotify.max_user_instances = 8192
+(exit code: 0)
+[raw: t1-inotify-before.txt]
+
+=> ALREADY ABOVE THE PHASE-1 THRESHOLDS of 524288 / 512, by 2x and 16x. NO FIX
+WAS APPLIED and no `sysctl -w` was run, so there is no after-value to record.
+The restart did not reset them on this host.
+
+------------------------------------------------------------
+2b) THE BEFORE-RUN: kube-bench master Job + node DaemonSet
+------------------------------------------------------------
+
+$ kubectl apply -f docs/evidence/phase-5-cis/job-kube-bench-master.yaml
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), restricted volume types (volumes "etc-kubernetes", "var-lib-etcd", "var-lib-kubelet", "var-lib-cni", "etc-systemd", "lib-systemd", "etc-passwd", "etc-group" use restricted volume type "hostPath"), runAsNonRoot != true (pod or container "kube-bench" must set securityContext.runAsNonRoot=true), runAsUser=0 (container "kube-bench" must not set runAsUser=0)
+job.batch/kube-bench-master created
+(exit code: 0 — the PSA warning is the cis-benchmark namespace's documented
+exemption behaving as designed, not a new finding)
+
+$ kubectl apply -f docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml
+daemonset.apps/kube-bench-node-ds created
+(exit code: 0)
+[raw: t4-apply.txt]
+
+$ kubectl -n cis-benchmark wait --for=condition=complete job/kube-bench-master --timeout=300s
+job.batch/kube-bench-master condition met
+(exit code: 0)
+[raw: t4-job-wait.txt]
+
+$ kubectl -n cis-benchmark get pods -o wide
+NAME                       READY   STATUS      RESTARTS   AGE   IP           NODE                   NOMINATED NODE   READINESS GATES
+kube-bench-master-bv8kv    0/1     Completed   0          6s    10.244.0.6   seclab-control-plane   <none>           <none>
+kube-bench-node-ds-4gpq6   1/1     Running     0          6s    10.244.2.8   seclab-worker2         <none>           <none>
+kube-bench-node-ds-fj92n   1/1     Running     0          6s    10.244.1.6   seclab-worker          <none>           <none>
+(exit code: 0 — one DS pod per worker, which is the coverage the DaemonSet
+exists to provide)
+[raw: t4-pods-wide.txt]
+
+Summary blocks from the three reports:
+
+  master (job/kube-bench-master, on seclab-control-plane)
+== Summary total ==
+46 checks PASS
+10 checks FAIL
+50 checks WARN
+0 checks INFO
+[raw: before-master-job.log — 426 lines]
+
+  node (kube-bench-node-ds-fj92n, on seclab-worker)
+== Summary total ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+[raw: before-node-worker.log — 97 lines]
+
+  node (kube-bench-node-ds-4gpq6, on seclab-worker2)
+== Summary total ==
+17 checks PASS
+2 checks FAIL
+6 checks WARN
+0 checks INFO
+[raw: before-node-worker2.log — 97 lines]
+
+------------------------------------------------------------
+2c) DRIFT CHECK AGAINST THE COMMITTED PHASE-5 EVIDENCE — AND IT IS NOT CLEAN
+------------------------------------------------------------
+
+The before-run only functions as a baseline if the cluster is still the
+cluster phase 5 measured. Method is phase 5's own, from evidence §8f: strip
+the glog lines and the client-version Warning, then diff. Committed ranges are
+taken by each report's own boundaries — first `[INFO] N` line through the
+blank line after `== Summary total ==`.
+
+NODE, seclab-worker, fresh vs committed §8d:
+$ diff <(sed -n '1481,1569p' docs/evidence/phase-5-cis/attack-output.txt | tr -d '\r' | grep -v -e '^I07' -e '^Warning: Kubernetes version') <(kubectl -n cis-benchmark logs kube-bench-node-ds-fj92n | grep -v -e '^I07' -e '^Warning: Kubernetes version')
+(exit code: 0 — no output at all; identical)
+
+NODE, seclab-worker2, fresh vs committed §8e:
+$ diff <(sed -n '1588,1676p' docs/evidence/phase-5-cis/attack-output.txt | tr -d '\r' | grep -v -e '^I07' -e '^Warning: Kubernetes version') <(kubectl -n cis-benchmark logs kube-bench-node-ds-4gpq6 | grep -v -e '^I07' -e '^Warning: Kubernetes version')
+(exit code: 0 — no output at all; identical)
+
+MASTER, fresh vs committed §3:
+$ diff <(sed -n '265,678p' docs/evidence/phase-5-cis/attack-output.txt | tr -d '\r' | grep -v -e '^I07' -e '^Warning: Kubernetes version') <(kubectl -n cis-benchmark logs job/kube-bench-master | grep -v -e '^I07' -e '^Warning: Kubernetes version')
+(exit code: 1 — NOT identical: 18 changed lines across 9 hunks)
+[raw: t4-drift-diffs.txt]
+
+THE MASTER DIFF IS NON-EMPTY AND IS RECORDED RATHER THAN NORMALISED AWAY. It
+decomposes exactly, and the decomposition was measured, not asserted.
+
+First, no check moved. Restricting the same diff to the report's status lines
+and summary — dropping the tab-indented audit-output detail that carries the
+raw ps text:
+$ diff <(committed 265,678 | grep -E '^(\[|== |[0-9]+ checks)') <(fresh | grep -E '^(\[|== |[0-9]+ checks)')
+(exit code: 0 — every [PASS]/[FAIL]/[WARN]/[INFO] line and every count line is
+identical)
+
+Second, every one of the 18 changed lines is a tab-indented ps line:
+$ diff ... | grep '^[<>]' | grep -v $'^[<>] \t root'
+(exit code: 1 — empty; there is no changed line that is not a ps line)
+[raw: t4-drift-analysis.txt]
+
+Third, the ps lines differ in the process-table columns and in exactly one
+flag value. Normalising away the volatile columns (uid pid ppid c stime tty
+time) leaves a single distinct difference:
+< 	 CMD kube-apiserver --advertise-address=172.18.0.2  [...rest of flags elided for readability...]
+> 	 CMD kube-apiserver --advertise-address=172.18.0.3  [...rest of flags elided for readability...]
+and normalising that one value as well:
+(exit code: 0 — with the ps columns and --advertise-address normalised, the
+two master reports are byte-identical)
+[raw: t4-drift-normalized.txt]
+
+The cause is the host, not the cluster config. Docker Desktop restarted this
+morning and the bridge handed out different addresses:
+$ docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' seclab-control-plane seclab-worker seclab-worker2
+/seclab-control-plane 172.18.0.3
+/seclab-worker 172.18.0.2
+/seclab-worker2 172.18.0.4
+(exit code: 0 — the control plane and the first worker swapped addresses)
+[raw: t4-drift-analysis.txt]
+
+=> DRIFT VERDICT: NO POSTURE DRIFT, BUT THE BYTE-DIFF IS NOT ZERO AND THE
+PHASE-5 METHOD SAYS IT SHOULD BE. Zero checks changed status and zero flag
+sets changed; the whole delta is restart volatility (PIDs, start times,
+accumulated CPU) plus one IP that the Docker bridge reassigned. The reason
+this is written down instead of quietly normalised is that the AFTER diff in
+§9 will hit the same thing much harder — a recreated cluster gets new PIDs,
+new start times and quite possibly new addresses for all three nodes, so a
+raw §8f-style diff of the after-report against this before-report WILL be
+non-empty for reasons that have nothing to do with the remediation. The
+after-run must diff status lines and counts, and treat ps-detail differences
+as noise to be inspected by eye, not as findings. A drill that reports "the
+diff was non-empty, remediation failed" has misread its own instrument.
+
+------------------------------------------------------------
+2d) KUBELET CONFIG: THE FILE kube-bench READS, AND THE /configz IT DOES NOT
+------------------------------------------------------------
+
+$ kubectl get --raw "/api/v1/nodes/<node>/proxy/configz"   (all three nodes)
+
+  field                            seclab-control-plane   seclab-worker   seclab-worker2
+  seccompDefault                   false                  false           false
+  podPidsLimit                     -1                     -1              -1
+  serverTLSBootstrap               <absent>               <absent>        <absent>
+  streamingConnectionIdleTimeout   "4h0m0s"               "4h0m0s"        "4h0m0s"
+  tlsCertFile                      "/var/lib/kubelet/pki/kubelet.crt"     (same on all three)
+  tlsPrivateKeyFile                "/var/lib/kubelet/pki/kubelet.key"     (same on all three)
+(exit code: 0 on all three)
+[raw: t4-configz-seclab-control-plane.json, t4-configz-seclab-worker.json,
+ t4-configz-seclab-worker2.json]
+
+The two fields the remediation sets are at their defaults and the third is not
+present at all, which is the expected before-state.
+
+AND ONE VALUE THAT CONTRADICTS A COMMITTED CLAIM IN THIS REPO — CAPTURED ON
+PURPOSE, NOT FIXED HERE. threat model §6, the phase-5 runbook §3 and the
+README all state that streamingConnectionIdleTimeout is `0s` on all three
+nodes, and that 4.2.5's PASS is therefore a false PASS "while all three nodes
+really do set streamingConnectionIdleTimeout: 0s, the exact condition that
+check exists to forbid". The config FILE does say 0s, and that half is
+correct:
+
+$ docker exec <node> cat /var/lib/kubelet/config.yaml   (all three nodes)
+streamingConnectionIdleTimeout: 0s
+[raw: t4-kubelet-config-files.txt]
+
+But the kubelet's own /configz reports the EFFECTIVE value as "4h0m0s" on all
+three nodes, and the kubelet is not started with a
+--streaming-connection-idle-timeout flag that could explain it:
+
+$ docker exec seclab-worker sh -c 'ps -ef | grep "[k]ubelet " | head -3'
+root         261       1  1 12:49 ?        00:00:17 /usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml --node-ip=172.18.0.2 --node-labels= --provider-id=kind://docker/seclab/seclab-worker --runtime-cgroups=/system.slice/containerd.service
+(exit code: 0)
+[raw: t4-kubelet-ps-worker.txt]
+
+=> THE FILE SAYS 0s AND THE RUNNING KUBELET SAYS 4h0m0s. Both readings are
+recorded here; the reconciliation between them is NOT resolved by this
+capture, and the repo's existing wording is NOT edited by this phase. What can
+be said from the evidence on this page: the claim "the file contains 0s" is
+verified, and the claim that the cluster therefore runs with no streaming idle
+timeout is NOT supported by /configz. Phase 5b changes nothing about
+streamingConnectionIdleTimeout, and 4.2.5 is not one of the eight targeted
+checks — this is captured so that the after-run has a clean before-value to
+compare against and so the discrepancy is on the record rather than
+rediscovered later.
+
+------------------------------------------------------------
+2e) CONTROL-PLANE PROCESS LINES — THE FLAGS THAT ARE AND ARE NOT THERE TODAY
+------------------------------------------------------------
+
+$ docker exec seclab-control-plane sh -c 'ps -ef | grep kube-apiserver | grep -v grep'
+root         664     439  6 12:49 ?        00:01:40 kube-apiserver --advertise-address=172.18.0.3 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --runtime-config=
+(exit code: 0)
+
+$ docker exec seclab-control-plane sh -c 'ps -ef | grep kube-controller-manager | grep -v grep'
+root         652     480  1 12:49 ?        00:00:20 kube-controller-manager --allocate-node-cidrs=true --authentication-kubeconfig=/etc/kubernetes/controller-manager.conf --authorization-kubeconfig=/etc/kubernetes/controller-manager.conf --bind-address=127.0.0.1 --client-ca-file=/etc/kubernetes/pki/ca.crt --cluster-cidr=10.244.0.0/16 --cluster-name=seclab --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt --cluster-signing-key-file=/etc/kubernetes/pki/ca.key --controllers=*,bootstrapsigner,tokencleaner --kubeconfig=/etc/kubernetes/controller-manager.conf --leader-elect=true --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --root-ca-file=/etc/kubernetes/pki/ca.crt --service-account-private-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --use-service-account-credentials=true --enable-hostpath-provisioner=true
+(exit code: 0)
+
+$ docker exec seclab-control-plane sh -c 'ps -ef | grep kube-scheduler | grep -v grep'
+root         663     509  0 12:49 ?        00:00:07 kube-scheduler --authentication-kubeconfig=/etc/kubernetes/scheduler.conf --authorization-kubeconfig=/etc/kubernetes/scheduler.conf --bind-address=127.0.0.1 --kubeconfig=/etc/kubernetes/scheduler.conf --leader-elect=true
+(exit code: 0)
+[raw: t4-controlplane-ps.txt]
+
+Mechanical count over that capture:
+  occurrences of --profiling                     : 0
+  occurrences of --kubelet-certificate-authority : 0
+  occurrences of --enable-admission-plugins      : 1
+  value of --enable-admission-plugins            : --enable-admission-plugins=NodeRestriction
+
+=> --profiling IS ABSENT FROM ALL THREE COMPONENTS, which is why 1.2.15, 1.3.2
+and 1.4.1 FAIL — the checks compare `eq false` and an absent flag does not
+satisfy that. --kubelet-certificate-authority is absent, which is 1.2.5.
+
+=> --enable-admission-plugins IS PRESENT, NOT ABSENT, and this correction
+matters. 1.2.11 is not a missing-flag finding; the flag is there with the
+value NodeRestriction and the check WARNs because AlwaysPullImages is not in
+that value. It also confirms the restated-entry rationale in the config
+header from the other direction: kubeadm/kind really do write these entries
+themselves, so a patch that replaces the extraArgs list has to carry them.
+
+=> --runtime-config= (empty) on the apiserver and
+--enable-hostpath-provisioner=true on the controller manager are both visible
+above. These are the two kind-injected entries that clusters/kind-config.yaml
+now restates. They are confirmed present BEFORE the change, so if either is
+missing from the ps lines after the rebuild, the patch dropped it and the
+restatement did not work.
+
+------------------------------------------------------------
+2f) KUBELET SERVING-CERTIFICATE ISSUERS — THE BEFORE-LEG FOR 4.2.9
+------------------------------------------------------------
+
+$ docker exec <node> sh -c 'echo | openssl s_client -connect localhost:10250 2>/dev/null | openssl x509 -noout -issuer -subject'
+issuer=CN=seclab-control-plane-ca@1784637412
+subject=CN=seclab-control-plane@1784637412
+issuer=CN=seclab-worker-ca@1784637429
+subject=CN=seclab-worker@1784637429
+issuer=CN=seclab-worker2-ca@1784637429
+subject=CN=seclab-worker2@1784637429
+(exit code: 0 on all three)
+[raw: t4-kubelet-serving-cert-issuers.txt]
+
+=> EVERY KUBELET IS ITS OWN CA. Each node's serving certificate is issued by
+an ad-hoc CA named after that node with an epoch suffix — three unrelated
+trust roots, none of them the cluster CA, none of them verifiable by the
+apiserver. This is exactly the condition --kubelet-certificate-authority makes
+fatal, and it is why 1.2.5 and serverTLSBootstrap have to ship together: turn
+on apiserver verification without fixing the kubelets and `kubectl logs`
+breaks everywhere with no way back except a rebuild.
+
+After the change these three lines must name the cluster CA instead. That is
+the only ground truth 4.2.9 will ever have, since the check itself is
+predicted not to move (section 0c).
+
+------------------------------------------------------------
+2g) BEHAVIOURAL PROBE POD — THE BEFORE-LEG FOR 4.2.13, 4.2.14 AND 1.2.11
+------------------------------------------------------------
+
+Pod r3-seccomp-pids-probe in demo-kyverno-only — the namespace where Kyverno
+enforces and PSA only warns, so the pod is admitted while still being subject
+to real admission control. Image docker.io/curlimages/curl:8.16.0, no
+seccompProfile field anywhere, and no imagePullPolicy field, which is the
+whole point of the third reading.
+
+$ kubectl apply -f probe-pod.yaml
+Warning: would violate PodSecurity "restricted:latest": seccompProfile (pod or container "probe" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+pod/r3-seccomp-pids-probe created
+(exit code: 0 — and the warning is useful evidence in itself: PSA's only
+complaint is the missing seccompProfile, confirming the pod really does omit
+it)
+
+$ kubectl wait --for=condition=Ready pod/r3-seccomp-pids-probe -n demo-kyverno-only --timeout=120s
+pod/r3-seccomp-pids-probe condition met
+(exit code: 0)
+[raw: t4-probe-create.txt]
+
+$ kubectl exec -n demo-kyverno-only r3-seccomp-pids-probe -- grep Seccomp /proc/1/status
+Seccomp:	2
+Seccomp_filters:	1
+(exit code: 0 — NOT the expected `Seccomp: 0`; see section 0d, the filter is
+inherited from the kind node's own Docker seccomp profile and
+Seccomp_filters is the discriminator that actually works)
+
+$ kubectl exec -n demo-kyverno-only r3-seccomp-pids-probe -- cat /sys/fs/cgroup/pids.max
+18999
+(exit code: 0 — NOT the expected `max`. A limit is already in force per
+container. Its origin was NOT determined: the node containers have docker
+PidsLimit=<nil>, the node-level cgroup pids.max reads `max`, kernel.pid_max is
+4194304, and the kubelet's podPidsLimit is -1, so none of those is the source.
+The nginx control pod in demo reads 18999 as well, so it is uniform across
+pods rather than specific to this one. Recorded as observed and unexplained.)
+
+$ kubectl get pod r3-seccomp-pids-probe -n demo-kyverno-only -o jsonpath='{.spec.containers[0].imagePullPolicy}'
+IfNotPresent
+(exit code: 0 — admission defaulted it, since the manifest sets no such field)
+
+$ kubectl get pod r3-seccomp-pids-probe -n demo-kyverno-only -o jsonpath='{.spec.containers[0].securityContext.seccompProfile}'
+(exit code: 0 — empty; the field is genuinely absent from the stored object,
+not merely absent from the manifest)
+[raw: t4-probe-readings.txt]
+
+=> THE THREE BEFORE-VALUES THE AFTER-RUN MUST BEAT:
+     Seccomp_filters:	1      -> must become 2          (4.2.14)
+     pids.max 18999             -> must become 4096       (4.2.13)
+     imagePullPolicy IfNotPresent -> must become Always   (1.2.11)
+   The pids and imagePullPolicy legs are clean discriminators. The seccomp leg
+   is only a discriminator when read as Seccomp_filters; see 0d.
+
+$ kubectl delete pod r3-seccomp-pids-probe -n demo-kyverno-only
+pod "r3-seccomp-pids-probe" deleted from demo-kyverno-only namespace
+(exit code: 0)
+
+$ kubectl get pods -n demo-kyverno-only
+No resources found in demo-kyverno-only namespace.
+(exit code: 0 — the probe left nothing behind)
+[raw: t4-probe-delete.txt]
+
+------------------------------------------------------------
+2h) CLEANUP OF THE BEFORE-RUN
+------------------------------------------------------------
+
+$ kubectl -n cis-benchmark delete job kube-bench-master
+job.batch "kube-bench-master" deleted from cis-benchmark namespace
+(exit code: 0)
+
+$ kubectl -n cis-benchmark delete ds kube-bench-node-ds
+daemonset.apps "kube-bench-node-ds" deleted from cis-benchmark namespace
+(exit code: 0)
+
+$ kubectl -n cis-benchmark get jobs,ds,pods
+No resources found in cis-benchmark namespace.
+(exit code: 0 — re-checked after the DS pods finished terminating; the first
+check caught them mid-Terminating)
+
+$ kubectl get ns cis-benchmark
+NAME            STATUS   AGE
+cis-benchmark   Active   4d11h
+(exit code: 0 — the namespace stays, per the phase-5 convention)
+[raw: t4-cleanup.txt, t4-cleanup-final.txt]
+
+------------------------------------------------------------
+2i) RE-SEAL SOURCES STILL PRESENT
+------------------------------------------------------------
+
+The rebuild has to re-seal the demo secret from its plaintext sources, which
+only works if those sources still exist on this host — they are gitignored and
+therefore not recoverable from the repo. Existence only; NEITHER FILE WAS
+READ, and the plaintext secret's value does not appear anywhere in this repo.
+
+$ ls -l secrets/plain/demo-app-secret-plain.yaml secrets/plain/controller-cert.pem
+-rw-r--r-- 1 josep 197610 1724 Jul 23 17:41 secrets/plain/controller-cert.pem
+-rw-r--r-- 1 josep 197610  146 Jul 23 17:41 secrets/plain/demo-app-secret-plain.yaml
+(exit code: 0 — both present)
+
+$ git check-ignore -v secrets/plain/demo-app-secret-plain.yaml secrets/plain/controller-cert.pem
+.gitignore:22:secrets/plain/	secrets/plain/demo-app-secret-plain.yaml
+.gitignore:22:secrets/plain/	secrets/plain/controller-cert.pem
+(exit code: 0 — both ignored by .gitignore line 22, which is why their
+survival on this host is a precondition and not a convenience)
+[raw: t4-sources-existence.txt]
+
+=> END OF THE BEFORE-CAPTURE. The cluster is unchanged by everything above:
+the kube-bench Job and DaemonSet were deleted, the probe pod was deleted, and
+the only writes made to the cluster were those three objects plus the crictl
+pulls in section 1. The next section appended to this file is the recreate.
