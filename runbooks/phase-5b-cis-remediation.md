@@ -206,18 +206,31 @@ kubeadmConfigPatches:
     serverTLSBootstrap: true
 ```
 
+**The block above is the form this section first wrote, and the drill disproved
+the premise behind it.** The reasoning was that the live kubeadm-config
+ConfigMap is `kubeadm.k8s.io/v1beta4`, in which `extraArgs` is a **list** of
+name/value pairs, so the patch had to be a list too. It does not follow: kind
+renders `/kind/kubeadm.conf` at `kubeadm.k8s.io/v1beta3`, where `extraArgs` is
+a map, and kubeadm converts and stores the ConfigMap in its newest version
+afterwards — so reading that ConfigMap says nothing about the form this file
+must be written in. The list form failed `kind create`, and labelling the patch
+`v1beta4` made it fail silently instead. The committed
+`clusters/kind-config.yaml` carries the **v1beta3 map form**. §5b's Observed
+block and evidence §3b-3d hold the failures and the correction, and the file's
+own header explains it; it is not re-derived here.
+
 **Purpose of the two entries that are not remediation at all** —
-`runtime-config: ""` and `enable-hostpath-provisioner: "true"`. The live
-kubeadm-config ConfigMap is `kubeadm.k8s.io/v1beta4`, in which `extraArgs` is a
-**list** of name/value pairs rather than a map, and kind injects those two
-entries itself. A patch against a list may **replace** it wholesale rather than
-merge into it, and which happens is not something this file controls. Restating
+`runtime-config: ""` and `enable-hostpath-provisioner: "true"`, which kind
+injects itself. A patch may **replace** the block it lands on rather than merge
+into it, and which happens is not something this file controls. Restating
 kind's own entries makes the outcome identical either way: under replace
 semantics they survive because they are written here; under append semantics
 they are already present and are not duplicated into a conflict. Dropping them
 would silently remove the hostpath provisioner and change the apiserver's
 runtime-config on every rebuild — a self-inflicted regression disguised as a
-hardening change.
+hardening change. That half of the reasoning held: the drill observed replace
+semantics (evidence §3b) and both entries are on the rebuilt cluster's process
+lines because they were restated here (§5b).
 
 **Observed:** both entries are confirmed present on the **pre-change** cluster
 (evidence §2e): the apiserver ps line ends `--runtime-config=` and the
