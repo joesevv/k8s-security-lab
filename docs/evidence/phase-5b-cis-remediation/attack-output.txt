@@ -797,3 +797,1342 @@ survival on this host is a precondition and not a convenience)
 the kube-bench Job and DaemonSet were deleted, the probe pod was deleted, and
 the only writes made to the cluster were those three objects plus the crictl
 pulls in section 1. The next section appended to this file is the recreate.
+
+============================================================
+3) THE RECREATE — 2026-07-30
+============================================================
+
+Human gate cleared before anything below was run. Preconditions re-checked on
+the day: inotify limits still 1048576 / 8192 (unchanged, no sysctl -w was run),
+and both gitignored re-seal sources still present.
+
+$ ls -l secrets/plain/demo-app-secret-plain.yaml secrets/plain/controller-cert.pem
+-rw-r--r-- 1 josep 197610 1724 Jul 23 17:41 secrets/plain/controller-cert.pem
+-rw-r--r-- 1 josep 197610  146 Jul 23 17:41 secrets/plain/demo-app-secret-plain.yaml
+(exit code: 0 — both present, so the rebuild is recoverable)
+[raw: t3-preconditions.txt]
+
+$ kind delete cluster --name seclab
+Deleting cluster "seclab" ...
+Deleted nodes: ["seclab-worker2" "seclab-worker" "seclab-control-plane"]
+(exit code: 0 — 13:43:20Z to 13:43:24Z)
+[raw: t4-kind-delete.txt]
+
+------------------------------------------------------------
+3a) ATTEMPT 1 FAILED, AND THE REASON INVALIDATES A PREMISE IN SECTION 2
+------------------------------------------------------------
+
+$ kind create cluster --config clusters/kind-config.yaml
+Creating cluster "seclab" ...
+ * Ensuring node image (kindest/node:v1.35.5)
+ * Preparing nodes
+ * Writing configuration
+ x Starting control-plane
+Deleted nodes: ["seclab-control-plane" "seclab-worker2" "seclab-worker"]
+ERROR: failed to create cluster: failed to init node with kubeadm: command "docker exec --privileged seclab-control-plane kubeadm init --config=/kind/kubeadm.conf --skip-token-print --v=6" failed with error: exit status 1
+
+Command Output: I0730 13:43:39.795839     201 initconfiguration.go:262] loading configuration from "/kind/kubeadm.conf"
+W0730 13:43:39.796368     201 common.go:100] your configuration file uses a deprecated API spec: "kubeadm.k8s.io/v1beta3" (kind: "ClusterConfiguration"). Please use 'kubeadm config migrate --old-config old-config-file --new-config new-config-file', which will write the new, similar spec using a newer API version.
+W0730 13:43:39.796976     201 initconfiguration.go:334] error unmarshaling configuration schema.GroupVersionKind{Group:"kubeadm.k8s.io", Version:"v1beta3", Kind:"ClusterConfiguration"}: json: cannot unmarshal array into Go struct field APIServer.apiServer.ControlPlaneComponent.extraArgs of type map[string]string
+error: json: cannot unmarshal array into Go struct field APIServer.apiServer.ControlPlaneComponent.extraArgs of type map[string]string
+no stack trace
+(exit code: 1 — this is contingency ladder step (i))
+[raw: t5-kind-create.txt]
+
+(The kind progress glyphs above are transcribed as * and x; the tool prints
+Unicode check and cross marks with emoji. Everything else on those lines is
+verbatim.)
+
+=> SECTION 2 REASONED FROM THE WRONG DOCUMENT. Its premise was "the live
+kubeadm-config ConfigMap is kubeadm.k8s.io/v1beta4, in which extraArgs is a
+LIST", so the patch was written in the list form. That premise is true about
+the ConfigMap and irrelevant to the patch. kubeadm CONVERTS on write and stores
+that ConfigMap in its newest API version; what a patch has to match is what
+kind FEEDS kubeadm, which is a different document.
+
+------------------------------------------------------------
+3b) ATTEMPT 2 — DIAGNOSTIC, --retain, TO READ THE RENDERED CONFIG
+------------------------------------------------------------
+
+Rather than guess at the fix, the same command was re-run with --retain so the
+failed node survived and /kind/kubeadm.conf could be read. Same failure,
+verbatim, at 13:44:35Z.
+[raw: t6-kind-create-attempt2-retain.txt]
+
+$ docker exec seclab-control-plane cat /kind/kubeadm.conf
+apiServer:
+  certSANs:
+  - localhost
+  - 127.0.0.1
+  extraArgs:
+  - name: runtime-config
+    value: ""
+  - name: profiling
+    value: "false"
+  - name: enable-admission-plugins
+    value: NodeRestriction,AlwaysPullImages
+  - name: kubelet-certificate-authority
+    value: /etc/kubernetes/pki/ca.crt
+apiVersion: kubeadm.k8s.io/v1beta3
+[... InitConfiguration / JoinConfiguration / KubeProxyConfiguration elided ...]
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+[...]
+kind: KubeletConfiguration
+podPidsLimit: 4096
+seccompDefault: true
+serverTLSBootstrap: true
+(exit code: 0)
+[raw: t7-rendered-kubeadm-conf-FAILED.txt]
+
+=> TWO FACTS, BOTH READ RATHER THAN ASSUMED. (1) kind v0.32.0 renders its
+kubeadm config at kubeadm.k8s.io/v1beta3 for this node image, and in v1beta3
+extraArgs is a map[string]string — hence "cannot unmarshal array". (2) The
+patch DID merge: the extraArgs list is present, and the KubeletConfiguration
+patch landed cleanly because kind's own kubelet document already is
+kubelet.config.k8s.io/v1beta1 and matches it. Only the ClusterConfiguration
+half was in the wrong shape.
+
+Note also that apiServer.extraArgs in that render is EXACTLY the patch's four
+entries and nothing else, so on this path the patch REPLACED kind's block
+rather than merging into it. That is the replace semantics section 2 hedged
+against, observed rather than hypothesised — and the restatement of
+runtime-config and enable-hostpath-provisioner is what kept them alive.
+
+------------------------------------------------------------
+3c) ATTEMPT 3 — LADDER STEP (i) VERBATIM. IT "WORKED", AND THAT IS THE PROBLEM.
+------------------------------------------------------------
+
+The contingency ladder's step (i) says to add an explicit apiVersion to the
+failing patch document. It was followed exactly:
+
+$ git diff -- clusters/kind-config.yaml
++    apiVersion: kubeadm.k8s.io/v1beta4
+     kind: ClusterConfiguration
+[...]
++    apiVersion: kubelet.config.k8s.io/v1beta1
+     kind: KubeletConfiguration
+[raw: t9-ladder-i-edit-v1beta4.txt]
+
+$ kind create cluster --config clusters/kind-config.yaml --retain
+Creating cluster "seclab" ...
+ * Starting control-plane
+ * Installing CNI
+ * Installing StorageClass
+ * Joining worker nodes
+Set kubectl context to "kind-seclab"
+(exit code: 0 — 13:45:44Z to 13:46:11Z, a clean green create)
+[raw: t10-kind-create-attempt3-v1beta4.txt]
+
+THE CREATE SUCCEEDED AND THE REMEDIATION WAS SILENTLY DISCARDED. The patch's
+apiVersion kubeadm.k8s.io/v1beta4 matched no document in kind's v1beta3 render,
+so kind dropped the whole patch without a word:
+
+$ docker exec seclab-control-plane cat /kind/kubeadm.conf
+apiServer:
+  extraArgs:
+    runtime-config: ""
+apiVersion: kubeadm.k8s.io/v1beta3
+controllerManager:
+  extraArgs:
+    enable-hostpath-provisioner: "true"
+scheduler:
+  extraArgs: null
+(exit code: 0 — only kind's own two entries survive: no profiling, no
+enable-admission-plugins, no kubelet-certificate-authority)
+[raw: t11-rendered-kubeadm-conf-SUCCESS.txt]
+
+Confirmed against the running processes, not only against the config file:
+
+  occurrences of --profiling                     : 0
+  occurrences of --kubelet-certificate-authority : 0
+  occurrences of --enable-admission-plugins      : 1
+  value of --enable-admission-plugins            : --enable-admission-plugins=NodeRestriction
+  occurrences of AlwaysPullImages                : 0
+(exit code: 0)
+[raw: t12-attempt3-ps-UNREMEDIATED.txt]
+
+=> THAT IS THE PRE-REMEDIATION CONTROL PLANE, BYTE FOR BYTE — compare section
+2e. Only the KubeletConfiguration half landed, because its apiVersion happened
+to match. A drill that stopped at "kind create exited 0 and three nodes are
+Ready" would have reported five of the eight checks fixed and been wrong about
+every one of them. THE LADDER'S STEP (i) IS WRONG FOR THIS KIND VERSION, and it
+fails in the worst available direction: it converts a loud failure into a quiet
+one. The cluster was deleted and the ladder edit reverted.
+
+------------------------------------------------------------
+3d) ATTEMPT 4 — THE CORRECTED FIX: THE v1beta3 MAP FORM
+------------------------------------------------------------
+
+The mechanism-correct fix is to write the patch in the form kind's rendered
+base actually uses. The apiVersion additions were reverted and the three
+extraArgs blocks converted from the v1beta4 list form to the v1beta3 map form.
+The three node image lines are untouched and the file still has zero CR bytes.
+
+$ npx --yes js-yaml@4 <extracted patch 1>
+{ "kind": "ClusterConfiguration",
+  "apiServer": { "extraArgs": { "runtime-config": "", "profiling": "false",
+    "enable-admission-plugins": "NodeRestriction,AlwaysPullImages",
+    "kubelet-certificate-authority": "/etc/kubernetes/pki/ca.crt" } },
+  "controllerManager": { "extraArgs": { "enable-hostpath-provisioner": "true",
+    "profiling": "false" } },
+  "scheduler": { "extraArgs": { "profiling": "false" } } }
+(exit code: 0 — patch 2 unchanged and still parses to
+{kind: KubeletConfiguration, seccompDefault: true, podPidsLimit: 4096,
+serverTLSBootstrap: true})
+[raw: t14-config-validate.txt]
+
+$ kind create cluster --config clusters/kind-config.yaml
+Creating cluster "seclab" ...
+ * Ensuring node image (kindest/node:v1.35.5)
+ * Preparing nodes
+ * Writing configuration
+ * Starting control-plane
+ * Installing CNI
+ * Installing StorageClass
+ * Joining worker nodes
+Set kubectl context to "kind-seclab"
+(exit code: 0 — 13:48:45Z to 13:49:13Z, 28 seconds)
+[raw: t16-kind-create-attempt4-SUCCESS.txt]
+
+$ kubectl get nodes
+NAME                   STATUS   ROLES           AGE    VERSION
+seclab-control-plane   Ready    control-plane   2m2s   v1.35.5
+seclab-worker          Ready    <none>          109s   v1.35.5
+seclab-worker2         Ready    <none>          109s   v1.35.5
+(exit code: 0 — read at 13:50:58Z, after the CSR approvals in section 4)
+[raw: t21-5a-POSITIVE-CONTROL-logs-work.txt]
+
+=> AlwaysPullImages DID NOT BLOCK BRING-UP. CNI, CoreDNS, kube-proxy and
+local-path-provisioner all pulled and ran, so contingency (iii) was never
+reached and section 1's pull-gate green was real. LADDER STEPS TAKEN: (i) only,
+and step (i) as written had to be corrected — see 3c. Contingency (ii) was not
+reached: the Tier-2 gate passed, see section 4.
+
+============================================================
+4) THE TIER-2 GATE — 2026-07-30
+============================================================
+
+------------------------------------------------------------
+4a) FOUR CSRs, NOT THREE
+------------------------------------------------------------
+
+$ kubectl get csr
+NAME        AGE   SIGNERNAME                                    REQUESTOR                          REQUESTEDDURATION   CONDITION
+csr-5vgxk   15s   kubernetes.io/kubelet-serving                 system:node:seclab-worker          <none>              Pending
+csr-bjjd4   18s   kubernetes.io/kube-apiserver-client-kubelet   system:bootstrap:abcdef            <none>              Approved,Issued
+csr-bx9x5   27s   kubernetes.io/kubelet-serving                 system:node:seclab-control-plane   <none>              Pending
+csr-fkg5x   30s   kubernetes.io/kube-apiserver-client-kubelet   system:node:seclab-control-plane   <none>              Approved,Issued
+csr-httth   29s   kubernetes.io/kubelet-serving                 system:node:seclab-control-plane   <none>              Pending
+csr-prjk6   16s   kubernetes.io/kubelet-serving                 system:node:seclab-worker2         <none>              Pending
+csr-w2l4f   17s   kubernetes.io/kube-apiserver-client-kubelet   system:bootstrap:abcdef            <none>              Approved,Issued
+(exit code: 0)
+[raw: t17-5a-csrs-and-nodes.txt]
+
+=> FOUR PENDING kubelet-serving CSRs, NOT THE THREE THE RUNBOOK EXPECTED. The
+control plane filed TWO of them (csr-bx9x5 at 27s and csr-httth at 29s); each
+worker filed one. So "three Pending CSRs, one per node" is not a safe gate. The
+safe gate is: at least one Pending kubelet-serving CSR per node, and approve
+EVERY Pending one. The three kube-apiserver-client-kubelet CSRs are
+auto-approved by the controller manager and are not part of this gate.
+
+------------------------------------------------------------
+4b) THE NEGATIVE CONTROL — CAPTURED BEFORE ANY APPROVAL
+------------------------------------------------------------
+
+$ kubectl -n kube-system logs kube-proxy-66hvw --tail=1     # on seclab-control-plane
+Error from server: Get "https://172.18.0.4:10250/containerLogs/kube-system/kube-proxy-66hvw/kube-proxy?tailLines=1": remote error: tls: internal error
+(exit code: 1)
+
+$ kubectl -n kube-system logs kube-proxy-tn8bm --tail=1     # on seclab-worker
+Error from server: Get "https://172.18.0.3:10250/containerLogs/kube-system/kube-proxy-tn8bm/kube-proxy?tailLines=1": remote error: tls: internal error
+(exit code: 1)
+
+$ kubectl -n kube-system logs kube-proxy-jhq54 --tail=1     # on seclab-worker2
+Error from server: Get "https://172.18.0.2:10250/containerLogs/kube-system/kube-proxy-jhq54/kube-proxy?tailLines=1": remote error: tls: internal error
+(exit code: 1)
+
+$ kubectl top nodes
+error: Metrics API not available
+(exit code: 1)
+[raw: t18-5a-NEGATIVE-CONTROL-logs-broken.txt]
+
+THE MECHANISM IS NOT THE ONE THE RUNBOOK PREDICTED, AND THE REAL ONE IS
+STRONGER. The runbook expected "an x509 / certificate-verification error" —
+i.e. the apiserver rejecting an untrusted kubelet certificate. What actually
+happens is that the kubelet has NO SERVING CERTIFICATE AT ALL until its CSR is
+approved, so the handshake dies at the kubelet end with `tls: internal error`.
+Read directly, on the same cluster, before approval:
+
+$ docker exec <node> sh -c 'echo | openssl s_client -connect localhost:10250 2>/dev/null | openssl x509 -noout -issuer -subject'
+Could not find certificate from <stdin>
+(exit code: 1 on all three nodes)
+[raw: t19-5a-serving-cert-BEFORE-approval.txt]
+
+=> serverTLSBootstrap: true does not merely change WHO signs the kubelet's
+serving certificate. Until the CSR is approved there is no certificate to
+present at all — contrast section 2f, where every kubelet served one it had
+signed itself. That is a larger behavioural change than the runbook described,
+and it is why the window between `kind create` and the approvals is a hard
+outage of logs/exec/top rather than a degradation.
+
+------------------------------------------------------------
+4c) THE APPROVALS — INCLUDING TWO FAILED ATTEMPTS, RECORDED
+------------------------------------------------------------
+
+ATTEMPT 1 selected the CSR names with a Windows `python` one-liner, which
+emitted CRLF, and the CR rode into the resource name:
+
+$ kubectl certificate approve csr-5vgxk
+Error from server (NotFound): certificatesigningrequests.certificates.k8s.io "csr-5vgxk\r" not found
+(exit code: 1 — same for csr-bx9x5 and csr-httth. csr-prjk6 was the LAST line
+of the selection and so carried no trailing CR; it was approved at exit 0.)
+
+ATTEMPT 2 piped the names through `tr -d '\r'` but indexed the signer as awk
+$2. Under --no-headers the columns are NAME AGE SIGNERNAME ..., so $2 is the
+AGE and the selector matched nothing:
+
+pending kubelet-serving CSRs: []
+(exit code: 0 — no CSR was approved and no cluster state changed; it was a
+selector bug. It is written down because an empty selection exiting 0 is
+exactly the shape of a false pass.)
+
+ATTEMPT 3, with $3 as the signer:
+
+$ kubectl certificate approve csr-5vgxk
+certificatesigningrequest.certificates.k8s.io/csr-5vgxk approved
+$ kubectl certificate approve csr-bx9x5
+certificatesigningrequest.certificates.k8s.io/csr-bx9x5 approved
+$ kubectl certificate approve csr-httth
+certificatesigningrequest.certificates.k8s.io/csr-httth approved
+(exit code: 0 each)
+[raw: t20-5a-csr-approve.txt]
+
+All four kubelet-serving CSRs end Approved,Issued.
+
+------------------------------------------------------------
+4d) THE POSITIVE CONTROL — SAME COMMANDS, SAME PODS, ON EVERY NODE
+------------------------------------------------------------
+
+$ kubectl -n kube-system logs kube-proxy-66hvw --tail=1     # on seclab-control-plane
+I0730 13:49:11.765540       1 shared_informer.go:356] "Caches are synced" controller="endpoint slice config"
+(exit code: 0)
+
+$ kubectl -n kube-system logs kube-proxy-tn8bm --tail=1     # on seclab-worker
+I0730 13:49:19.320539       1 shared_informer.go:356] "Caches are synced" controller="service config"
+(exit code: 0)
+
+$ kubectl -n kube-system logs kube-proxy-jhq54 --tail=1     # on seclab-worker2
+I0730 13:49:18.963807       1 shared_informer.go:356] "Caches are synced" controller="endpoint slice config"
+(exit code: 0)
+[raw: t21-5a-POSITIVE-CONTROL-logs-work.txt]
+
+=> THE FLIP IS PROVED ON ALL THREE NODES: identical commands against identical
+pods, exit 1 with `tls: internal error` before approval and exit 0 with real
+log content after it. Nothing else changed between the two captures.
+
+------------------------------------------------------------
+4e) THE SERVING-CERTIFICATE ISSUER FLIP — THE ONLY GROUND TRUTH 4.2.9 GETS
+------------------------------------------------------------
+
+$ docker exec seclab-control-plane sh -c 'echo | openssl s_client -connect localhost:10250 2>/dev/null | openssl x509 -noout -issuer -subject'
+issuer=CN=kubernetes
+subject=O=system:nodes, CN=system:node:seclab-control-plane
+$ docker exec seclab-worker sh -c '<same command>'
+issuer=CN=kubernetes
+subject=O=system:nodes, CN=system:node:seclab-worker
+$ docker exec seclab-worker2 sh -c '<same command>'
+issuer=CN=kubernetes
+subject=O=system:nodes, CN=system:node:seclab-worker2
+(exit code: 0 on all three)
+
+And the issuer really is the cluster CA, checked rather than inferred:
+
+$ docker exec seclab-control-plane openssl x509 -in /etc/kubernetes/pki/ca.crt -noout -subject -issuer
+subject=CN=kubernetes
+issuer=CN=kubernetes
+(exit code: 0)
+[raw: t27-5b-serving-cert-issuers-AFTER.txt]
+
+=> BEFORE (section 2f): three unrelated ad-hoc roots —
+CN=seclab-control-plane-ca@1784637412, CN=seclab-worker-ca@1784637429,
+CN=seclab-worker2-ca@1784637429. AFTER: all three issued by CN=kubernetes, the
+cluster CA, with subjects in O=system:nodes. kube-bench cannot see this
+distinction at all, and 4.2.9 does not move because of it — see section 7.
+
+============================================================
+5) THE FLAGS LANDED — 2026-07-30
+============================================================
+
+------------------------------------------------------------
+5a) CONTROL-PLANE PROCESS LINES
+------------------------------------------------------------
+
+$ docker exec seclab-control-plane sh -c 'ps -ef | grep kube-apiserver | grep -v grep'
+root         626     325  5 13:48 ?        00:00:07 kube-apiserver --advertise-address=172.18.0.4 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key --enable-admission-plugins=NodeRestriction,AlwaysPullImages --kubelet-certificate-authority=/etc/kubernetes/pki/ca.crt --profiling=false --runtime-config=
+(exit code: 0)
+
+$ docker exec seclab-control-plane sh -c 'ps -ef | grep kube-controller-manager | grep -v grep'
+root         597     356  1 13:48 ?        00:00:02 kube-controller-manager --allocate-node-cidrs=true --authentication-kubeconfig=/etc/kubernetes/controller-manager.conf --authorization-kubeconfig=/etc/kubernetes/controller-manager.conf --bind-address=127.0.0.1 --client-ca-file=/etc/kubernetes/pki/ca.crt --cluster-cidr=10.244.0.0/16 --cluster-name=seclab --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt --cluster-signing-key-file=/etc/kubernetes/pki/ca.key --controllers=*,bootstrapsigner,tokencleaner --kubeconfig=/etc/kubernetes/controller-manager.conf --leader-elect=true --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --root-ca-file=/etc/kubernetes/pki/ca.crt --service-account-private-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/16 --use-service-account-credentials=true --enable-hostpath-provisioner=true --profiling=false
+(exit code: 0)
+
+$ docker exec seclab-control-plane sh -c 'ps -ef | grep kube-scheduler | grep -v grep'
+root         560     304  0 13:48 ?        00:00:00 kube-scheduler --authentication-kubeconfig=/etc/kubernetes/scheduler.conf --authorization-kubeconfig=/etc/kubernetes/scheduler.conf --bind-address=127.0.0.1 --kubeconfig=/etc/kubernetes/scheduler.conf --leader-elect=true --profiling=false
+(exit code: 0)
+
+Mechanical count over that capture, the same four the before-run used:
+  occurrences of --profiling                     : 3
+  occurrences of --profiling=false               : 3
+  occurrences of --kubelet-certificate-authority=/etc/kubernetes/pki/ca.crt : 1
+  value of --enable-admission-plugins            : --enable-admission-plugins=NodeRestriction,AlwaysPullImages
+  REGRESSION CHECK --runtime-config=             : 1
+  REGRESSION CHECK --enable-hostpath-provisioner=true : 1
+[raw: t22-5b-controlplane-ps-AFTER.txt]
+
+=> ALL FOUR TIER-1/TIER-2 APISERVER-SIDE CHANGES ARE ON THE PROCESS LINES.
+--profiling=false on all three components (before: absent on all three).
+--enable-admission-plugins is exactly NodeRestriction,AlwaysPullImages — the
+1.2.11 finding was a wrong-VALUE finding, not a missing-flag one, and the value
+is now right rather than merely present.
+
+=> AND THE REGRESSION CHECK PASSES, WHICH MATTERS MORE THAN ANY OF THEM.
+--runtime-config= is still on the apiserver line and
+--enable-hostpath-provisioner=true is still on the controller-manager line. The
+restatement in the config header did its job. Section 3b showed the patch using
+replace semantics against kind's block, so without the restatement both would
+have been dropped and the rebuild would have silently removed the hostpath
+provisioner.
+
+------------------------------------------------------------
+5b) THE SAME THING AT THE SOURCE — kubeadm-config ConfigMap
+------------------------------------------------------------
+
+$ kubectl -n kube-system get cm kubeadm-config -o yaml
+apiVersion: v1
+data:
+  ClusterConfiguration: |
+    apiServer:
+      certSANs:
+      - localhost
+      - 127.0.0.1
+      extraArgs:
+      - name: enable-admission-plugins
+        value: NodeRestriction,AlwaysPullImages
+      - name: kubelet-certificate-authority
+        value: /etc/kubernetes/pki/ca.crt
+      - name: profiling
+        value: "false"
+      - name: runtime-config
+        value: ""
+    apiVersion: kubeadm.k8s.io/v1beta4
+    [... caCertificateValidityPeriod, certificatesDir, clusterName,
+         controlPlaneEndpoint elided ...]
+    controllerManager:
+      extraArgs:
+      - name: enable-hostpath-provisioner
+        value: "true"
+      - name: profiling
+        value: "false"
+    [... dns, encryptionAlgorithm, etcd, imageRepository, kind,
+         kubernetesVersion, networking, proxy elided ...]
+    scheduler:
+      extraArgs:
+      - name: profiling
+        value: "false"
+kind: ConfigMap
+metadata:
+  creationTimestamp: "2026-07-30T13:48:57Z"
+  name: kubeadm-config
+  namespace: kube-system
+(exit code: 0)
+[raw: t23-5b-kubeadm-config-cm.txt]
+
+=> ALL FOUR apiServer ENTRIES AND BOTH controllerManager ENTRIES ARE THERE, plus
+scheduler profiling. And note the pair of documents side by side: the INPUT
+kind wrote is kubeadm.k8s.io/v1beta3 with extraArgs as a MAP
+(t24-rendered-kubeadm-conf-ATTEMPT4.txt), while the ConfigMap kubeadm STORED is
+kubeadm.k8s.io/v1beta4 with extraArgs as a LIST. That is the exact conversion
+that made section 2 reason from the wrong document, now visible in one place.
+
+------------------------------------------------------------
+5c) KUBELET /configz ON ALL THREE NODES
+------------------------------------------------------------
+
+$ for n in seclab-control-plane seclab-worker seclab-worker2; do kubectl get --raw "/api/v1/nodes/$n/proxy/configz"; done
+
+  field                            control-plane   worker      worker2     before (section 2d)
+  seccompDefault                   true            true        true        false
+  podPidsLimit                     4096            4096        4096        -1
+  serverTLSBootstrap               true            true        true        <absent>
+  streamingConnectionIdleTimeout   "4h0m0s"        "4h0m0s"    "4h0m0s"    "4h0m0s"
+  tlsCertFile                      <absent>        <absent>    <absent>    "/var/lib/kubelet/pki/kubelet.crt"
+  tlsPrivateKeyFile                <absent>        <absent>    <absent>    "/var/lib/kubelet/pki/kubelet.key"
+  rotateCertificates               true            true        true        (not captured before)
+(exit code: 0 on all three)
+[raw: t25-configz-seclab-control-plane.json, t25-configz-seclab-worker.json,
+ t25-configz-seclab-worker2.json, t26-5b-configz-summary.txt]
+
+And the kubelet config FILE, which is what kube-bench's 4.2.x checks actually
+read (audit_config: /bin/cat $kubeletconf):
+
+$ docker exec <node> grep -E '^(seccompDefault|podPidsLimit|serverTLSBootstrap|tlsCertFile|tlsPrivateKeyFile|streamingConnectionIdleTimeout|rotateCertificates|readOnlyPort):' /var/lib/kubelet/config.yaml
+podPidsLimit: 4096
+rotateCertificates: true
+seccompDefault: true
+serverTLSBootstrap: true
+streamingConnectionIdleTimeout: 0s
+(identical on all three nodes; exit code: 0)
+[raw: t28-kubelet-config-files-AFTER.txt]
+
+=> seccompDefault AND podPidsLimit ARE NOW IN THE FILE, which is why 4.2.14 and
+4.2.13 can move at all. tlsCertFile and tlsPrivateKeyFile are ABSENT from both
+the file and /configz — serverTLSBootstrap removed them rather than setting
+them, exactly as section 0c predicted, which is why 4.2.9 cannot move.
+
+=> AND THE streamingConnectionIdleTimeout DISCREPANCY REPRODUCES ON A CLUSTER
+BUILT FROM SCRATCH. The file says 0s and /configz says "4h0m0s" on all three
+nodes, identically to section 2d. It is therefore not drift, not a stale value
+and not an artifact of the old cluster's age — it is how this kubelet behaves.
+Phase 5b changes nothing about it, 4.2.5 is not one of the eight targets, and
+no committed document is edited here. The reconciliation is left open on the
+record with a second, independent observation now attached to it.
+
+============================================================
+6) THE CONTROLS COME BACK — 2026-07-30
+============================================================
+
+Re-bootstrapped in the runbook's section 6 order. Every control below is
+reported as: the bootstrap command's outcome, then its REAL probe. A control
+that applied cleanly but was not probed is not evidence that it works.
+
+------------------------------------------------------------
+6a) WORKLOADS + PSA (phase-1 §4/§5)
+------------------------------------------------------------
+
+$ kubectl apply -f workloads/nginx/
+namespace/demo created
+serviceaccount/nginx-sa created
+deployment.apps/nginx created
+service/nginx created
+(exit code: 0 — one pass, in numbered order, into a fresh cluster)
+
+$ kubectl rollout status deploy/nginx -n demo --timeout=300s
+deployment "nginx" successfully rolled out
+(exit code: 0)
+
+$ kubectl get ns demo --show-labels
+demo   Active   5s    app.kubernetes.io/part-of=k8s-security-lab,kubernetes.io/metadata.name=demo,pod-security.kubernetes.io/enforce-version=v1.35,pod-security.kubernetes.io/enforce=restricted,pod-security.kubernetes.io/warn=restricted
+(exit code: 0)
+[raw: t29-6.1-nginx-workload.txt]
+
+PROBE — a hardened curl pod reaches nginx through the Service:
+$ kubectl exec -n demo curl-test -- curl -s -o /dev/null -w '%{http_code}\n' http://nginx.demo.svc.cluster.local
+200
+(exit code: 0; pod deleted afterwards)
+[raw: t30-6.1-verify-phase1-s5.txt]
+
+------------------------------------------------------------
+6b) RBAC (phase-2a §1/§2)
+------------------------------------------------------------
+
+PROBE, no-token half — the directory must not exist:
+$ kubectl exec -n demo nginx-6b6d4558d-47j9f -- ls /var/run/secrets/kubernetes.io/serviceaccount
+ls: /var/run/secrets/kubernetes.io/serviceaccount: No such file or directory
+command terminated with exit code 1
+(exit code: 1 — automountServiceAccountToken: false is in effect)
+
+$ kubectl apply -f rbac/
+serviceaccount/developer-sa created
+role.rbac.authorization.k8s.io/developer created
+rolebinding.rbac.authorization.k8s.io/developer-binding created
+clusterrole.rbac.authorization.k8s.io/kyverno:reports-controller:ephemeralcontainers created
+(exit code: 0)
+
+PROBE, least-privilege half — the full can-i matrix, SA
+system:serviceaccount:demo:developer-sa:
+  list pods             -> yes
+  get services          -> yes
+  list deployments.apps -> yes
+  get secrets           -> no
+  list secrets          -> no
+  create pods           -> no
+  delete pods           -> no
+(exit code: 0 — identical to the phase-2a committed matrix)
+[raw: t31-6.2-rbac.txt]
+
+------------------------------------------------------------
+6c) KYVERNO + THE FOUR ValidatingPolicies (phase-2b §1/§2)
+------------------------------------------------------------
+
+$ helm install kyverno kyverno/kyverno --namespace kyverno --create-namespace --version 3.8.2
+STATUS: deployed / Chart version: 3.8.2 / Kyverno version: v1.18.2
+(exit code: 0; all four controllers rolled out, 1/1 Running, 0 restarts)
+
+$ kubectl api-resources | grep -i validatingpolic
+validatingpolicies                  vpol         policies.kyverno.io/v1            false        ValidatingPolicy
+imagevalidatingpolicies             ivpol        policies.kyverno.io/v1            false        ImageValidatingPolicy
+(exit code: 0 — v1 is served, as clusters/kyverno-install.md records)
+[raw: t32-6.3-kyverno-install.txt]
+
+AUDIT FIRST. demo-kyverno-only and the reports RBAC go in before the policies,
+or every policy that matches pods/ephemeralcontainers sits READY=false:
+
+$ kubectl get validatingpolicy -o custom-columns='NAME:...,ACTIONS:...,READY:...'
+disallow-latest-and-bare-tag     [Audit]   true
+disallow-privileged-containers   [Audit]   true
+require-drop-all-capabilities    [Audit]   true
+restrict-registries              [Audit]   true
+(exit code: 0)
+
+THE PASS=4 GATE — the compliant workload must satisfy every rule before Deny:
+$ kubectl get policyreport -n demo
+NAME   KIND         NAME                     PASS   FAIL   WARN   ERROR   SKIP
+...    ReplicaSet   nginx-6b6d4558d          4      0      0      0       0
+...    Deployment   nginx                    4      0      0      0       0
+...    Pod          nginx-68d5c479cf-d2lzk   4      0      0      0       0
+...    Pod          nginx-68d5c479cf-k7m7q   4      0      0      0       0
+(exit code: 0 — pass=4 fail=0 error=0 on both pods; the gate is clean)
+[raw: t33-6.4-6.5-namespace-and-audit.txt, t34-6.5-pass4-gate.txt]
+
+THEN DENY:
+$ kubectl apply -f policies/ ; kubectl get validatingpolicy -o custom-columns=...
+disallow-latest-and-bare-tag     [Deny]    true
+disallow-privileged-containers   [Deny]    true
+require-drop-all-capabilities    [Deny]    true
+restrict-registries              [Deny]    true
+(exit code: 0)
+$ kubectl rollout restart deploy/nginx -n demo && kubectl rollout status ...
+deployment "nginx" successfully rolled out
+(exit code: 0 — a compliant workload still admits under Enforce)
+[raw: t35-6.5-flip-to-deny.txt]
+
+PROBE — all nine phase-2b attacks, every one blocked, each naming its control.
+Two representative denials, verbatim:
+
+$ kubectl apply -f attack-bad-registry.yaml            # ATTACK D, demo-kyverno-only
+Error from server: error when creating "attack-bad-registry.yaml": admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy restrict-registries failed: Image registry not allowed: every container (including init and ephemeral containers) must use an image from Docker Hub nginxinc/* or curlimages/*, or ghcr.io/joesevv/k8s-security-lab/*.
+(exit code: 1)
+
+$ kubectl debug -n demo-kyverno-only target-pod-for-debug --image=curlimages/curl:8.11.1 --target=target --profile=sysadmin --container=attacker-ephemeral -- sleep 3600     # ATTACK H
+Error from server: admission webhook "vpol.validate.kyverno.svc-fail" denied the request: Policy require-drop-all-capabilities failed: Every container (including init and ephemeral containers) must set securityContext.capabilities.drop to include "ALL" AND must not add any capability back via securityContext.capabilities.add.; Policy disallow-privileged-containers failed: Privileged containers are not allowed: every container (including init and ephemeral containers) must not set securityContext.privileged=true.
+(exit code: 1 — two policies fire on the subresource; the pod's
+spec.ephemeralContainers is empty afterwards, so nothing was attached)
+
+Summary of the nine: A privileged pod, B :latest tag, C no drop, D bad
+registry, E capability add-back, F privileged Deployment, G privileged CronJob,
+H ephemeral-container injection — all DENIED at exit 1 by Kyverno, each naming
+its policy. I hostPath/root — DENIED at exit 1 by PSA, naming no Kyverno policy:
+
+$ kubectl apply -f docs/evidence/phase-2b-admission/attack-hostpath-root.yaml     # ATTACK I, in demo
+Error from server (Forbidden): error when creating "docs/evidence/phase-2b-admission/attack-hostpath-root.yaml": pods "attack-hostpath-root" is forbidden: violates PodSecurity "restricted:v1.35": restricted volume types (volume "node-root" uses restricted volume type "hostPath"), runAsNonRoot != true (pod must not set securityContext.runAsNonRoot=false), runAsUser=0 (pod must not set runAsUser=0)
+(exit code: 1 — and note "restricted:v1.35", the pinned enforce-version, not
+"restricted:latest")
+
+And the deliberately unflattering counter-proof — the SAME pod in
+demo-kyverno-only, which has PSA warn but no enforce, is ADMITTED:
+$ kubectl apply -f attack-hostpath-root.yaml --dry-run=server
+Warning: would violate PodSecurity "restricted:latest": restricted volume types (volume "node-root" uses restricted volume type "hostPath"), runAsNonRoot != true (pod must not set securityContext.runAsNonRoot=false), runAsUser=0 (pod must not set runAsUser=0)
+pod/attack-hostpath-root created (server dry run)
+(exit code: 0 — Kyverno inspects it and has nothing to say; no ValidatingPolicy
+here covers hostPath or runAsUser, so PSA is not redundant)
+
+$ kubectl get pods,deploy,rs,job,cronjob -n demo-kyverno-only
+No resources found in demo-kyverno-only namespace.
+(exit code: 0 — admission denials happen before persistence)
+[raw: t36-6.6-attacks-A-G.txt, t37-6.6-attacks-H-I.txt]
+
+A retry is recorded in t37: the first run of the ATTACK I counter-proof failed
+with `error: the path "/tmp/tmp.vubDTd0Drg/attack-hostpath-root.yaml" does not
+exist` (exit code: 1). That is the MSYS trap in reverse — MSYS_NO_PATHCONV=1
+was exported, so an MSYS /tmp path reached a Windows kubectl.exe that cannot
+resolve it. The file existed; kubectl could not see it. Re-run with cd plus a
+relative filename, as section 3a of the phase-2b runbook does.
+
+------------------------------------------------------------
+6d) SUPPLY CHAIN (phase-4 §2/§3)
+------------------------------------------------------------
+
+$ kubectl apply -f policies/supply-chain/require-signed-images.yaml
+imagevalidatingpolicy.policies.kyverno.io/require-keyless-signed-ghcr created
+$ kubectl get imagevalidatingpolicy require-keyless-signed-ghcr
+NAME                          AGE   READY
+require-keyless-signed-ghcr   8s    true
+$ kubectl get imagevalidatingpolicy require-keyless-signed-ghcr -o jsonpath='{.spec.attestors[0].cosign.keyless.identities}'
+[{"issuer":"https://token.actions.githubusercontent.com","subject":"https://github.com/joesevv/k8s-security-lab/.github/workflows/supply-chain.yml@refs/heads/main"}]
+(exit code: 0 — READY=true is the gate; a policy that failed to compile its CEL
+would read false and enforce nothing)
+
+PROBE, positive half — the signed image is admitted and runs on its digest:
+$ kubectl rollout status deploy/signed-app -n demo --timeout=300s
+deployment "signed-app" successfully rolled out
+$ kubectl -n demo get pod -l app=signed-app -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'
+ghcr.io/joesevv/k8s-security-lab/signed-app@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
+(exit code: 0 — the exact digest cosign signed in CI run 30174855073)
+[raw: t38-6.7-supply-chain-policy-and-workload.txt]
+
+PROBE, negative half — a REAL, pullable, UNSIGNED artifact under the enforced
+glob is refused:
+$ kubectl apply -f docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml
+Error from server: error when creating "docs/evidence/phase-4-supply-chain/attack-unsigned-existing-artifact.yaml": admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr failed: Image must be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+(exit code: 1)
+
+Same code path, one variable — the real Deployment with only the image swapped:
+$ sed 's|^\( *image: \).*$|\1...signed-app:sha256-b4cb133e...|' workloads/signed-app/deployment.yaml | kubectl apply -f - --server-side --force-conflicts --dry-run=server --field-manager=evidence-check
+Error from server: admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr failed: Image must be cosign keyless-signed by the k8s-security-lab GitHub Actions workflow.
+(exit code: 1)
+
+FAIL-CLOSED, a different property shown separately:
+$ kubectl apply -f docs/evidence/phase-4-supply-chain/attack-unsigned-image.yaml
+Error from server: error when creating "docs/evidence/phase-4-supply-chain/attack-unsigned-image.yaml": admission webhook "ivpol.validate.kyverno.svc-fail-finegrained-require-keyless-signed-ghcr" denied the request: Policy require-keyless-signed-ghcr error: failed to evaluate policy: GET https://ghcr.io/v2/joesevv/k8s-security-lab/signed-app/manifests/unsigned: MANIFEST_UNKNOWN: manifest unknown
+(exit code: 1 — "error: failed to evaluate" + a registry 404, NOT "failed:
+Image must be cosign keyless-signed". Same outcome, different mechanism.)
+
+CONTROLLER PATH and OUT-OF-GLOB NEGATIVE CONTROL both reproduce: the unsigned
+Deployment is rejected at apply (exit code: 1), and nginx server-side-applies
+clean (exit code: 0) with both replicas still Running. Every apply used
+--server-side --dry-run=server; a plain --dry-run=server on an unchanged object
+computes an empty patch and proves nothing.
+[raw: t39-6.7-verify-phase4-s3.txt]
+
+------------------------------------------------------------
+6e) NETWORKPOLICY — LAST OF THE DEMO CONTROLS (phase-2c §1/§2)
+------------------------------------------------------------
+
+$ kubectl apply -f network/00-default-deny.yaml ; kubectl get pods -n demo
+networkpolicy.networking.k8s.io/default-deny created
+(all three pods still 1/1 Running — NetworkPolicy affects connections, not
+lifecycle)
+$ kubectl apply -f network/ ; kubectl get networkpolicy -n demo
+allow-client-egress-to-nginx      access=nginx
+allow-dns                         <none>
+allow-nginx-ingress-from-client   app=nginx
+default-deny                      <none>
+(exit code: 0)
+[raw: t44-6.8-networkpolicy.txt]
+
+PROBE — one label of difference, same name, same command:
+$ kubectl exec -n demo unauth -- curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://nginx.demo.svc.cluster.local/
+HTTP:000 time=5.002283
+command terminated with exit code 28
+(exit code: 28 — curl 28 is timeout)
+
+$ kubectl exec -n demo authorized -- curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://nginx.demo.svc.cluster.local/
+HTTP:200 time=0.002518
+(exit code: 0)
+
+And the blocked pod can still RESOLVE the name, so the failure is the
+NetworkPolicy denying TCP and not a DNS failure:
+$ kubectl exec -n demo unauth -- nslookup nginx.demo.svc.cluster.local
+Name:	nginx.demo.svc.cluster.local
+Address: 10.96.180.134
+(exit code: 0)
+[raw: t45-6.8-verify-phase2c.txt]
+
+=> 5-second timeout versus a 2.5-millisecond 200. kindnet really does enforce
+NetworkPolicy on this cluster; the access=nginx label is the sole
+discriminator. Both test pods deleted afterwards.
+
+------------------------------------------------------------
+6f) SEALED SECRETS — RE-SEALED, BECAUSE THE OLD CIPHERTEXT IS DEAD
+------------------------------------------------------------
+
+The controller was reinstalled (chart 2.19.1 / app 0.38.4, kube-system,
+fullnameOverride=sealed-secrets-controller; rolled out 1/1). Its keypair is
+NEW. That the committed ciphertext is therefore useless is DEMONSTRATED rather
+than asserted — the old file was applied first:
+
+$ kubectl apply -f secrets/demo-app-sealedsecret.yaml     # the OLD committed ciphertext
+sealedsecret.bitnami.com/demo-app-secret created
+$ kubectl get sealedsecret demo-app-secret -n demo
+NAME              STATUS                                      SYNCED   AGE
+demo-app-secret   no key could decrypt secret (db-password)   False    8s
+$ kubectl get secret demo-app-secret -n demo
+Error from server (NotFound): secrets "demo-app-secret" not found
+(exit code: 1)
+$ kubectl get events -n demo --field-selector reason=ErrUnsealFailed
+Warning   ErrUnsealFailed   sealedsecret/demo-app-secret   Failed to unseal: no key could decrypt secret (db-password)
+(exit code: 0)
+[raw: t47-7-sealed-secrets-install.txt, t48-7-old-ciphertext-dead.txt]
+
+RE-SEAL. The 20-line hand-written header is preserved by extracting it BEFORE
+the file is overwritten, and it is byte-identical to what the runbook quotes:
+$ diff header-20.txt <the header the runbook §7 quotes>
+(exit code: 0)
+
+$ kubeseal --fetch-cert --controller-namespace kube-system --controller-name sealed-secrets-controller > secrets/plain/controller-cert.pem
+$ openssl x509 -in secrets/plain/controller-cert.pem -noout -dates -fingerprint -sha256
+notBefore=Jul 30 14:02:39 2026 GMT
+notAfter=Jul 27 14:02:39 2036 GMT
+sha256 Fingerprint=C9:B2:E1:89:83:90:12:50:D9:E8:55:EA:4B:4B:40:89:77:48:AA:87:41:E0:53:82:0E:27:9B:67:8A:52:07:58
+(exit code: 0 — notBefore is today, so this really is a fresh keypair)
+
+$ kubeseal --format yaml --cert secrets/plain/controller-cert.pem < secrets/plain/demo-app-secret-plain.yaml
+(exit code: 0; kubeseal's leading `---` dropped so the file keeps its committed
+shape, then the 20-line header re-prepended)
+
+$ git diff --numstat -- secrets/demo-app-sealedsecret.yaml
+1	1	secrets/demo-app-sealedsecret.yaml
+$ git diff -- secrets/demo-app-sealedsecret.yaml | grep '^[+-]' | grep -v '^[+-][+-]' | cut -c1-50
+-    db-password: AgBQaeyrEVSHVFyi6TYJhCzMb2bOWqvA
++    db-password: AgAH6npk+T+cUec7JNjXrB3LTqdvaR4V
+(exit code: 0 — exactly ONE line changed, the ciphertext. 32 lines before and
+after, header intact, line 21 still `apiVersion: bitnami.com/v1alpha1`, zero CR
+bytes.)
+
+$ kubectl apply -f secrets/demo-app-sealedsecret.yaml
+sealedsecret.bitnami.com/demo-app-secret configured
+$ kubectl get sealedsecret,secret demo-app-secret -n demo
+sealedsecret.bitnami.com/demo-app-secret            True     68s
+secret/demo-app-secret   Opaque   1      8s
+(exit code: 0)
+
+The controller's own log carries the whole story in three lines — two failures
+against the old ciphertext, then the success against the new one:
+time=2026-07-30T14:02:58.591Z level=INFO msg="Event(v1.ObjectReference{Kind:\"SealedSecret\", Namespace:\"demo\", Name:\"demo-app-secret\", UID:\"f2c652a7-3a5b-4c70-88db-c2f57627178f\", APIVersion:\"bitnami.com/v1alpha1\", ResourceVersion:\"3728\", FieldPath:\"\"}): type: 'Warning' reason: 'ErrUnsealFailed' Failed to unseal: no key could decrypt secret (db-password)"
+time=2026-07-30T14:02:58.676Z level=INFO msg="Event(v1.ObjectReference{Kind:\"SealedSecret\", Namespace:\"demo\", Name:\"demo-app-secret\", UID:\"f2c652a7-3a5b-4c70-88db-c2f57627178f\", APIVersion:\"bitnami.com/v1alpha1\", ResourceVersion:\"3728\", FieldPath:\"\"}): type: 'Warning' reason: 'ErrUnsealFailed' Failed to unseal: no key could decrypt secret (db-password)"
+time=2026-07-30T14:03:58.417Z level=INFO msg="Event(v1.ObjectReference{Kind:\"SealedSecret\", Namespace:\"demo\", Name:\"demo-app-secret\", UID:\"f2c652a7-3a5b-4c70-88db-c2f57627178f\", APIVersion:\"bitnami.com/v1alpha1\", ResourceVersion:\"3951\", FieldPath:\"\"}): type: 'Normal' reason: 'Unsealed' SealedSecret unsealed successfully"
+(exit code: 0)
+[raw: t49-7-reseal.txt, t50-7-reseal-assemble-apply.txt]
+
+PROBE — the round trip, by DIGEST. The value is never printed:
+$ grep 'db-password:' secrets/plain/demo-app-secret-plain.yaml | awk '{print $2}' | base64 -d | sha256sum
+2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c   (intended input)
+$ kubectl get secret demo-app-secret -n demo -o jsonpath='{.data.db-password}' | base64 -d | sha256sum
+2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c   (in-cluster, decrypted by the NEW keypair)
+(exit code: 0 — MATCH, and it is the same digest phase 3 recorded, so the
+credential survived the rebuild unchanged)
+
+THE NO-PLAINTEXT-IN-GIT GATE, GUARD FIRST:
+$ [ -n "$B64" ] && [ -n "$VAL" ] && echo "VAL/B64 set (values not printed)"
+VAL/B64 set (values not printed)
+  guard detail, lengths only: ${#B64}=44  ${#VAL}=31
+$ git grep --no-index -l "$B64"          # positive control
+secrets/plain/demo-app-secret-plain.yaml
+(exit code: 0 — the value exists, and ONLY in the ignored file)
+$ git grep --untracked -n "$VAL"     -> (exit code: 1, no match)
+$ git grep --untracked -n "$B64"     -> (exit code: 1, no match)
+$ git log --all -p -- secrets/ | grep "$VAL"  -> (exit code: 1, no match)
+$ git check-ignore secrets/plain/demo-app-secret-plain.yaml secrets/plain/controller-cert.pem
+secrets/plain/demo-app-secret-plain.yaml
+secrets/plain/controller-cert.pem
+(exit code: 0 — both ignored)
+
+AND THE GUARD IS NOT DECORATION. What an empty variable would have done, run as
+a deliberate negative control:
+$ git grep --untracked -n "" | wc -l
+15244
+(exit code: 0 — an unset variable makes the search match EVERY line of EVERY
+file and exit 0, silently inverting the proof. The guard is checked before the
+result is believed.)
+[raw: t51-7-roundtrip-and-git-gate.txt]
+
+------------------------------------------------------------
+6g) FALCO (clusters/falco-install.md, phase-6 §2/§3)
+------------------------------------------------------------
+
+Namespace from its committed manifest first, then the pinned install verbatim —
+all eleven --set flags including collectors.containerEngine.pluginRef, the one
+that is easy to drop.
+
+$ helm install falco falcosecurity/falco --namespace falco --version 9.1.0 --set driver.kind=modern_ebpf ... --timeout 10m --wait
+NAME: falco / NAMESPACE: falco / STATUS: deployed / REVISION: 1
+(exit code: 0; the install prints the full PSA warn list, which is the falco
+namespace's enforce=privileged label doing its documented job)
+
+$ kubectl -n falco get pods -o wide
+falco-g8d62   1/1   Running   0   101s   10.244.2.12   seclab-worker
+falco-hzkbw   1/1   Running   0   101s   10.244.1.9    seclab-worker2
+falco-lbrt9   1/1   Running   0   101s   10.244.0.5    seclab-control-plane
+(exit code: 0)
+[raw: t53-8-falco-install.txt]
+
+RUNNING IS NOT THE PROOF. Four checks, only one of which is Falco's own word:
+
+(1) Falco's log:      Opening 'syscall' source with modern BPF probe.
+                      /etc/falco/falco_rules.yaml | schema validation: ok
+(2) the RUNNING container's config, read out of it:
+    $ kubectl -n falco exec falco-g8d62 -c falco -- sed -n '/^engine:/,/^[a-z]/p' /etc/falco/falco.yaml
+    engine:
+      kind: modern_ebpf
+(3) no kernel module anywhere: NO_FALCO_KMOD_LOADED on all three nodes
+(4) live BPF objects held by Falco PID 1:
+         13 bpf
+         14 bpf-map
+        197 bpf-prog
+(5) restartCount 0 on all three pods, so nothing fell back to another driver
+(exit code: 0 throughout)
+
+BTF present on all three nodes before the install
+(-r--r--r-- 1 root root 6677359 /sys/kernel/btf/vmlinux, identical size on each,
+which is what one kernel behind three container mounts looks like), kernel
+6.18.33.2-microsoft-standard-WSL2.
+
+And the pins actually held — falcoctl's own resolved refs:
+refs":["ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0","ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891"]
+(exit code: 0 — BOTH by digest, no floating tag survived; and 2 lines of
+"Signature successfully verified" in that init container's log)
+[raw: t54-8-falco-driver-proofs.txt]
+
+PROBE — two behaviours, NEW markers so no grep can match a stale line. Target is
+demo/nginx-78c88678f4-8k5lb on seclab-worker; alerts are read from falco-g8d62,
+the CO-LOCATED sensor, because only it resolves container and k8s_* fields.
+
+PRIMARY, window T0 14:07:40.985619100Z -> T1 14:07:41.461033300Z:
+$ docker exec seclab-control-plane script -q -c "kubectl exec -it -n demo nginx-78c88678f4-8k5lb -- /bin/sh -c 'tty; id; echo R3-DR-PRIMARY-MARKER; uname -a'" /dev/null
+/dev/pts/0
+uid=101(nginx) gid=101(nginx) groups=101(nginx)
+R3-DR-PRIMARY-MARKER
+(exit code: 0 — a real PTY, not a synthesized event)
+
+$ kubectl -n falco logs falco-g8d62 -c falco | grep R3-DR-PRIMARY-MARKER
+14:07:41.306012745: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo R3-DR-PRIMARY-MARKER; uname -a terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=4622f824fd59 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=7312fa98595737958df41e20f21a2880dd9775f455c6bf76e638024dc755d201 k8s_pod_name=nginx-78c88678f4-8k5lb k8s_ns_name=demo
+(exit code: 0 — .306 sits inside the window .985 -> .461; terminal=34816 is the
+non-zero proc.tty the rule requires; user_uid=101 confirms it fired against the
+NON-ROOT hardened workload)
+
+SECONDARY, window T0 14:07:41.494076400Z -> T1 14:07:41.673850800Z:
+$ kubectl exec -n demo nginx-78c88678f4-8k5lb -- /bin/sh -c 'cp /bin/busybox /dev/shm/bb && /dev/shm/bb id && echo R3-DR-SHM-MARKER'
+bb: applet not found
+command terminated with exit code 127
+(exit code: 127 — busybox's OWN message printed AFTER it started; the kernel did
+execute the staged binary)
+
+$ kubectl -n falco logs falco-g8d62 -c falco | grep R3-DR-SHM-MARKER
+14:07:41.640496274: Warning File execution detected from /dev/shm | evt_res=SUCCESS file=<NA> proc_cwd=/ proc_pcmdline=sh -c cp /bin/busybox /dev/shm/bb && /dev/shm/bb id && echo R3-DR-SHM-MARKER user_loginname=<NA> group_gid=101 group_name=<NA> evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=bb proc_exepath=/dev/shm/bb parent=sh command=bb id terminal=0 exe_flags=EXE_WRITABLE container_id=4622f824fd59 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=7312fa98595737958df41e20f21a2880dd9775f455c6bf76e638024dc755d201 k8s_pod_name=nginx-78c88678f4-8k5lb k8s_ns_name=demo
+(exit code: 0 — .640 sits inside the window .494 -> .673, and evt_res=SUCCESS is
+the independent confirmation that the execve succeeded)
+
+Every alert line in that pod's log, enumerated whole at 14:08:08Z — the log is
+fresh, so this time there are exactly two and both are this drill's:
+14:07:41.306012745: Notice A shell was spawned in a container with an attached terminal
+14:07:41.640496274: Warning File execution detected from /dev/shm
+(exit code: 0 — the two lines above are reproduced from the raw capture with
+one edit: `grep -oE '... [A-Za-z /]+'` leaves a TRAILING SPACE on each, and
+that trailing space is stripped here rather than committed into the file.
+Everything before it is byte-exact.)
+
+THE SHARED-KERNEL ARTIFACT REPRODUCES. One event, three sensors, 14.7 us apart,
+and only the co-located one has k8s metadata:
+  falco-g8d62 (seclab-worker)        14:07:41.306012745  container_name=nginx  k8s_pod_name=nginx-78c88678f4-8k5lb  k8s_ns_name=demo
+  falco-hzkbw (seclab-worker2)       14:07:41.305097485  container_name=<NA>   k8s_pod_name=<NA>  k8s_ns_name=<NA>
+  falco-lbrt9 (seclab-control-plane) 14:07:41.303562132  container_name=<NA>   k8s_pod_name=<NA>  k8s_ns_name=<NA>
+(exit code: 0 — .306012745 - .303562132 = 2,450,613 ns = 2.45 ms first-to-last.
+On a real cluster with three kernels two of these lines would not exist. Divide
+every count by three.)
+[raw: t55-8-detection-trigger.txt, t56-8-detection-alerts.txt]
+
+The staged payload was removed afterwards (phase-6 §5): /dev/shm is empty,
+cleaned-rc=0 (exit code: 0). [raw: t57-8-falco-cleanup.txt]
+
+------------------------------------------------------------
+6h) THE 1.2.11 / 4.2.13 / 4.2.14 GROUND-TRUTH PROBE POD
+------------------------------------------------------------
+
+Re-created from the SAME manifest as the before-leg, proven byte-identical:
+$ diff r3-before-raw/probe-pod.yaml r3-after-raw/probe-pod.yaml
+(exit code: 0)
+
+$ kubectl apply -f probe-pod.yaml
+Warning: would violate PodSecurity "restricted:latest": seccompProfile (pod or container "probe" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+pod/r3-seccomp-pids-probe created
+(exit code: 0 — and the warning is itself evidence that the pod really does omit
+seccompProfile)
+
+$ kubectl exec -n demo-kyverno-only r3-seccomp-pids-probe -- grep Seccomp /proc/1/status
+Seccomp:	2
+Seccomp_filters:	2
+(exit code: 0 — 4.2.14: Seccomp_filters 1 -> 2. THE DISCRIMINATOR MOVED.
+`Seccomp: 2` is unchanged and proves nothing, exactly as section 0d warned.)
+
+$ kubectl get pod r3-seccomp-pids-probe -n demo-kyverno-only -o jsonpath='{.spec.containers[0].imagePullPolicy}'
+Always
+(exit code: 0 — 1.2.11: IfNotPresent -> Always. The manifest sets no
+imagePullPolicy field, so this is the AlwaysPullImages admission plugin
+mutating the object. That mutation, not the flag string, is the proof the
+plugin is live.)
+
+$ kubectl exec -n demo-kyverno-only r3-seccomp-pids-probe -- cat /sys/fs/cgroup/pids.max
+18999
+(exit code: 0 — 4.2.13: 18999, UNCHANGED. The probe did NOT move. See section 8.)
+
+$ kubectl get pod r3-seccomp-pids-probe -n demo-kyverno-only -o jsonpath='{.spec.containers[0].securityContext.seccompProfile}'
+(exit code: 0 — empty; the field really is absent from the stored object)
+
+Probe pod deleted afterwards; demo-kyverno-only empty.
+[raw: t40-probe-readings-AFTER.txt, t43-probe-delete.txt]
+
+============================================================
+7) THE AFTER-RUN AND THE DELTA — 2026-07-30
+============================================================
+
+Same manifests, same image digest, same cis-1.12 pin as the before-run in
+section 2. Nothing about the scanner changed, so the delta is the cluster.
+
+$ kubectl apply -f docs/evidence/phase-5-cis/job-kube-bench-master.yaml
+Warning: would violate PodSecurity "restricted:latest": host namespaces (hostPID=true), restricted volume types (...), runAsNonRoot != true (...), runAsUser=0 (...)
+job.batch/kube-bench-master created
+(exit code: 0 — the PSA warning is the cis-benchmark namespace's documented
+exemption behaving as designed)
+$ kubectl apply -f docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml
+daemonset.apps/kube-bench-node-ds created
+$ kubectl -n cis-benchmark wait --for=condition=complete job/kube-bench-master --timeout=300s
+job.batch/kube-bench-master condition met
+(exit code: 0)
+
+$ kubectl -n cis-benchmark get pods -o wide
+kube-bench-master-p24tn    0/1   Completed   0   11s   10.244.0.6    seclab-control-plane
+kube-bench-node-ds-5pds5   1/1   Running     0   11s   10.244.2.13   seclab-worker
+kube-bench-node-ds-6jwkg   1/1   Running     0   11s   10.244.1.10   seclab-worker2
+(exit code: 0 — one DS pod per worker)
+[raw: t58-9a-kube-bench-run.txt]
+
+------------------------------------------------------------
+7a) THE SUMMARY BLOCKS
+------------------------------------------------------------
+
+  master (job/kube-bench-master, on seclab-control-plane)
+== Summary total ==
+51 checks PASS
+6 checks FAIL
+49 checks WARN
+0 checks INFO
+[raw: after-master-job.log — 399 lines, was 426]
+
+  node (kube-bench-node-ds-5pds5, on seclab-worker)
+== Summary total ==
+19 checks PASS
+2 checks FAIL
+4 checks WARN
+0 checks INFO
+[raw: after-node-worker.log — 90 lines, was 97]
+
+  node (kube-bench-node-ds-6jwkg, on seclab-worker2)
+== Summary total ==
+19 checks PASS
+2 checks FAIL
+4 checks WARN
+0 checks INFO
+[raw: after-node-worker2.log — 90 lines, was 97]
+
+  target        before               predicted            ACTUAL
+  master        46 / 10 / 50 / 0     51 / 6 / 49 / 0      51 / 6 / 49 / 0
+  worker        17 /  2 /  6 / 0     19 / 2 /  4 / 0      19 / 2 /  4 / 0
+  worker2       17 /  2 /  6 / 0     19 / 2 /  4 / 0      19 / 2 /  4 / 0
+                                          (PASS / FAIL / WARN / INFO)
+
+=> EVERY PREDICTED COUNT IS EXACT ON ALL THREE TARGETS.
+[raw: t59-9a-summaries.txt]
+
+------------------------------------------------------------
+7b) THE STATUS-LINE DIFF — THE AUTHORITATIVE COMPARISON
+------------------------------------------------------------
+
+Method per runbook §9b: strip the glog lines and the client-version warning,
+then restrict to status and count lines. Section 2c established why the raw
+byte-diff cannot be the instrument here.
+
+$ diff <(strip before-master-job.log) <(strip after-master-job.log)
+29c29
+< [FAIL] 1.2.5 Ensure that the --kubelet-certificate-authority argument is set as appropriate (Automated)
+---
+> [PASS] 1.2.5 Ensure that the --kubelet-certificate-authority argument is set as appropriate (Automated)
+35c35
+< [WARN] 1.2.11 Ensure that the admission control plugin AlwaysPullImages is set (Manual)
+---
+> [PASS] 1.2.11 Ensure that the admission control plugin AlwaysPullImages is set (Manual)
+39c39
+< [FAIL] 1.2.15 Ensure that the --profiling argument is set to false (Automated)
+---
+> [PASS] 1.2.15 Ensure that the --profiling argument is set to false (Automated)
+57c57
+< [FAIL] 1.3.2 Ensure that the --profiling argument is set to false (Automated)
+---
+> [PASS] 1.3.2 Ensure that the --profiling argument is set to false (Automated)
+64c64
+< [FAIL] 1.4.1 Ensure that the --profiling argument is set to false (Automated)
+---
+> [PASS] 1.4.1 Ensure that the --profiling argument is set to false (Automated)
+[plus the two count blocks: section 1 39/10/11 -> 44/6/10, total 46/10/50 -> 51/6/49]
+(exit code: 1 — five status lines, and only five)
+
+$ diff <(strip before-node-worker.log) <(strip after-node-worker.log)
+26,27c26,27
+< [WARN] 4.2.13 Ensure that a limit is set on pod PIDs (Manual)
+< [WARN] 4.2.14 Ensure that the --seccomp-default parameter is set to true (Manual)
+---
+> [PASS] 4.2.13 Ensure that a limit is set on pod PIDs (Manual)
+> [PASS] 4.2.14 Ensure that the --seccomp-default parameter is set to true (Manual)
+[plus the count blocks: 17 PASS -> 19, 6 WARN -> 4, twice]
+(exit code: 1 — two status lines, and only two. seclab-worker2's diff is
+character-identical to this one.)
+[raw: t60-9b-status-delta.txt]
+
+------------------------------------------------------------
+7c) THE STRONGER CLAIM, MEASURED — EVERYTHING ELSE IS UNCHANGED
+------------------------------------------------------------
+
+Counting only [STATUS] lines, so the count lines cannot pad the number:
+
+  master : 10 changed status lines = 5 checks moved, out of 123 status lines
+  worker : 4 changed status lines  = 2 checks moved, out of 29
+  worker2: 4 changed status lines  = 2 checks moved, out of 29
+
+Then MASK the checks that were supposed to move and re-diff. If anything else
+moved, this is where it shows:
+
+$ diff <(status-lines before-master | grep -Ev '^\[[A-Z]+\] (1\.2\.5|1\.2\.11|1\.2\.15|1\.3\.2|1\.4\.1) ') <(same for after-master)
+(exit code: 0 — no output; EVERY other master check is byte-identical)
+
+$ diff <(status-lines before-node-worker | grep -Ev '^\[[A-Z]+\] (4\.2\.13|4\.2\.14) ') <(same for after)
+(exit code: 0 — no output)
+
+$ diff <(status-lines before-node-worker2 | grep -Ev '^\[[A-Z]+\] (4\.2\.13|4\.2\.14) ') <(same for after)
+(exit code: 0 — no output)
+[raw: t61-9b-stronger-assertion.txt]
+
+=> EXACTLY THE FIVE INTENDED MASTER CHECKS AND THE TWO INTENDED NODE CHECKS
+MOVED, ON EVERY TARGET, AND NOTHING ELSE DID. That is the assertion section 0e
+called the one worth checking, and it holds with a zero exit code behind it.
+
+The six master FAILs that remain are precisely the ones section 0 declared out
+of scope, named rather than summarised:
+[FAIL] 1.1.12 Ensure that the etcd data directory ownership is set to etcd:etcd (Automated)
+[FAIL] 1.2.16 Ensure that the --audit-log-path argument is set (Automated)
+[FAIL] 1.2.17 Ensure that the --audit-log-maxage argument is set to 30 or as appropriate (Automated)
+[FAIL] 1.2.18 Ensure that the --audit-log-maxbackup argument is set to 10 or as appropriate (Automated)
+[FAIL] 1.2.19 Ensure that the --audit-log-maxsize argument is set to 100 or as appropriate (Automated)
+[FAIL] 1.2.30 Ensure that the --service-account-extend-token-expiration parameter is set to false (Automated)
+
+The two node FAILs that remain are the kind-inherent file-mode findings phase 5
+already classified as such:
+[FAIL] 4.1.1 Ensure that the kubelet service file permissions are set to 600 or more restrictive (Automated)
+[FAIL] 4.1.9 If the kubelet config.yaml configuration file is being used validate permissions set to 600 or more restrictive (Automated)
+
+------------------------------------------------------------
+7d) THE FULL-TEXT DIFF, READ AS A CHANGE LOG AND FULLY ACCOUNTED FOR
+------------------------------------------------------------
+
+Run as §9b requires, and every changed line is attributed rather than waved at:
+
+  target    changed   ps/audit detail   status+count   remediation advice
+  master      59            14              22           23  (all removed)
+  worker      19             0              12            7  (all removed)
+  worker2     19             0              12            7  (all removed)
+  arithmetic: 14+22+23 = 59 ; 0+12+7 = 19
+(exit code: 1 on all three, which is EXPECTED — new PIDs, new start times, new
+node addresses)
+
+The third column is kube-bench's own "== Remediations ==" prose, which it emits
+only for checks that are NOT passing. Zero such lines were ADDED on any target
+and 23 / 7 / 7 were REMOVED — they disappeared because the checks now pass. The
+`ps` detail lines are the section 2c noise class, e.g.
+< 	 root         664     439  6 12:49 ?        00:01:30 kube-apiserver --advertise-address=172.18.0.3 ...
+> 	 root         626     325  6 13:48 ?        00:01:11 kube-apiserver --advertise-address=172.18.0.4 ...
+[raw: t62-9b-fulltext-diff-analysis.txt, fulldiff-MASTER.txt,
+ fulldiff-WORKER.txt, fulldiff-WORKER2.txt]
+
+A method note, recorded because it produced a wrong number first: the initial
+decomposition used `grep -P` and this host answers
+`grep: -P supports only unibyte and UTF-8 locales`. The failed grep printed
+nothing, which the arithmetic then read as "0 unexplained lines" — a false pass
+manufactured by a broken tool. Redone with a literal tab. Both passes are in
+the raw file.
+
+------------------------------------------------------------
+7e) CLEANUP AND WHOLE-LAB FINAL STATE
+------------------------------------------------------------
+
+$ kubectl -n cis-benchmark delete job kube-bench-master
+job.batch "kube-bench-master" deleted from cis-benchmark namespace
+$ kubectl -n cis-benchmark delete ds kube-bench-node-ds
+daemonset.apps "kube-bench-node-ds" deleted from cis-benchmark namespace
+$ kubectl -n cis-benchmark get jobs,ds,pods
+No resources found in cis-benchmark namespace.
+$ kubectl get ns cis-benchmark
+cis-benchmark   Active   8m37s
+(exit code: 0 — namespace retained per the phase-5 convention)
+
+$ kubectl get pod,daemonset,job -A | grep -iE 'falco-smoke|psa-isolate|attack|probe|curl-test|unauth|authorized|target-pod' || echo NO_LEFTOVER_ATTACK_OBJECTS
+NO_LEFTOVER_ATTACK_OBJECTS
+(exit code: 0)
+[raw: t63-9d-cleanup.txt]
+
+$ kubectl get nodes
+seclab-control-plane   Ready   control-plane   22m   v1.35.5
+seclab-worker          Ready   <none>          22m   v1.35.5
+seclab-worker2         Ready   <none>          22m   v1.35.5
+
+$ kubectl get validatingpolicy,imagevalidatingpolicy
+disallow-latest-and-bare-tag     true
+disallow-privileged-containers   true
+require-drop-all-capabilities    true
+restrict-registries              true
+require-keyless-signed-ghcr      true          (all five READY=true)
+
+$ kubectl -n demo get deploy,pods -o wide
+deployment.apps/nginx        2/2   nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+deployment.apps/signed-app   1/1   ghcr.io/joesevv/k8s-security-lab/signed-app:b8483c5892a16afb16c1a15aaaa35b3c8436dd65@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
+pod/nginx-78c88678f4-8k5lb       1/1   Running   0   14m   seclab-worker
+pod/nginx-78c88678f4-xm7qh       1/1   Running   0   14m   seclab-worker2
+pod/signed-app-d9c5dfcbb-8mzkm   1/1   Running   0   13m   seclab-worker2
+
+$ kubectl get networkpolicy -n demo      -> all four present
+$ kubectl get sealedsecret,secret demo-app-secret -n demo
+sealedsecret.bitnami.com/demo-app-secret   True   8m15s
+secret/demo-app-secret   Opaque   1   7m15s
+
+$ kubectl -n falco get ds
+daemonset.apps/falco   3   3   3   3   3   docker.io/falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
+
+$ helm list -A
+falco           falco         1   deployed   falco-9.1.0            0.44.1
+kyverno         kyverno       1   deployed   kyverno-3.8.2          v1.18.2
+sealed-secrets  kube-system   1   deployed   sealed-secrets-2.19.1  0.38.4
+(exit code: 0 throughout)
+[raw: t64-9d-final-state.txt]
+
+=> THE LAB CAME BACK FROM GIT. Six phases of controls, one `kind delete`, and
+every layer is enforcing again with the same pinned artifacts.
+
+AND WHAT WAS NOT CONFIG-AS-CODE, WHICH IS HALF THE VALUE OF RUNNING THIS:
+  - THE FOUR CSR APPROVALS. `kubectl certificate approve` by hand, four times,
+    with logs/exec/top hard-down cluster-wide until they were done. Nothing in
+    this repo automates it and nothing in the cluster approves them.
+  - THE RE-SEAL. The controller generates a new RSA keypair on first start, so
+    the committed ciphertext was dead on arrival (section 6f proves it rather
+    than assuming it) and had to be regenerated by hand from a GITIGNORED
+    plaintext that exists only on this host. If that file were lost, the
+    credential would not come back from git — the repo is what protects the
+    secret from disclosure, not what preserves it.
+  - THE CONFIG FILE ITSELF NEEDED EDITING MID-DRILL. See section 3: the
+    committed kind-config.yaml did not build a cluster on the first, second or
+    third attempt. It does now, and the correction is committed, but "rebuilt
+    from git unattended" is not a claim this drill earned.
+
+============================================================
+8) PREDICTIONS RECONCILED — SECTION 0 vs WHAT HAPPENED
+============================================================
+
+Section 0 is not edited. This section marks it.
+
+  check    predicted        actual      verdict
+  1.2.15   FAIL -> PASS     PASS        HIT
+  1.3.2    FAIL -> PASS     PASS        HIT
+  1.4.1    FAIL -> PASS     PASS        HIT
+  1.2.5    FAIL -> PASS     PASS        HIT
+  1.2.11   WARN -> PASS     PASS        HIT
+  4.2.14   WARN -> PASS     PASS        HIT
+  4.2.13   WARN -> PASS     PASS        HIT
+  4.2.9    WARN -> WARN     WARN        HIT  (the load-bearing one)
+
+  master   51 / 6 / 49 / 0  ->  51 / 6 / 49 / 0   HIT
+  worker   19 / 2 /  4 / 0  ->  19 / 2 /  4 / 0   HIT
+  worker2  19 / 2 /  4 / 0  ->  19 / 2 /  4 / 0   HIT
+
+  "every check not in the target list is unchanged"  ->  HELD, exit code 0
+
+EIGHT OF EIGHT, AND THE COUNTS TO THE UNIT. The most useful of them is 4.2.9:
+section 0c predicted it would NOT move, explained why (serverTLSBootstrap
+removes tlsCertFile/tlsPrivateKeyFile rather than writing them, and the check
+reads the kubelet config FILE), and it did not move. Section 5c confirms the
+mechanism directly — both fields are absent from /var/lib/kubelet/config.yaml
+and from /configz on all three nodes. Meanwhile section 4e shows the posture
+genuinely improved. A scanner number that stays still while the cluster gets
+safer is the whole point of that prediction.
+
+------------------------------------------------------------
+8a) THE GROUND-TRUTH PROBES, WHICH ARE AUTHORITATIVE WHERE kube-bench IS NOT
+------------------------------------------------------------
+
+  check              probe                                    before        after       verdict
+  1.2.15/1.3.2/1.4.1 control-plane ps lines                   absent x3     --profiling=false x3   PASS
+  1.2.5              apiserver flag                           absent        present     PASS
+  1.2.5              logs broken -> approve -> logs work      n/a           proved x3   PASS
+  1.2.11             probe pod with no imagePullPolicy        IfNotPresent  Always      PASS
+  4.2.14             probe pod Seccomp_filters                1             2           PASS
+  4.2.9              serving-cert issuer x3                   per-node CA   CN=kubernetes  PASS
+  4.2.13             probe pod /sys/fs/cgroup/pids.max        18999         18999       *** DID NOT MOVE ***
+
+SEVEN OF THE SEVEN PROBES THAT MOVED, MOVED. THE EIGHTH DID NOT, AND THE
+RUNBOOK'S EXPECTED VALUE FOR IT (4096) IS WRONG.
+
+------------------------------------------------------------
+8b) THE ONE MISS: 4.2.13's GROUND-TRUTH PROBE READS THE WRONG CGROUP
+------------------------------------------------------------
+
+The check flipped WARN -> PASS, and correctly so: podPidsLimit: 4096 really is
+in /var/lib/kubelet/config.yaml, which is what the check reads. But the
+runbook's ground-truth probe — `cat /sys/fs/cgroup/pids.max` from inside the
+container — still returns 18999, the same value section 2g recorded as
+"unexplained". So the probe as designed cannot distinguish a working
+podPidsLimit from a broken one. The mechanism was found rather than guessed.
+
+FIRST, WHERE 18999 COMES FROM. It is systemd's default inside the kind node:
+
+$ docker exec seclab-worker sh -c 'systemctl show --property=DefaultTasksMax'
+DefaultTasksMax=18999
+$ docker exec seclab-worker sh -c 'cat /proc/sys/kernel/threads-max'
+threads-max=126663
+(exit code: 0 — systemd's documented default is DefaultTasksMax=15%, and
+126663 * 0.15 = 18999.45, truncating to 18999)
+
+That closes the section 2g open question: 18999 is not a kubelet value, not a
+Docker value and not kernel.pid_max. It is systemd's TasksMax default applied
+to the container scope, and it survived a full cluster rebuild because it is a
+property of the node image, not of the cluster.
+
+SECOND, WHERE 4096 ACTUALLY IS. Every pids.max in the node's cgroup tree,
+counted:
+     22 18999      (container scopes — systemd's DefaultTasksMax)
+      8 max        (unbounded parents, including the node root)
+      7 4096       (the POD slices — one per pod on the node)
+      1 126663     (kubelet-kubepods.slice)
+(exit code: 0)
+
+And pinned to this exact probe pod, by its own UID, so it is not a
+coincidence-of-numbers argument:
+
+  probe pod UID : 46f84866-c2cd-4aac-91c6-708a5115ee98
+  4096   /sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-besteffort.slice/kubelet-kubepods-besteffort-pod46f84866_c2cd_4aac_91c6_708a5115ee98.slice/pids.max
+  18999  .../kubelet-kubepods-besteffort-pod46f84866_c2cd_4aac_91c6_708a5115ee98.slice/cri-containerd-76da7055c4d8...scope/pids.max
+  18999  .../kubelet-kubepods-besteffort-pod46f84866_c2cd_4aac_91c6_708a5115ee98.slice/cri-containerd-2c5dc4247b19...scope/pids.max
+(exit code: 0)
+[raw: t41-pids-max-investigation.txt, t42-pids-max-pod-slice.txt]
+
+=> THE KUBELET APPLIES podPidsLimit AT THE POD SLICE, ONE LEVEL ABOVE THE
+CONTAINER. cgroup v2 enforces pids limits hierarchically, so 4096 is the
+binding limit for the pod as a whole regardless of the 18999 each container
+scope carries. The remediation IS in force; the probe was pointed one level too
+low. THE CORRECT PROBE for 4.2.13 is the pod slice's pids.max on the node, not
+`cat /sys/fs/cgroup/pids.max` from inside the container. The runbook's
+"expect 4096" for the in-container reading is wrong and is corrected there.
+
+This is worth stating plainly: had the drill accepted "4.2.13 flipped to PASS"
+as sufficient, the broken probe would never have been found. The check passing
+and the probe failing disagreed, and the disagreement was the finding.
+
+------------------------------------------------------------
+8c) OTHER PREDICTIONS AND EXPECTATIONS THAT MISSED
+------------------------------------------------------------
+
+These are runbook expectations rather than section 0 predictions, and all three
+are recorded because each one could have produced a false verification.
+
+  1. THE PATCH FORMAT. Section 2 wrote the patch in the v1beta4 list form on
+     the strength of the live ConfigMap being v1beta4. kind feeds kubeadm
+     v1beta3, where extraArgs is a map. Three failed creates. See section 3.
+  2. CONTINGENCY LADDER STEP (i) IS WRONG AND FAILS QUIETLY. Adding
+     `apiVersion: kubeadm.k8s.io/v1beta4` makes `kind create` succeed while
+     dropping the entire ClusterConfiguration patch. See section 3c.
+  3. THE TIER-2 GATE EXPECTED THREE CSRs AND AN x509 ERROR. There were FOUR
+     Pending kubelet-serving CSRs (the control plane files two), and the
+     failure mode is `remote error: tls: internal error` because the kubelet
+     has no serving certificate at all, not an x509 verification failure. See
+     sections 4a and 4b.
+
+And one non-prediction that reproduced exactly and is still unresolved:
+streamingConnectionIdleTimeout reads 0s in the kubelet config file and "4h0m0s"
+in /configz on all three nodes of a cluster built from scratch this morning.
+Section 2d recorded it on the old cluster; it is not drift or staleness. 4.2.5
+is not one of the eight targets, phase 5b changes nothing about it, and no
+committed document is edited here.

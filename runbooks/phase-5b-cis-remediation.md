@@ -409,7 +409,39 @@ remediation and the DR drill in one step.
 active the first pod creations really do pull, so CNI and DNS coming up is
 itself the first proof the §1c gate was correct.
 
-**Observed:** (pending — filled by the drill)
+**Observed — and it took four attempts. The committed config did not build a
+cluster.** Full transcript in evidence §3.
+
+`kind delete` succeeded in 4 seconds (exit code: 0). Then:
+
+1. **Attempt 1 FAILED** (exit code: 1). `kubeadm init` rejected the patch:
+   `error: json: cannot unmarshal array into Go struct field
+   APIServer.apiServer.ControlPlaneComponent.extraArgs of type
+   map[string]string`, preceded by
+   `your configuration file uses a deprecated API spec: "kubeadm.k8s.io/v1beta3"`.
+2. **Attempt 2** re-ran the same command with `--retain` so the failed node
+   survived and `/kind/kubeadm.conf` could be read rather than guessed at. Same
+   failure. The render shows **kind v0.32.0 emits `kubeadm.k8s.io/v1beta3`**,
+   in which `extraArgs` is a `map[string]string` — so §2's list form, chosen
+   because the live *ConfigMap* is v1beta4, was the wrong shape. kubeadm
+   converts on write; the ConfigMap says nothing about what kind feeds it. The
+   `KubeletConfiguration` patch landed fine on every attempt, because kind's own
+   kubelet document already is `kubelet.config.k8s.io/v1beta1`.
+3. **Attempt 3 applied contingency (i) verbatim and that made things worse.**
+   With `apiVersion: kubeadm.k8s.io/v1beta4` added, `kind create` exited **0**,
+   three nodes went Ready — and the patch matched no document, so kind
+   discarded it silently. The rendered config carried only kind's own
+   `runtime-config` and `enable-hostpath-provisioner`, and the running
+   apiserver had `--profiling` count 0, `--kubelet-certificate-authority`
+   count 0 and `--enable-admission-plugins=NodeRestriction`. That is the
+   pre-remediation control plane. **See the correction to §5c below.**
+4. **Attempt 4 succeeded** (exit code: 0, 28 seconds) after rewriting the
+   `extraArgs` blocks in the v1beta3 **map** form, which is now what
+   `clusters/kind-config.yaml` carries. Three nodes Ready.
+
+`AlwaysPullImages` did not obstruct bring-up — CNI, CoreDNS, kube-proxy and
+local-path-provisioner all pulled and ran, so contingency (iii) was never
+reached and §1c's green was real.
 
 ### 5a. The Tier-2 gate, IMMEDIATELY after create
 
@@ -429,7 +461,14 @@ automatically.
 — one per node. Zero CSRs means the KubeletConfiguration patch did not land and
 you are in contingency (ii).
 
-**Observed:** (pending — filled by the drill)
+**Observed: FOUR Pending `kubelet-serving` CSRs, not three** (exit code: 0).
+`seclab-control-plane` filed **two** of them (`csr-bx9x5` and `csr-httth`, 27s
+and 29s old); each worker filed one. The expectation above is therefore not a
+safe gate — **the safe gate is "at least one Pending `kubelet-serving` CSR per
+node, and approve every Pending one."** Three additional
+`kubernetes.io/kube-apiserver-client-kubelet` CSRs were already
+`Approved,Issued`; those are auto-approved by the controller manager and are
+not part of this gate. Evidence §4a.
 
 ```bash
 kubectl -n kube-system logs <any pod on any node>        # BEFORE approving
@@ -445,7 +484,30 @@ distinguish "the fix works" from "it was never broken".
 
 **Expected:** an x509 / certificate-verification error, non-zero exit.
 
-**Observed:** (pending — filled by the drill)
+**Observed: it fails on all three nodes, but NOT with an x509 error — and the
+real mechanism is stronger than the expected one.**
+
+```
+Error from server: Get "https://172.18.0.4:10250/containerLogs/kube-system/kube-proxy-66hvw/kube-proxy?tailLines=1": remote error: tls: internal error
+```
+
+(exit code: 1 — same shape on all three nodes, with each node's own IP;
+`kubectl top nodes` also fails, `error: Metrics API not available`.)
+
+The apiserver never gets as far as rejecting an untrusted certificate, because
+**there is no certificate to reject.** Probed directly on each node before any
+approval:
+
+```
+$ docker exec <node> sh -c 'echo | openssl s_client -connect localhost:10250 2>/dev/null | openssl x509 -noout -issuer -subject'
+Could not find certificate from <stdin>
+```
+
+(exit code: 1 on all three.) `serverTLSBootstrap: true` stops the kubelet
+self-signing and it has nothing to serve until its CSR is approved — contrast
+§4b, where every kubelet served a cert issued by its own ad-hoc CA. So the
+window between `kind create` and the approvals is a **hard cluster-wide outage**
+of logs/exec/top, not a degradation. Evidence §4b.
 
 ```bash
 kubectl certificate approve <each kubelet-serving CSR>
@@ -457,7 +519,30 @@ establish the other two.
 
 **Expected:** all three succeed, exit 0.
 
-**Observed:** (pending — filled by the drill)
+**Observed: all four CSRs approved, and logs work on every node.** The same
+three commands that had just failed:
+
+```
+$ kubectl -n kube-system logs kube-proxy-66hvw --tail=1     # seclab-control-plane
+I0730 13:49:11.765540       1 shared_informer.go:356] "Caches are synced" controller="endpoint slice config"
+$ kubectl -n kube-system logs kube-proxy-tn8bm --tail=1     # seclab-worker
+I0730 13:49:19.320539       1 shared_informer.go:356] "Caches are synced" controller="service config"
+$ kubectl -n kube-system logs kube-proxy-jhq54 --tail=1     # seclab-worker2
+I0730 13:49:18.963807       1 shared_informer.go:356] "Caches are synced" controller="endpoint slice config"
+```
+
+(exit code: 0 each; nothing changed between the two captures except the
+approvals.) All three nodes then Ready.
+
+**Two failed approval attempts are recorded in evidence §4c rather than
+dropped.** The first selected the CSR names with a Windows `python` one-liner,
+which emitted CRLF, and the CR rode into the resource name —
+`certificatesigningrequests.certificates.k8s.io "csr-5vgxk\r" not found`
+(exit code: 1) on three of four. The second stripped the CR but indexed the
+signer as awk `$2`; under `--no-headers` the columns are `NAME AGE SIGNERNAME
+...`, so it selected nothing and **exited 0** — the shape of a false pass, and
+the reason it is written down. The third, with `$3`, approved all three
+remaining CSRs at exit 0.
 
 ### 5b. Assert the flags actually landed
 
@@ -477,7 +562,27 @@ either is gone, the patch replaced kind's list instead of merging and the
 restatement in §2 failed — record it, because it is a real finding about how
 v1beta4 patches behave.
 
-**Observed:** (pending — filled by the drill)
+**Observed: every flag landed, and both regression checks pass.** Mechanical
+count over the three `ps` captures (full lines in evidence §5a):
+
+| item | count / value |
+| --- | --- |
+| `--profiling` | 3 |
+| `--profiling=false` | 3 |
+| `--kubelet-certificate-authority=/etc/kubernetes/pki/ca.crt` | 1 |
+| `--enable-admission-plugins` value | `NodeRestriction,AlwaysPullImages` |
+| **regression** `--runtime-config=` | 1 — still present |
+| **regression** `--enable-hostpath-provisioner=true` | 1 — still present |
+
+(exit code: 0 on all three.) The restatement in §2 **worked, and it was
+load-bearing**: evidence §3b shows the patch using *replace* semantics against
+kind's block, so without restating them both kind-injected entries would have
+been dropped and the rebuild would have silently removed the hostpath
+provisioner.
+
+Note the correction §2 needs: the merge semantics question was real, but the
+*format* reasoning was not. The patch has to match kind's **v1beta3** render,
+not the v1beta4 ConfigMap. See §5's Observed and evidence §3.
 
 ```bash
 kubectl -n kube-system get cm kubeadm-config -o yaml
@@ -488,7 +593,18 @@ kubectl -n kube-system get cm kubeadm-config -o yaml
 **Expected:** the `ClusterConfiguration` carries all four apiServer entries and
 both controllerManager entries.
 
-**Observed:** (pending — filled by the drill)
+**Observed: all four apiServer entries, both controllerManager entries and the
+scheduler entry are present** (exit code: 0) — `enable-admission-plugins`,
+`kubelet-certificate-authority`, `profiling`, `runtime-config` on the
+apiServer; `enable-hostpath-provisioner` and `profiling` on the controller
+manager; `profiling` on the scheduler.
+
+**And the two documents side by side are the whole §2 lesson.** The ConfigMap
+kubeadm *stored* is `kubeadm.k8s.io/v1beta4` with `extraArgs` as a **list**;
+the file kind *wrote* (`/kind/kubeadm.conf`) is `kubeadm.k8s.io/v1beta3` with
+`extraArgs` as a **map**. kubeadm converts on write. Reading the ConfigMap to
+decide the patch format — which is what §2 did — reads the output of the
+conversion, not its input. Evidence §5b.
 
 ```bash
 export MSYS_NO_PATHCONV=1
@@ -500,7 +616,27 @@ done
 **Expected:** `seccompDefault: true`, `podPidsLimit: 4096`,
 `serverTLSBootstrap: true` on all three.
 
-**Observed:** (pending — filled by the drill)
+**Observed:** all three, on all three nodes (exit code: 0 each).
+
+| field | control-plane | worker | worker2 | before (§4b) |
+| --- | --- | --- | --- | --- |
+| `seccompDefault` | true | true | true | false |
+| `podPidsLimit` | 4096 | 4096 | 4096 | -1 |
+| `serverTLSBootstrap` | true | true | true | absent |
+| `streamingConnectionIdleTimeout` | "4h0m0s" | "4h0m0s" | "4h0m0s" | "4h0m0s" |
+| `tlsCertFile` | **absent** | **absent** | **absent** | `/var/lib/kubelet/pki/kubelet.crt` |
+| `tlsPrivateKeyFile` | **absent** | **absent** | **absent** | `/var/lib/kubelet/pki/kubelet.key` |
+
+The kubelet config **file** — which is what kube-bench's 4.2.x checks actually
+read — carries `seccompDefault: true` and `podPidsLimit: 4096` on all three
+nodes, and carries **neither** `tlsCertFile` nor `tlsPrivateKeyFile`. That is
+precisely why 4.2.13 and 4.2.14 can move and 4.2.9 cannot.
+
+**`streamingConnectionIdleTimeout` reproduces the §4b contradiction exactly**:
+the file says `0s`, `/configz` says `"4h0m0s"`, on all three nodes of a cluster
+built from scratch this morning. So it is not drift and not staleness — it is
+how this kubelet behaves. Still not resolved here, still no committed document
+edited by this phase. Evidence §5c.
 
 ```bash
 export MSYS_NO_PATHCONV=1
@@ -514,7 +650,26 @@ done
 **Expected:** issuer is the cluster CA on all three, replacing the per-node
 `CN=<node>-ca@<epoch>` self-signed issuers recorded in §4b.
 
-**Observed:** (pending — filled by the drill)
+**Observed: the issuer flipped to the cluster CA on all three nodes.**
+
+```
+issuer=CN=kubernetes
+subject=O=system:nodes, CN=system:node:seclab-control-plane
+issuer=CN=kubernetes
+subject=O=system:nodes, CN=system:node:seclab-worker
+issuer=CN=kubernetes
+subject=O=system:nodes, CN=system:node:seclab-worker2
+```
+
+(exit code: 0 on all three.) And that the issuer really is the cluster CA is
+checked rather than inferred — `openssl x509 -in /etc/kubernetes/pki/ca.crt
+-noout -subject -issuer` returns `subject=CN=kubernetes` /
+`issuer=CN=kubernetes` (exit code: 0).
+
+Before: `CN=seclab-control-plane-ca@1784637412`,
+`CN=seclab-worker-ca@1784637429`, `CN=seclab-worker2-ca@1784637429` — three
+unrelated self-signed roots. **This is the only evidence 4.2.9 will ever have**,
+and §9b confirms the check itself did not move. Evidence §4e.
 
 ### 5c. Contingency ladder
 
@@ -523,11 +678,32 @@ re-run until it works and only the working run is written down is the exact
 fabrication class this repo exists to avoid. Both attempts go in the evidence
 file.
 
-- **(i) `kind create` errors on patch syntax.** Add an explicit `apiVersion` to
-  the failing patch document — `kubeadm.k8s.io/v1beta4` for the
+- **(i) `kind create` errors on patch syntax.** ~~Add an explicit `apiVersion`
+  to the failing patch document — `kubeadm.k8s.io/v1beta4` for the
   ClusterConfiguration patch, `kubelet.config.k8s.io/v1beta1` for the
-  KubeletConfiguration patch — and retry. Record **both** the failing and the
-  succeeding attempt, including the verbatim error.
+  KubeletConfiguration patch — and retry.~~ **THIS STEP IS WRONG AND WAS
+  CORRECTED BY THE 2026-07-30 DRILL. DO NOT DO IT.** Adding
+  `apiVersion: kubeadm.k8s.io/v1beta4` makes the patch match **no document** in
+  kind's render, so kind drops the entire patch, `kind create` exits **0**, all
+  three nodes go Ready, and the cluster comes up with **none** of the
+  apiServer/controllerManager/scheduler remediation. It converts a loud failure
+  into a silent one. Observed in full in evidence §3c.
+
+  **Do this instead.** Read the rendered config before changing anything:
+  re-run the failing create with `--retain`, then
+  `docker exec seclab-control-plane cat /kind/kubeadm.conf`, and write the
+  patch in the form that file actually uses. On kind v0.32.0 with this node
+  image that is `kubeadm.k8s.io/v1beta3`, where `extraArgs` is a
+  `map[string]string`, **not** the v1beta4 name/value list. Leave the
+  KubeletConfiguration patch alone — kind's own kubelet document is already
+  `kubelet.config.k8s.io/v1beta1` and it merges correctly with no `apiVersion`.
+
+  **And whatever the fix, verify the patch LANDED, not that the create
+  succeeded.** A green `kind create` is not evidence. Check
+  `/kind/kubeadm.conf`, the `kubeadm-config` ConfigMap, and the `ps` lines —
+  §5b does all three, and on the bad path §5b is the only thing that catches it.
+  Record **both** the failing and the succeeding attempt, including the verbatim
+  error.
 - **(ii) Tier-2 gate fails** — no CSRs appear, or `kubectl logs` is still
   broken minutes after approving all three. Recreate Tier-1-only: drop the
   `kubelet-certificate-authority` entry and the `serverTLSBootstrap` field,
@@ -579,7 +755,29 @@ the API probes later steps depend on.
    exemptions that are deliberately written down rather than inherited; do not
    let `helm install` or `kubectl apply` create these namespaces implicitly.
 
-**Observed:** (pending — filled by the drill)
+**Observed: every control came back, and every one was re-probed rather than
+assumed from a clean `apply`.** Full transcript in evidence §6.
+
+| # | control | bootstrap | the real probe |
+| --- | --- | --- | --- |
+| 1 | nginx + `demo` PSA | 4 objects created, rollout OK (0) | hardened curl pod → `200` (0) |
+| 2 | RBAC | `rbac/` applied (0) | no token dir in nginx pod (1); can-i matrix yes/yes/yes/no/no/no/no |
+| 3 | Kyverno 3.8.2 / v1.18.2 | 4 controllers 1/1, 0 restarts (0) | `policies.kyverno.io/v1` served |
+| 4-5 | 4 ValidatingPolicies | Audit → **PASS=4 FAIL=0** gate → Deny, all READY=true (0) | nginx still admits under Deny |
+| 6 | nine attacks | — | all 9 denied at exit 1; A–H name their Kyverno policy, I names `PodSecurity "restricted:v1.35"` |
+| 7 | supply chain | ivpol READY=true (0); signed-app on `sha256:7fd13d22…` | unsigned-but-real artifact denied (1); fail-closed 404 denied (1); nginx out-of-glob applies (0) |
+| 8 | NetworkPolicy | 4 policies, pods stayed Running (0) | `unauth` `HTTP:000 time=5.002283` exit 28; `authorized` `HTTP:200 time=0.002518` exit 0 |
+| 9 | `falco` + `cis-benchmark` ns | both from committed manifests (0) | PSA labels as written |
+
+Ordering held: `demo-kyverno-only` and the reports RBAC before the policies (no
+policy sat READY=false), Audit before Deny with the PASS=4 gate, and all of
+`network/` **after** the admission and supply-chain probes.
+
+One retry is recorded in evidence §6c: the ATTACK I counter-proof first failed
+with `error: the path "/tmp/tmp.vubDTd0Drg/attack-hostpath-root.yaml" does not
+exist` (exit code: 1) — the MSYS trap in reverse, an MSYS `/tmp` path handed to
+a Windows `kubectl.exe` with `MSYS_NO_PATHCONV=1` exported. Re-run with `cd`
+plus a relative filename, as phase-2b §3a does.
 
 ---
 
@@ -631,7 +829,43 @@ both are non-empty **before** the grep, and record the assertion.
 **Expected:** hashes match; the plaintext value appears nowhere in tracked
 files; the header is present above `apiVersion:` in the re-sealed file.
 
-**Observed:** (pending — filled by the drill)
+**Observed: all three, and the premise was demonstrated rather than assumed.**
+Full transcript in evidence §6f.
+
+The runbook asserts the committed ciphertext cannot be reused. That was
+**tested** by applying the old file first against the new controller:
+
+```
+$ kubectl get sealedsecret demo-app-secret -n demo
+demo-app-secret   no key could decrypt secret (db-password)   False   8s
+$ kubectl get secret demo-app-secret -n demo
+Error from server (NotFound): secrets "demo-app-secret" not found
+```
+
+(exit code: 1 on the Secret; `ErrUnsealFailed` event raised.) The fetched cert
+is genuinely new — `notBefore=Jul 30 14:02:39 2026 GMT`.
+
+After re-sealing and re-prepending the header:
+
+- `git diff --numstat` → `1	1` — **exactly one line changed, the ciphertext.**
+  32 lines before and after, line 21 still `apiVersion: bitnami.com/v1alpha1`,
+  header byte-identical to the block quoted above (`diff` exit code: 0), zero
+  CR bytes.
+- Applied → `sealedsecret … True`, `secret/demo-app-secret   Opaque   1`
+  (exit code: 0); controller log shows two `ErrUnsealFailed` then
+  `'Unsealed' SealedSecret unsealed successfully`.
+- **Round trip by digest, value never printed:** source
+  `2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c`,
+  in-cluster `2a8d0a93a6387c37cba8af645e0cf275c712f5542c4c8440c703bd057011769c`
+  — MATCH, and it is the same digest phase 3 recorded.
+- **The guard was checked before the greps were believed:** `${#B64}=44`,
+  `${#VAL}=31`, both non-empty. Positive control finds the value only in
+  `secrets/plain/demo-app-secret-plain.yaml`; all three searches of the
+  committed set and of history return **exit code 1, no match**; both paths
+  `git check-ignore`d.
+- **And the guard was proved load-bearing** by a deliberate negative control:
+  `git grep --untracked -n ""` matches **15244 lines and exits 0**. An unset
+  variable would have inverted this proof into an apparent clean bill of health.
 
 ---
 
@@ -667,7 +901,47 @@ appear in the Falco pod log on the node where the behaviour was triggered.
 Remember phase-6's own caveat — one kernel, three sensors, so divide event
 counts by three.
 
-**Observed:** (pending — filled by the drill)
+**Observed: driver resolved to `modern_ebpf` with no fallback, and both markers
+fired.** Full transcript in evidence §6g.
+
+Install used the verbatim flag set from `clusters/falco-install.md`, all eleven
+`--set` flags including `collectors.containerEngine.pluginRef`. DaemonSet 3/3
+Running, **0 restarts** on every pod.
+
+Driver proofs, only one of which is Falco's own word:
+
+| check | result |
+| --- | --- |
+| BTF on all three nodes | `-r--r--r-- 1 root root 6677359 /sys/kernel/btf/vmlinux`, identical on each |
+| Falco log | `Opening 'syscall' source with modern BPF probe.` and `/etc/falco/falco_rules.yaml \| schema validation: ok` |
+| running pod's own config | `engine:` / `kind: modern_ebpf` |
+| kernel module | `NO_FALCO_KMOD_LOADED` on all three nodes |
+| BPF objects in Falco PID 1 | 13 `bpf`, 14 `bpf-map`, 197 `bpf-prog` |
+| restarts | 0 / 0 / 0 |
+
+The pins held — falcoctl resolved **both** ghcr artifacts by digest
+(`falco-rules@sha256:36d143c0…` and `plugins/plugin/container@sha256:f3d531f3…`)
+with 2 × `Signature successfully verified`. No floating tag survived.
+
+Detection, against `demo/nginx-78c88678f4-8k5lb` on `seclab-worker`, read from
+the co-located sensor `falco-g8d62`:
+
+- `R3-DR-PRIMARY-MARKER` → `14:07:41.306012745: Notice A shell was spawned in a
+  container with an attached terminal`, `terminal=34816`, `user_uid=101`,
+  `k8s_ns_name=demo`. Window T0 `14:07:40.985619100Z` → T1 `14:07:41.461033300Z`
+  — the alert sits inside it.
+- `R3-DR-SHM-MARKER` → `14:07:41.640496274: Warning File execution detected from
+  /dev/shm`, `evt_res=SUCCESS`, `proc_exepath=/dev/shm/bb`. Window T0
+  `14:07:41.494076400Z` → T1 `14:07:41.673850800Z` — inside it. (The exec exited
+  127; that is busybox's own `applet not found` **after** it started, and
+  `evt_res=SUCCESS` is the independent confirmation the execve worked.)
+
+**One kernel, three sensors** reproduces: the same primary event appears in all
+three pods 2.45 ms apart end to end (`.306012745`, `.305097485`, `.303562132`)
+and only the co-located one resolves `container_name` / `k8s_*`; the other two
+read `<NA>`. Divide every count by three. The log is fresh, so the whole
+enumeration is exactly these two lines and both are this drill's. Staged payload
+removed afterwards (`cleaned-rc=0`).
 
 ---
 
@@ -686,7 +960,19 @@ kubectl -n cis-benchmark logs <each node-ds pod>
 **Purpose:** same manifests, same digest, same benchmark pin as the before-run.
 Nothing about the scanner changes, so the delta is the cluster.
 
-**Observed:** (pending — filled by the drill)
+**Observed:** (exit code: 0 throughout — Job Completed on
+`seclab-control-plane`, one DS pod per worker.)
+
+| target | before | predicted | **actual** |
+| --- | --- | --- | --- |
+| master | 46 / 10 / 50 / 0 | 51 / 6 / 49 / 0 | **51 / 6 / 49 / 0** |
+| node, `seclab-worker` | 17 / 2 / 6 / 0 | 19 / 2 / 4 / 0 | **19 / 2 / 4 / 0** |
+| node, `seclab-worker2` | 17 / 2 / 6 / 0 | 19 / 2 / 4 / 0 | **19 / 2 / 4 / 0** |
+
+(PASS / FAIL / WARN / INFO.) **Every predicted count is exact on all three
+targets.** Report lengths dropped 426→399 and 97→90 lines, which is kube-bench
+dropping the remediation-advice blocks for the checks that now pass — see §9b.
+Evidence §7a.
 
 ### 9b. The delta method — and the trap §4a already found
 
@@ -711,7 +997,52 @@ count lines. **Every other check must be unchanged** — that is the real
 assertion. 4.2.9 must still read `[WARN]`; if it flipped to `[PASS]`, the
 prediction in §3 was wrong and the reason needs finding, not celebrating.
 
-**Observed:** (pending — filled by the drill)
+**Observed: exactly five master status lines and exactly two per worker, and
+nothing else moved.**
+
+Master (exit code: 1 — five changes, plus the two count blocks):
+`1.2.5` FAIL→PASS, `1.2.11` WARN→PASS, `1.2.15` FAIL→PASS, `1.3.2` FAIL→PASS,
+`1.4.1` FAIL→PASS.
+Each worker (exit code: 1 — two changes, plus counts; the two workers' diffs
+are character-identical): `4.2.13` WARN→PASS, `4.2.14` WARN→PASS.
+
+**`4.2.9` still reads `[WARN]` on both workers.** The §3 prediction holds, and
+§5b's `/configz` capture shows the mechanism directly: `tlsCertFile` and
+`tlsPrivateKeyFile` are absent from the kubelet config file, which is what the
+check reads.
+
+**The stronger assertion, measured rather than eyeballed.** Restricting to
+`[STATUS]` lines only, so count lines cannot pad the number: master 10 changed
+lines = 5 checks out of 123; each worker 4 changed lines = 2 checks out of 29.
+Then masking the checks that were *supposed* to move and re-diffing:
+
+```
+$ diff <(before | grep -Ev '^\[[A-Z]+\] (1\.2\.5|1\.2\.11|1\.2\.15|1\.3\.2|1\.4\.1) ') <(after | same)
+(exit code: 0 — no output; every OTHER master check is byte-identical)
+$ diff <(before | grep -Ev '^\[[A-Z]+\] (4\.2\.13|4\.2\.14) ') <(after | same)
+(exit code: 0 on BOTH workers)
+```
+
+**The full-text diff is non-empty and every changed line is accounted for**
+(exit code: 1 on all three, which §4a predicted):
+
+| target | changed | `ps`/audit detail | status+count | remediation advice |
+| --- | --- | --- | --- | --- |
+| master | 59 | 14 | 22 | 23, all *removed* |
+| worker | 19 | 0 | 12 | 7, all *removed* |
+| worker2 | 19 | 0 | 12 | 7, all *removed* |
+
+14+22+23 = 59; 0+12+7 = 19. The third column is kube-bench's own
+`== Remediations ==` prose, emitted only for checks that are **not** passing —
+**zero were added on any target**; they only disappeared, because the checks now
+pass. The `ps` detail is the §4a noise class (new PIDs, new start times,
+`--advertise-address` 172.18.0.3 → 172.18.0.4).
+
+**A method failure is recorded because it manufactured a false pass.** The first
+decomposition used `grep -P`; this host answers `grep: -P supports only unibyte
+and UTF-8 locales`. The failed grep printed nothing, which the arithmetic then
+read as "0 unexplained lines". Redone with a literal tab — which is where the
+23 / 7 advice lines actually surfaced. Evidence §7b–§7d.
 
 ### 9c. Reconcile against the predictions
 
@@ -736,7 +1067,58 @@ Recreate the probe pod exactly as §4b's — `demo-kyverno-only`,
 `imagePullPolicy` field — so the three readings are comparable. Delete it
 afterwards.
 
-**Observed:** (pending — filled by the drill)
+**Observed: 8 of 8 predictions HIT, including the one predicted not to move.**
+The probe pod was recreated from a manifest proven byte-identical to §4b's
+(`diff` exit code: 0) and deleted afterwards.
+
+| check | predicted | actual | verdict |
+| --- | --- | --- | --- |
+| 1.2.15 / 1.3.2 / 1.4.1 | FAIL → PASS | PASS | HIT ×3 |
+| 1.2.5 | FAIL → PASS | PASS | HIT |
+| 1.2.11 | WARN → PASS | PASS | HIT |
+| 4.2.13 / 4.2.14 | WARN → PASS | PASS | HIT ×2 |
+| 4.2.9 | WARN → **WARN** | WARN | HIT |
+| master counts | 51 / 6 / 49 / 0 | 51 / 6 / 49 / 0 | HIT |
+| node counts ×2 | 19 / 2 / 4 / 0 | 19 / 2 / 4 / 0 | HIT |
+| "nothing else moves" | — | held, exit code 0 | HIT |
+
+Ground-truth probes:
+
+| check | probe | before | after |
+| --- | --- | --- | --- |
+| 1.2.15/1.3.2/1.4.1 | control-plane `ps` | absent ×3 | `--profiling=false` ×3 |
+| 1.2.5 | apiserver flag + logs flip | absent / n/a | present / proved on 3 nodes |
+| 1.2.11 | probe pod `imagePullPolicy` | `IfNotPresent` | **`Always`** |
+| 4.2.14 | probe pod `Seccomp_filters` | 1 | **2** |
+| 4.2.9 | serving-cert issuer ×3 | per-node self-signed | **`CN=kubernetes`** |
+| 4.2.13 | probe pod `/sys/fs/cgroup/pids.max` | 18999 | **18999 — DID NOT MOVE** |
+
+**THE 4.2.13 PROBE IN THE TABLE ABOVE IS WRONG, AND THE DRILL FOUND OUT WHY.**
+The check legitimately passes (`podPidsLimit: 4096` really is in
+`/var/lib/kubelet/config.yaml`), but reading `pids.max` from **inside the
+container** cannot see it. Mechanism, found not guessed:
+
+- `18999` is systemd's `DefaultTasksMax` inside the kind node —
+  `systemctl show --property=DefaultTasksMax` → `DefaultTasksMax=18999`, and
+  `threads-max` is `126663`; systemd's default is `15%`, and
+  126663 × 0.15 = 18999.45 → 18999. **That also closes §4b's "origin
+  undetermined" note**: it is a property of the node image, which is why it
+  survived a full rebuild unchanged.
+- `4096` is applied one level **up**, on the **pod** cgroup slice. Counted
+  across the whole node tree: 22 × `18999` (container scopes), 8 × `max`,
+  **7 × `4096` (the pod slices, one per pod on the node)**, 1 × `126663`.
+  Pinned to this exact probe pod by its own UID:
+  `…/kubelet-kubepods-besteffort-pod46f84866_c2cd_4aac_91c6_708a5115ee98.slice/pids.max`
+  = **4096**, while its two `cri-containerd-*.scope` children read `18999`.
+
+cgroup v2 enforces pids limits hierarchically, so 4096 binds the pod regardless.
+**The correct probe for 4.2.13 is the pod slice's `pids.max` on the node, not
+`cat /sys/fs/cgroup/pids.max` from inside the container.** The "expect 4096" in
+the table above is corrected here rather than in §0, which is not edited.
+
+Had the drill accepted "4.2.13 flipped to PASS" as sufficient, the broken probe
+would never have been found. The check passing and the probe failing disagreed,
+and the disagreement was the finding. Evidence §8a–§8b.
 
 ### 9d. Cleanup and whole-lab final state
 
@@ -749,7 +1131,20 @@ kubectl -n cis-benchmark get jobs,ds,pods
 **Expected:** `No resources found in cis-benchmark namespace.` Namespace
 retained, per the phase-5 convention. Probe pod gone.
 
-**Observed:** (pending — filled by the drill)
+**Observed:** as expected.
+
+```
+job.batch "kube-bench-master" deleted from cis-benchmark namespace
+daemonset.apps "kube-bench-node-ds" deleted from cis-benchmark namespace
+$ kubectl -n cis-benchmark get jobs,ds,pods
+No resources found in cis-benchmark namespace.
+$ kubectl get ns cis-benchmark
+cis-benchmark   Active   8m37s
+```
+
+(exit code: 0 throughout.) `demo-kyverno-only` is empty, and a cluster-wide
+sweep for leftover attack objects returns `NO_LEFTOVER_ATTACK_OBJECTS`
+(exit code: 0). Evidence §7e.
 
 Then the whole-lab final state in the phase-6 §5 style: every namespace, every
 policy, every DaemonSet and Deployment, with the point being that a cluster
@@ -758,4 +1153,35 @@ what did not come back.** Anything that needed a manual step (the CSR
 approvals, the re-seal against a new controller keypair) is not
 config-as-code, and the drill's value is partly in naming those.
 
-**Observed:** (pending — filled by the drill)
+**Observed: the lab came back.** (exit code: 0 throughout; evidence §7e.)
+
+- 3 nodes `Ready`, all `v1.35.5`.
+- All **five** policies `READY=true` — the four `ValidatingPolicy` in `[Deny]`
+  plus `require-keyless-signed-ghcr`.
+- `demo`: `nginx` 2/2 and `signed-app` 1/1, three pods Running, **0 restarts**,
+  both on their pinned digests (`…@sha256:0c79d56a…`, `…@sha256:7fd13d22…`).
+- All four NetworkPolicies present; `sealedsecret … True` with its `Secret`
+  materialised.
+- Falco DaemonSet 3/3 on `falco:0.44.1@sha256:d0cfe422…`.
+- Helm: `falco 9.1.0 / 0.44.1`, `kyverno 3.8.2 / v1.18.2`,
+  `sealed-secrets 2.19.1 / 0.38.4`.
+- Ten namespaces, including `cis-benchmark` and `falco` from their committed
+  manifests with their PSA exemptions intact.
+
+**AND WHAT WAS NOT CONFIG-AS-CODE — the part worth more than the green ticks:**
+
+1. **The four CSR approvals.** Done by hand, with `kubectl logs`, `exec` and
+   `top` hard-down cluster-wide until they were finished. Nothing in this repo
+   automates it and nothing in the cluster auto-approves `kubelet-serving`.
+2. **The re-seal.** The controller mints a new RSA keypair on first start, so
+   the committed ciphertext was dead on arrival — §7 proves that rather than
+   assuming it — and had to be regenerated by hand from a **gitignored**
+   plaintext that exists only on this host. If that file were lost the
+   credential would not come back from git. The repo protects the secret from
+   disclosure; it does not preserve it.
+3. **`clusters/kind-config.yaml` itself needed editing mid-drill.** It did not
+   build a cluster on the first, second or third attempt (§5). It does now, and
+   the fix is committed — but **"rebuilt from git unattended" is not a claim
+   this drill earned.** What it does now support is the narrower and more useful
+   claim: rebuilt from git, by a human who reads the output, in 27m53s of wall
+   clock — `kind delete` at 13:43:20Z, whole-lab final state at 14:11:13Z.
