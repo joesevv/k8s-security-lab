@@ -938,6 +938,7 @@ controllerManager:
     enable-hostpath-provisioner: "true"
 scheduler:
   extraArgs: null
+[CORRECTED — SEE SECTION 9: 10 lines were elided from this block with no marker]
 (exit code: 0 — only kind's own two entries survive: no profiling, no
 enable-admission-plugins, no kubelet-certificate-authority)
 [raw: t11-rendered-kubeadm-conf-SUCCESS.txt]
@@ -1712,6 +1713,7 @@ that trailing space is stripped here rather than committed into the file.
 Everything before it is byte-exact.)
 
 THE SHARED-KERNEL ARTIFACT REPRODUCES. One event, three sensors, 14.7 us apart,
+[CORRECTED — SEE SECTION 9: the spread is 2.45 ms, not 14.7 us]
 and only the co-located one has k8s metadata:
   falco-g8d62 (seclab-worker)        14:07:41.306012745  container_name=nginx  k8s_pod_name=nginx-78c88678f4-8k5lb  k8s_ns_name=demo
   falco-hzkbw (seclab-worker2)       14:07:41.305097485  container_name=<NA>   k8s_pod_name=<NA>  k8s_ns_name=<NA>
@@ -2073,6 +2075,7 @@ $ docker exec seclab-worker sh -c 'systemctl show --property=DefaultTasksMax'
 DefaultTasksMax=18999
 $ docker exec seclab-worker sh -c 'cat /proc/sys/kernel/threads-max'
 threads-max=126663
+[CORRECTED — SEE SECTION 9: label synthesized; the command prints a bare 126663]
 (exit code: 0 — systemd's documented default is DefaultTasksMax=15%, and
 126663 * 0.15 = 18999.45, truncating to 18999)
 
@@ -2121,6 +2124,7 @@ are recorded because each one could have produced a false verification.
   1. THE PATCH FORMAT. Section 2 wrote the patch in the v1beta4 list form on
      the strength of the live ConfigMap being v1beta4. kind feeds kubeadm
      v1beta3, where extraArgs is a map. Three failed creates. See section 3.
+     [CORRECTED — SEE SECTION 9: two creates failed; the third exited 0]
   2. CONTINGENCY LADDER STEP (i) IS WRONG AND FAILS QUIETLY. Adding
      `apiVersion: kubeadm.k8s.io/v1beta4` makes `kind create` succeed while
      dropping the entire ClusterConfiguration patch. See section 3c.
@@ -2136,3 +2140,218 @@ in /configz on all three nodes of a cluster built from scratch this morning.
 Section 2d recorded it on the old cluster; it is not drift or staleness. 4.2.5
 is not one of the eight targets, phase 5b changes nothing about it, and no
 committed document is edited here.
+
+============================================================
+9) CORRECTIONS — FOUND BY AN ADVERSARIAL PASS, 2026-07-30
+============================================================
+
+An adversarial verification pass whose explicit job was to REFUTE this file
+found four defects in it. Two of them were re-confirmed live against the still-
+running cluster before this section was written. The sections above are NOT
+rewritten. Each defect is corrected here, and each is marked in place at its own
+site with a one-line `[CORRECTED — SEE SECTION 9]` bracket so that a reader who
+skims cannot take the wrong text at face value. Those four bracket lines are the
+only edits made anywhere outside this section; they are a deliberate departure
+from strict append-only in the direction of MORE visibility, not less. Section 0
+is not touched. Every line number below refers to this file AS DELIVERED, which
+means it counts those four marker lines.
+
+No scanner number, check verdict or control status changes here. Three of the
+four are defects in the PRESENTATION of evidence for conclusions that survive
+intact; the fourth is a miscount that files this report's most useful finding
+under the wrong heading.
+
+------------------------------------------------------------
+9a) D1 — A FABRICATED EXHIBIT. LINES 2076-2077.
+------------------------------------------------------------
+
+As printed:
+
+  $ docker exec seclab-worker sh -c 'cat /proc/sys/kernel/threads-max'
+  threads-max=126663
+
+`cat` of a /proc file prints the file. It cannot print a key name. Re-run live
+on the same node on 2026-07-30, after this file was written:
+
+$ docker exec seclab-worker sh -c 'cat /proc/sys/kernel/threads-max'
+126663
+(exit code: 0 — seven bytes, confirmed with `od -c`: 1 2 6 6 6 3 \n)
+
+No command emits the printed form. The two that come closest do not:
+
+$ docker exec seclab-worker sh -c 'sysctl kernel.threads-max'
+kernel.threads-max = 126663
+$ docker exec seclab-worker sh -c 'sysctl -n kernel.threads-max'
+126663
+(exit code: 0 — neither is `threads-max=126663`. The label was synthesized.)
+
+WHY IT LOOKED PLAUSIBLE. The exhibit immediately above it, at lines 2074-2075,
+genuinely IS key=value, because that is what `systemctl show` emits:
+
+$ docker exec seclab-worker sh -c 'systemctl show --property=DefaultTasksMax'
+DefaultTasksMax=18999
+(exit code: 0 — re-run live 2026-07-30, byte-identical to line 2075)
+
+The fabricated line is the real one's neighbour, in its shape and its column.
+That is the whole mechanism.
+
+WHAT SURVIVES. All of the conclusion. 126663 is the correct value and is
+confirmed live above. 18999 is confirmed live as systemd's DefaultTasksMax.
+systemd's documented default is 15%, and 126663 * 0.15 = 18999.45, truncating
+to 18999. Section 8b's account of where 18999 comes from is unaffected; only
+its exhibit was manufactured.
+
+ADDENDUM, AND IT IS WORSE THAN THE EXHIBIT. The raw capture cited for this
+section carries the same synthesized labels. From
+r3-after-raw/t41-pids-max-investigation.txt, lines 9-12, verbatim:
+
+  $ docker exec seclab-worker sh -c 'cat /proc/sys/kernel/pid_max; cat /proc/sys/kernel/threads-max'
+  pid_max=4194304
+  threads-max=126663
+  (exit 0)
+
+That command prints two bare integers on two lines. Both values are correct —
+4194304 was re-read live on 2026-07-30 and is right — and both labels were
+added by hand.
+
+CONSEQUENCE, STATED PLAINLY. This file cites `[raw: ...]` throughout, and the
+entire value of a raw capture is that it is machine-written and therefore an
+independent check on the prose. At least one file in r3-after-raw/ is not
+purely machine-captured. Every `[raw: ...]` citation above is therefore a
+weaker check than the unqualified word "raw" implies. The scope is unmeasured:
+t41 was read line by line for this correction, the other captures in that
+directory were not audited for the same defect. The only readings whose
+standing is not in question are the ones re-derived from the cluster.
+
+------------------------------------------------------------
+9b) D2 — A UNITS ERROR THIS FILE ALREADY REFUTES. LINE 1715.
+------------------------------------------------------------
+
+As printed at line 1715:
+
+  THE SHARED-KERNEL ARTIFACT REPRODUCES. One event, three sensors, 14.7 us apart,
+
+Six lines below it, line 1721 carries the correct figure:
+
+  (exit code: 0 — .306012745 - .303562132 = 2,450,613 ns = 2.45 ms first-to-last.
+
+The gloss and the arithmetic in the same exhibit disagree by three orders of
+magnitude, and the arithmetic is right. All three pairwise spreads, computed
+from the timestamps exactly as printed at lines 1718-1720:
+
+  falco-g8d62 (worker)  - falco-hzkbw (worker2)  =   915,260 ns =   915.26 us
+  falco-hzkbw (worker2) - falco-lbrt9 (cp)       = 1,535,353 ns = 1,535.35 us
+  falco-g8d62 (worker)  - falco-lbrt9 (cp)       = 2,450,613 ns = 2,450.61 us
+
+First-to-last is 2.45 ms, about 2,450.6 us. No pair is 14.7 us apart, so the
+figure is not a mislabelled pairwise value either — it is wrong by a factor of
+about 167. The string `14.7` appears in no machine capture: grepped across all
+86 files in r3-after-raw/, its only occurrence is in append-s6.txt, the staged
+prose that became section 6 of this file. It was written, not measured.
+
+WHAT SURVIVES. The finding, entirely. One execve produced one alert in each of
+three Falco pods, and only the pod co-located with the workload carried
+container_name and k8s_pod_name, because all three sensors watch one kernel.
+The three timestamps at lines 1718-1720 are quoted from t56 and are correct,
+and the instruction to divide every Falco count in this lab by three stands. It
+was the gloss on the spacing that was wrong, not the observation.
+
+This is the nanosecond/microsecond class of error, which this repo has produced
+before. The runbook's own account of the same event, in
+runbooks/phase-5b-cis-remediation.md, says "2.45 ms apart end to end" and is
+correct; the defect is confined to line 1715.
+
+------------------------------------------------------------
+9c) D3 — AN UNMARKED ELISION IN THE HEADLINE EXHIBIT. LINES 931-940.
+------------------------------------------------------------
+
+Section 3c quotes `docker exec seclab-control-plane cat /kind/kubeadm.conf` as
+nine contiguous lines. The ClusterConfiguration document in the raw,
+r3-after-raw/t11-rendered-kubeadm-conf-SUCCESS.txt, is nineteen lines. Ten were
+removed with NO elision marker, in a file that marks elisions elsewhere — at
+lines 541-542, 877, 1230 and 1238, and line 877 is the same command on the
+previous attempt. The convention was broken at the point of maximum scrutiny: the
+exhibit for this report's most important finding.
+
+The full document, so that the removed material is on the record:
+
+$ docker exec seclab-control-plane cat /kind/kubeadm.conf
+apiServer:
+  certSANs:
+  - localhost
+  - 127.0.0.1
+  extraArgs:
+    runtime-config: ""
+apiVersion: kubeadm.k8s.io/v1beta3
+clusterName: seclab
+controlPlaneEndpoint: seclab-control-plane:6443
+controllerManager:
+  extraArgs:
+    enable-hostpath-provisioner: "true"
+kind: ClusterConfiguration
+kubernetesVersion: v1.35.5
+networking:
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/16
+scheduler:
+  extraArgs: null
+(exit code: 0 — the ClusterConfiguration document only; three further documents
+follow it in the same file, as at line 877)
+
+Elided at lines 931-940 without a marker: `certSANs` and its two entries,
+`clusterName`, `controlPlaneEndpoint`, `kind: ClusterConfiguration`,
+`kubernetesVersion`, and `networking` with its two entries. Ten lines.
+
+WHY THIS IS MORE THAN UNTIDINESS. As printed, the block reads as though
+ClusterConfiguration had LOST `kind:`, `clusterName`, `kubernetesVersion` and
+`networking` when the patch was dropped. It had not. Those are kind's own
+defaults, they were present on attempt 3 throughout, and the dropped patch cost
+exactly the apiServer, controllerManager and scheduler remediation and nothing
+else. The unmarked cut makes the damage look broader than it was, in an exhibit
+whose job is to show precisely how narrow and how silent the damage was.
+
+WHAT SURVIVES. Section 3c's finding, and it never rested on this exhibit. The
+v1beta4-labelled patch matched no document in kind's v1beta3 render and was
+discarded without a word, so `kind create` exited 0 on an unremediated control
+plane. That is confirmed independently of the config file by
+r3-after-raw/t12-attempt3-ps-UNREMEDIATED.txt, quoted at lines 948-952, which
+reads the RUNNING PROCESSES: --profiling count 0,
+--kubelet-certificate-authority count 0, and
+--enable-admission-plugins=NodeRestriction with AlwaysPullImages count 0. The
+conclusion is unchanged.
+
+------------------------------------------------------------
+9d) D4 — A MISCOUNT IN THE SUMMARY. LINE 2126.
+------------------------------------------------------------
+
+As printed at line 2126:
+
+  v1beta3, where extraArgs is a map. Three failed creates. See section 3.
+
+Two creates failed. The exit codes, read from the raws:
+
+  attempt 1  t5-kind-create.txt                    exit 1  FAILED
+  attempt 2  t6-kind-create-attempt2-retain.txt    exit 1  FAILED
+  attempt 3  t10-kind-create-attempt3-v1beta4.txt  exit 0  SUCCEEDED, patch dropped
+  attempt 4  t16-kind-create-attempt4-SUCCESS.txt  exit 0  SUCCEEDED, remediated
+
+Section 3c has it right at line 924 — "a clean green create" — and so does the
+runbook, which records attempt 3 as exiting 0. Only the section 8c summary gets
+it wrong, and it gets it wrong in the expensive direction. Attempt 3 is not a
+failed create; it is a create that exited 0, brought up three Ready nodes and
+silently discarded the entire ClusterConfiguration patch. That is the single
+most useful result in this report, and filing it under "failed creates" is
+exactly the reading that would let the next run miss it. Section 8c's own next
+bullet says so, two lines further down.
+
+=> AN ADVERSARIAL PASS FOUND ANOTHER INSTANCE OF THIS PROJECT'S OLDEST FAILURE
+MODE — A PLAUSIBLE-LOOKING VALUE THAT NO COMMAND EMITS — IN A FILE WRITTEN THE
+SAME DAY BY AGENTS WHO WERE EXPLICITLY WARNED ABOUT IT. The same class is on
+the record in phase 6, where an earlier revision recorded "a string the command
+cannot emit" and had to withdraw it (docs/evidence/phase-6-falco/
+attack-output.txt, around line 834). Nothing clever found it here either:
+mechanical diffing of the prose against the raw captures, plus one live re-run
+on the still-running cluster. That is what the workflow's verification step is
+for, and this pass also showed the check is not free — one of the raw captures
+it diffs against carries hand-added labels of its own, which is a defect in the
+checking apparatus rather than in the prose.

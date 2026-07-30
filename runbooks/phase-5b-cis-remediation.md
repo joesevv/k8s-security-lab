@@ -1251,7 +1251,8 @@ config-as-code, and the drill's value is partly in naming those.
    credential would not come back from git. The repo protects the secret from
    disclosure; it does not preserve it.
 3. **`clusters/kind-config.yaml` itself needed editing mid-drill.** It did not
-   build a cluster on the first, second or third attempt (§5). It does now, and
+   build a remediated cluster on the first, second or third attempt (§5) — the
+   third built one, which is the whole problem. It does now, and
    the fix is committed — but **"rebuilt from git unattended" is not a claim
    this drill earned.** What it does now support is the narrower and more useful
    claim: rebuilt from git, by a human who reads the output, in 27m53s of wall
