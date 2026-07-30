@@ -154,6 +154,7 @@ Runbooks with the full command logs, all in [`../runbooks/`](../runbooks/):
 [`phase-3-secrets.md`](../runbooks/phase-3-secrets.md),
 [`phase-4-supply-chain.md`](../runbooks/phase-4-supply-chain.md),
 [`phase-5-cis-benchmark.md`](../runbooks/phase-5-cis-benchmark.md),
+[`phase-5b-cis-remediation.md`](../runbooks/phase-5b-cis-remediation.md),
 [`phase-6-falco.md`](../runbooks/phase-6-falco.md).
 
 What is **not** in these diagrams — no encryption at rest, no audit log, no
