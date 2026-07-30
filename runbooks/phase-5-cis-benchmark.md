@@ -15,6 +15,14 @@ closes a coverage gap and nothing else; the phase still enforces nothing.
 Commands are in execution order; each has a one-line purpose and the observed
 output.
 
+**This runbook is a record of the cluster on those two dates and is not
+rewritten to match later work.** On 2026-07-30 phase 5b targeted eight of the
+checks triaged in section 3, rebuilt the cluster from
+`clusters/kind-config.yaml`, and moved seven of them to PASS. Where a claim
+here has been superseded or withdrawn since, a dated amendment says so on the
+spot and points to `runbooks/phase-5b-cis-remediation.md`; the original
+observations are left where they are.
+
 Host: Windows 11 + Docker Desktop (WSL2). Commands were run from Git Bash
 unless noted. Kubernetes node image v1.35.5, kube-bench v0.15.6
 (`docker.io/aquasec/kube-bench:v0.15.6@sha256:861900910eec...`), CIS config
@@ -465,21 +473,47 @@ Two separate things follow, and only one of them is about tooling.
 - **The methodological point.** A kube-bench PASS is not proof of compliance.
   This one is an artifact of a string-versus-integer comparison, which is why
   the defensible figure is "63 checks kube-bench scored as passing".
-- **The finding.** `0s` is the live value on all three nodes, and `0s`
-  disables the timeout entirely: idle `exec`, `attach` and `port-forward`
-  streams are never reaped, so a session left open holds a kubelet stream
-  indefinitely. That is a real open gap on this cluster, and it is NOT
-  remediated. It sits outside the 30 evaluated non-passing checks triaged in
-  3c only because kube-bench scored it PASS.
+- **The finding, narrowed.** `0s` is what `/var/lib/kubelet/config.yaml`
+  contains on all three nodes; that half was read directly and holds. It is
+  NOT remediated. It sits outside the 30 evaluated non-passing checks triaged
+  in 3c only because kube-bench scored it PASS.
+
+**AMENDED 2026-07-30 — the runtime consequence this bullet used to assert is
+WITHDRAWN.** It read that `0s` disables the timeout entirely, so idle `exec`,
+`attach` and `port-forward` streams are never reaped and a session left open
+holds a kubelet stream indefinitely. That was inferred from the file value and
+never observed, and a second reading disagrees with it: the kubelet's own
+`/configz` reports `streamingConnectionIdleTimeout` as `4h0m0s` on all three
+nodes — on the cluster this phase scanned
+(`docs/evidence/phase-5b-cis-remediation/attack-output.txt` §2d) and again on
+the cluster rebuilt from scratch on 2026-07-30, so it is not drift or staleness
+(§5c, §8c)
+— while the kubelet runs with no `--streaming-connection-idle-timeout` flag
+that would explain the difference. Both readings stand and neither is
+discarded. **Which of them governs a live stream is unreconciled and OPEN:** no
+experiment was run against an actual idle `exec`, `attach` or `port-forward`
+stream, on either cluster. A zero duration being defaulted away by the kubelet
+would account for the gap, but nothing here establishes that — it is unverified
+inference, in the same class as the paragraph below, and not a finding. Phase
+5b did not target 4.2.5 and changed nothing about it: the file still reads `0s`
+on the rebuilt cluster (§5c). Current status is threat model §6.12 item 5 and
+`runbooks/phase-5b-cis-remediation.md`.
+
+**The false PASS above is a separate fact and none of this weakens it.**
+kube-bench compares `noteq 0` against the string `"0s"` and therefore scores
+PASS on the value the check exists to forbid. That is a defect in the scoring,
+and it holds whatever the running kubelet does with the value.
 
 **Where `0s` came from is UNVERIFIED.** The working note behind this phase
 asserts it is kind's doing and that kubeadm defaults to `4h0m0s`, but no
 command was ever run to establish either half, and this is the one triage
 input in the phase with no probe behind it. It is recorded as unverified
-rather than repeated as fact. It would also not change the finding if it were
-true: this phase keeps 4.1.1 / 4.1.9 and 1.1.12 as real findings precisely
-because "it is the installer's default" is not a defence, and the same
-standard applies here.
+rather than repeated as fact. (The 2026-07-30 `/configz` reading above is not
+the missing command: it reports what the running kubelet holds, not where the
+file's `0s` came from nor what kubeadm would have written instead.) It would
+also not change the finding if it were true: this phase keeps 4.1.1 / 4.1.9
+and 1.1.12 as real findings precisely because "it is the installer's default"
+is not a defence, and the same standard applies here.
 
 **3c. The triage.** Every one of the 30 evaluated non-passing checks is
 classified in the evidence file, in three buckets, undocumented first because
@@ -490,6 +524,23 @@ that is the only part that is new information:
 | **Real, NOT previously documented** | 20 | 1.2.5 (no `--kubelet-certificate-authority`) and 4.2.9 (kubelet serves a self-signed cert) are the loudest and are two halves of one gap; 1.2.1 anonymous auth, confirmed by observation not inference; 1.2.30, 4.2.14 (no `seccompDefault`), 4.2.13 (no `podPidsLimit`), 1.2.11 (`AlwaysPullImages`), 1.2.15 / 1.3.2 / 1.4.1 (`--profiling`), 1.2.9, 4.1.1 / 4.1.9 (mode 644 want 600) and 1.1.9, the same class but found by probe rather than by the scanner, 1.1.12, 1.2.3, 1.2.29, 4.2.12, and two weak ones kept honest rather than flattered away, 1.2.20 and 1.3.1 |
 | **Real, ALREADY documented** | 7 | 1.2.16-1.2.19 and 3.2.1 → threat model §6.2, no audit logging; 1.2.27 and 1.2.28 → §6.1, no encryption at rest for etcd. The scanner independently rediscovering two written concessions is corroboration that they are real |
 | **Kind-inherent, not findings** | 3 | 1.1.10 (CNI ownership) and 4.1.3 / 4.1.4 (proxy kubeconfig). In all three the WARN is for ABSENCE OF DATA, not a bad value. This bucket held four until a probe moved 1.1.9 out of it |
+
+**Amended 2026-07-30 — eight checks in the first row have moved since, and the
+classification itself is NOT revised.** Every parenthesis above describes the
+cluster as it stood on 2026-07-26. Phase 5b targeted 1.2.5, 1.2.11, 1.2.15,
+1.3.2, 1.4.1, 4.2.13 and 4.2.14, and all seven are PASS on the 2026-07-30 run.
+4.2.9 was targeted too and did not move, as phase 5b predicted in writing:
+`serverTLSBootstrap: true` makes each kubelet serve a certificate issued by the
+cluster CA instead of the per-node self-signed one described above, but the
+check reads `tlsCertFile` / `tlsPrivateKeyFile` out of the kubelet config file
+and that setting REMOVES those fields rather than writing them — the trust root
+changed while the scanner number stood still, and neither reading alone is the
+whole truth. Mask those checks out (five on the master target, two on each
+worker) and the status-line diff of the before and after reports is empty on
+all three targets, so nothing else in this table moved in either direction:
+`docs/evidence/phase-5b-cis-remediation/attack-output.txt` §7b-7c (exit code:
+0 — no output) and §8. None of the other real findings in this table was
+remediated; threat model §6.12 carries the current status of each.
 
 Each classification was turned from a guess into an observation by a probe,
 run read-only against the live nodes. "That's just kind" is exactly the excuse
@@ -562,11 +613,21 @@ done
 #    information disclosure, not access.
 ```
 
-**Nothing above was remediated.** Threat model §6.3 concedes "no CIS
-remediation"; running the scanner does not discharge that concession, it only
-itemises it. The honest amendment §6.3 earns is that kube-bench now reports
-against CIS and the findings are recorded rather than unknown — not that the
-gap is closed.
+**Nothing above was remediated by this phase.** Threat model §6.3 concedes the
+node- and kernel-hardening gap that the CIS findings land on; running the
+scanner does not discharge that concession, it only itemises it. The honest
+amendment §6.3 earns from this phase is that kube-bench now reports against CIS
+and the findings are recorded rather than unknown — not that the gap is closed.
+
+**Amended 2026-07-30: phase 5b later remediated a subset.** The words "no CIS
+remediation" are no longer in §6.3. It now says "CIS remediation is no longer
+none", and in the next breath "A benchmark still measures a gap rather than
+closing it, so what closed anything here was a configuration change and not the
+scan" — which is the same distinction this section draws, kept after the
+change. Nothing in sections 0-4 above has been rewritten to match: they are
+what the 2026-07-26 scan saw, on the cluster as it stood that day. Which of
+these checks moved on 2026-07-30, which did not, and what is still open are in
+`runbooks/phase-5b-cis-remediation.md` and threat model §6.12.
 
 Full verbatim captures — both complete reports, the demo-namespace rejection,
 the five ground-truth probes, the false PASS and the classification of every

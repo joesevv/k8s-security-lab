@@ -175,7 +175,54 @@ claimed, in its own header, "No extraPortMappings and no `kubeadmConfigPatches`
 by design" — that sentence is now false and has been removed. The
 `extraPortMappings` half is still true and is still stated.
 
+**This is what is committed** — `kubeadmConfigPatches` reproduced from
+`clusters/kind-config.yaml` byte for byte, comments included. It is the
+**v1beta3 map form**, and that is not a style choice; the block after it is
+what happens otherwise. Copy from here:
+
 ```yaml
+kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        # restated from kind's own injection, see header
+        runtime-config: ""
+        # CIS 1.2.15
+        profiling: "false"
+        # CIS 1.2.11 — NodeRestriction is kubeadm's default and is restated so
+        # that adding AlwaysPullImages does not drop it
+        enable-admission-plugins: NodeRestriction,AlwaysPullImages
+        # CIS 1.2.5
+        kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
+    controllerManager:
+      extraArgs:
+        # restated from kind's own injection, see header
+        enable-hostpath-provisioner: "true"
+        # CIS 1.3.2
+        profiling: "false"
+    scheduler:
+      extraArgs:
+        # CIS 1.4.1
+        profiling: "false"
+  - |
+    kind: KubeletConfiguration
+    # CIS 4.2.14
+    seccompDefault: true
+    # CIS 4.2.13
+    podPidsLimit: 4096
+    # improves CIS 4.2.9 — requires per-node CSR approval after boot
+    serverTLSBootstrap: true
+```
+
+**And this is the form this section FIRST wrote, which does not work.** It is
+kept because it is what §3b-3d is about — the failure is the finding — but it
+is a counter-example, NOT something to copy:
+
+```yaml
+# DO NOT COPY — this v1beta4 list form failed `kind create` at kubeadm init:
+#   error: json: cannot unmarshal array into Go struct field
+#   APIServer.apiServer.ControlPlaneComponent.extraArgs of type map[string]string
 kubeadmConfigPatches:
   - |
     kind: ClusterConfiguration
@@ -199,25 +246,21 @@ kubeadmConfigPatches:
       extraArgs:
       - name: profiling
         value: "false"
-  - |
-    kind: KubeletConfiguration
-    seccompDefault: true
-    podPidsLimit: 4096
-    serverTLSBootstrap: true
 ```
 
-**The block above is the form this section first wrote, and the drill disproved
-the premise behind it.** The reasoning was that the live kubeadm-config
-ConfigMap is `kubeadm.k8s.io/v1beta4`, in which `extraArgs` is a **list** of
-name/value pairs, so the patch had to be a list too. It does not follow: kind
-renders `/kind/kubeadm.conf` at `kubeadm.k8s.io/v1beta3`, where `extraArgs` is
-a map, and kubeadm converts and stores the ConfigMap in its newest version
-afterwards — so reading that ConfigMap says nothing about the form this file
-must be written in. The list form failed `kind create`, and labelling the patch
-`v1beta4` made it fail silently instead. The committed
-`clusters/kind-config.yaml` carries the **v1beta3 map form**. §5b's Observed
+**The drill disproved the premise behind it.** The reasoning was that the live
+kubeadm-config ConfigMap is `kubeadm.k8s.io/v1beta4`, in which `extraArgs` is a
+**list** of name/value pairs, so the patch had to be a list too. It does not
+follow: kind renders `/kind/kubeadm.conf` at `kubeadm.k8s.io/v1beta3`, where
+`extraArgs` is a map, and kubeadm converts and stores the ConfigMap in its
+newest version afterwards — so reading that ConfigMap says nothing about the
+form this file must be written in. The list form failed `kind create`, and
+labelling the patch `v1beta4` made it fail silently instead. §5b's Observed
 block and evidence §3b-3d hold the failures and the correction, and the file's
-own header explains it; it is not re-derived here.
+own header explains it; it is not re-derived here. The `KubeletConfiguration`
+patch is identical in both blocks apart from its comments and was never the
+problem: kind's own kubelet document already is `kubelet.config.k8s.io/v1beta1`
+and matched it (evidence §3b).
 
 **Purpose of the two entries that are not remediation at all** —
 `runtime-config: ""` and `enable-hostpath-provisioner: "true"`, which kind
@@ -249,17 +292,32 @@ npx --yes js-yaml@4 clusters/kind-config.yaml            # outer document
 npx --yes js-yaml@4 <each extracted kubeadmConfigPatches entry>
 ```
 
-**Observed:** the outer document parses (exit code: 0) and yields
-`kubeadmConfigPatches` as a 2-element array of strings. Each of the two strings
-was written to a temp file and parsed on its own — patch 1 yields
-`ClusterConfiguration` with `apiServer.extraArgs` of 4 name/value objects,
-`controllerManager.extraArgs` of 2 and `scheduler.extraArgs` of 1; patch 2
-yields `{kind: KubeletConfiguration, seccompDefault: true, podPidsLimit: 4096,
-serverTLSBootstrap: true}` with `true` parsed as boolean and `4096` as integer
-(exit code: 0 for both). The three node `image:` lines are byte-identical to
-the previous revision — `git diff` shows no changed line containing `image:` or
-the digest — and the file contains zero CR bytes, as `.gitattributes` requires
-for `*.yaml`.
+**Observed — and read which revision this parsed.** It ran before the drill,
+against the **superseded v1beta4 list** revision, not the committed block
+above; "4 name/value objects" is the tell. It is kept as the record of the
+check actually made at the time, and it is exactly the check that did not catch
+the problem: valid YAML was never the question, and a clean parse is not
+evidence the form is the one kubeadm will accept. The outer document
+parses (exit code: 0) and yields `kubeadmConfigPatches` as a 2-element array of
+strings. Each of the two strings was written to a temp file and parsed on its
+own — patch 1 yields `ClusterConfiguration` with `apiServer.extraArgs` of 4
+name/value objects, `controllerManager.extraArgs` of 2 and
+`scheduler.extraArgs` of 1; patch 2 yields `{kind: KubeletConfiguration,
+seccompDefault: true, podPidsLimit: 4096, serverTLSBootstrap: true}` with
+`true` parsed as boolean and `4096` as integer (exit code: 0 for both). The
+three node `image:` lines are byte-identical to the previous revision — `git
+diff` shows no changed line containing `image:` or the digest — and the file
+contains zero CR bytes, as `.gitattributes` requires for `*.yaml`.
+
+**The committed map form was parsed too, after the correction** (evidence
+§3d): patch 1 then yields `apiServer.extraArgs` as a **map** —
+`{"runtime-config": "", "profiling": "false", "enable-admission-plugins":
+"NodeRestriction,AlwaysPullImages", "kubelet-certificate-authority":
+"/etc/kubernetes/pki/ca.crt"}` — with `controllerManager` and `scheduler` in
+the same shape, patch 2 unchanged (exit code: 0). The node `image:` lines and
+the zero-CR property held across that edit as well. What actually settled the
+question was `kind create` succeeding on attempt 4 and `/kind/kubeadm.conf`
+being read back, not the parse.
 
 **Note the `#` comments inside the block scalars.** They are literal text as far
 as the outer YAML is concerned and comments as far as kubeadm's and the
