@@ -341,6 +341,7 @@ out.
 | `automountServiceAccountToken: false` on `nginx-sa` / `signed-app-sa` | [`workloads/nginx/01-serviceaccount.yaml`](../workloads/nginx/01-serviceaccount.yaml) | T1552.007 Container API (F — no token exists in the pod to abuse); T1078 Valid Accounts (P) |
 | NetworkPolicy default-deny ingress **and** egress + label-gated allows | [`network/`](../network/) | T1046 Network Service Discovery (F, within `demo` — a pod may reach only CoreDNS:53 and, if labelled `access=nginx`, nginx:8080; the (F) is for *connection-based* discovery: [`network/10-allow-dns.yaml`](../network/10-allow-dns.yaml) opens 53/UDP+TCP to CoreDNS for every pod in `demo`, so cluster-wide service **name** enumeration survives — A3 notes both pods resolve DNS); T1613 Container and Resource Discovery (P — removes the API-server path); T1496 Resource Hijacking (P — a miner in `demo` has no egress to reach a pool) |
 | sealed-secrets: only ciphertext in Git, strict namespace/name scope | [`secrets/demo-app-sealedsecret.yaml`](../secrets/demo-app-sealedsecret.yaml) | T1552.001 Unsecured Credentials: Credentials In Files (F, for this repo's committed set and its history) |
+| Kubelet `seccompDefault: true` — the runtime's default syscall filter applied by the kubelet rather than by a namespace label (phase 5b, 2026-07-30) | [`clusters/kind-config.yaml`](../clusters/kind-config.yaml) | T1611 Escape to Host (P — it narrows the syscall surface an escape can reach, and it does so on all three nodes rather than in `demo` only: the field is set in every node's kubelet config and `/configz`, and a probe pod that requested **no** profile was measured loading a second filter, `Seccomp_filters` 1 → 2. No escape was tested against it, and §6.3 still stands — this is not a MAC profile and not a second kernel) |
 
 Outside this table: the CI signing path also addresses **T1195.002 Compromise
 Software Supply Chain**, which is an Enterprise technique (Linux/Windows/macOS)
@@ -356,6 +357,25 @@ mitigation: it blocks no technique, and this table's rule is that only
 techniques justified by what is actually enforced get listed. A scan that
 changed no manifest mitigates nothing, so the findings it produced are recorded
 as residual risk in §6.12 instead.
+
+Phase 5b earns exactly **one** row, and the count is the interesting part. It
+did change the cluster's configuration on 2026-07-30, so the reasoning above
+does not dispose of it — but of the eight settings it landed (§6.12) only
+`seccompDefault` clears this table's bar, which is a technique ID this document
+can defend inside the ATT&CK for Containers matrix *and* an enforced effect
+this lab measured. The rest were considered and left out rather than rounded
+up. `podPidsLimit` bounds PID exhaustion, which is Endpoint Denial of Service —
+an Enterprise technique whose place in the Containers matrix this document is
+not sure enough of to cite, and T1496 Resource Hijacking is not what a PID
+ceiling stops. `--kubelet-certificate-authority` with `serverTLSBootstrap` is
+the strongest of the eight in security terms and still gets no row: what it
+answers is adversary-in-the-middle on the API server → kubelet path, nothing of
+that kind was demonstrated here, and the same matrix-membership doubt applies.
+`AlwaysPullImages` forces a pull rather than refusing a deployment, so neither
+T1610 nor T1204.003 would be honest, and reading it as T1525 would stretch
+"implant internal image" to cover a node's local image cache. `--profiling=false`
+closes an endpoint no technique in this matrix names. A wrong technique ID is
+worse than a missing row.
 
 Phase 6 has deliberately **no row here either**, for a different reason.
 Falco does engage with runtime techniques — it matches the syscalls and names
@@ -386,17 +406,26 @@ key-management surface that would obscure the layers the lab is actually about.
 In production this is table stakes and would be a KMS provider, not a local key.
 
 **6.2 No audit logging.** Verified: no `--audit-policy-file` and no
-`--audit-log-path` on the API server.
-[`clusters/kind-config.yaml`](../clusters/kind-config.yaml) is bare by design —
-no `kubeadmConfigPatches`, no `extraMounts`. **Why:** wiring audit into kind
-means patching kubeadm and host-mounting a policy file and a log path into the
-control-plane node, which is cluster-lifecycle plumbing rather than a security
-control, and it would dominate the phase-1 runbook. **Consequence, stated
+`--audit-log-path` on the API server — 1.2.16–1.2.19 were still FAIL on the
+2026-07-30 run, after the phase-5b rebuild (§6.12).
+[`clusters/kind-config.yaml`](../clusters/kind-config.yaml) is no longer bare:
+since 2026-07-30 it carries `kubeadmConfigPatches`, the ones phase 5b used to
+set control-plane flags and kubelet fields. It still carries no `extraMounts`.
+**Why:** wiring audit into kind means patching kubeadm **and** host-mounting a
+policy file and a log path into the control-plane node; phase 5b did the first
+half and deliberately not the second, because the mount is where the failure
+mode is — a control plane that will not boot. **That weakens the reason this
+item used to give, and the weakening is written down rather than deleted:** the
+old argument was that audit was excluded because it is cluster-lifecycle
+plumbing rather than a security control, and that argument is thinner now that
+the file does carry kubeadm patches. What is left of it is the mount, not the
+patch. **Consequence, stated
 plainly:** there is no record of *who did what* to this cluster. Every denial in
 this document is a preventive control; none of them is detective. Phase 5's
 kube-bench run (§6.12) does not change that: a point-in-time configuration scan
 is neither preventive nor detective — it observes posture once, on request, and
-would not notice an action taken against this cluster a second later. Phase 6's
+would not notice an action taken against this cluster a second later. Phase 5b
+changed configuration, not logging, so it does not change it either. Phase 6's
 Falco (§6.4, §6.13) changes that only in part, and not in the direction this
 item is about: it is genuinely detective, but it watches syscalls on the nodes,
 not requests at the API server, so it still records nothing about *who called
@@ -405,15 +434,25 @@ trace on this cluster either way, and Falco's own output is a container's
 stdout — not queryable, not retained, not an audit trail.
 
 **6.3 No node or kernel hardening.** No AppArmor or SELinux profile beyond
-`seccompProfile: RuntimeDefault`, no gVisor or Kata, and no CIS remediation: as
-of 2026-07-26 kube-bench does now report against CIS (§6.12), but a benchmark
-measures a gap and does not close it, and not one finding it raised has been
-remediated. Two of its results land directly on this item and were not
-documented before the scan: the kubelets set no `seccompDefault` (4.2.14), so
-`RuntimeDefault` is applied only where a PSA `restricted` label puts it — that
-is `demo` alone, per §6.7 — and no `podPidsLimit` is set (4.2.13). All three
-nodes are containers on one shared WSL2 kernel. **Consequence:** a kernel-level
-escape that gets past PSA lands on the host directly — there is no second wall.
+`seccompProfile: RuntimeDefault`, no gVisor or Kata, and all three nodes are
+containers on one shared WSL2 kernel. CIS remediation is no longer none. A
+benchmark still measures a gap rather than closing it, so what closed anything
+here was a configuration change and not the scan: on 2026-07-30 phase 5b set
+`seccompDefault: true` and `podPidsLimit: 4096` in the kubelet configuration of
+every node (§6.12), which is exactly the pair of results that landed on this
+item — 4.2.14 and 4.2.13, both WARN → PASS. The seccomp half is the meaningful
+one here, and the change is narrow enough to state exactly. `RuntimeDefault`
+used to be applied only where a PSA `restricted` label put it — that is `demo`
+alone, per §6.7 — and it is now the kubelet's **default** on all three nodes:
+the profile a pod gets when it asks for none. Read as ground truth
+rather than off the flag: a probe pod declaring no profile goes from
+`Seccomp_filters: 1` to `Seccomp_filters: 2`, a second filter loaded above the
+one every process in a kind node inherits from Docker. The PID half bounds
+fork-bomb blast radius at the pod cgroup slice. **Both narrow this gap; neither
+closes it.** A default syscall filter is not a mandatory-access-control profile
+and not a second kernel, and no escape was tested against it. **Consequence:** a
+kernel-level escape that gets past PSA and past that filter lands on the host
+directly — there is no second wall.
 Since 2026-07-29 a kernel-level eBPF probe watches that same shared kernel
 (§6.4), so such an escape would stand a chance of being *seen*. It is still not
 a second wall: seeing is not stopping, nothing reads the alert, and the probe
@@ -506,14 +545,28 @@ Kyverno here. Production would invert this — match cluster-wide and carve out
 explicit system-namespace exclusions. Two namespaces now make that concrete
 rather than hypothetical: `cis-benchmark` (§6.12) and, since 2026-07-29,
 `falco`, which is labelled `pod-security.kubernetes.io/enforce: privileged` and
-holds the most privileged workload on this cluster (§6.13).
+holds the most privileged workload on this cluster (§6.13). Phase 5b does not
+bear on this item, and it is worth saying so rather than letting a reader infer
+otherwise: `seccompDefault` and `podPidsLimit` are set on every node rather than
+in one namespace, but they are kubelet settings and not policies — no namespace
+selector changed, no scanner-shaped exception was built, and kube-bench still
+runs in `cis-benchmark` outside both layers.
 
 **6.8 kind is not production.** One host, one kernel, one etcd, a single
 non-HA control plane, and no real multi-tenancy. Nothing here says anything
 about behaviour under node failure, control-plane partition, or a hostile
-co-tenant. `NodeRestriction` is enabled and authorization is `Node,RBAC`
-(verified), but that is kubeadm's default, not a hardening decision this lab
-made.
+co-tenant — the 2026-07-30 rebuild was a deliberate teardown, not a failure,
+and it tests recovery from git rather than resilience. `NodeRestriction` is
+enabled and authorization is `Node,RBAC` (verified), and `Node,RBAC` is
+kubeadm's default rather than a hardening decision this lab made.
+`NodeRestriction` is now written by name in
+[`clusters/kind-config.yaml`](../clusters/kind-config.yaml), but it is restated
+there only to keep kubeadm's default alive while `AlwaysPullImages` is added
+beside it (§6.12) — the lab owns the line without having chosen the plugin.
+What the lab did choose in that file, on 2026-07-30, is `AlwaysPullImages`,
+`--profiling=false`, `--kubelet-certificate-authority` and three kubelet
+fields. That is a small set of real hardening decisions in a file that
+previously made none; it does not make kind production.
 
 **6.9 As of 2026-07-25 the two-job CI split has run five times, all on one day;
 the build is not reproducible.** Run `30174855073` (2026-07-25) was the **first
@@ -618,18 +671,21 @@ enforces. And push protection guards only **future** pushes — nothing already
 public can be retracted, the same retroactive property that makes asset 2
 dangerous.
 
-**6.12 The CIS benchmark surfaced real gaps, and recording them is all this lab
-did about them.** On 2026-07-26 kube-bench v0.15.6, pinned to `--benchmark
+**6.12 The CIS benchmark surfaced real gaps; phase 5b closed the subset that is
+one line of cluster configuration each, and the rest are still open.** On
+2026-07-26 kube-bench v0.15.6, pinned to `--benchmark
 cis-1.12`, scored the cluster 63 PASS / 12 FAIL / 56 WARN. Take none of those
 three numbers at face value: 38 of the WARNs were never evaluated (27 are
 `type: manual` checks with no audit command, 11 shell out to `kubectl` from a
 Pod holding no ServiceAccount token), leaving 30 checks that actually ran and
 did not pass, and 4.2.5 is a demonstrable false PASS — it compares `noteq 0`
-against the string `0s` while every node really does set
-`streamingConnectionIdleTimeout: 0s`. So the honest reading of the PASS column
+against the string `0s`, and `0s` is what `/var/lib/kubelet/config.yaml` really
+contains on every node. So the honest reading of the PASS column
 is "checks kube-bench scored as passing", not "controls verified compliant".
-Two separate facts live in that one check: the scoring is wrong, and the value
-it mis-scores is itself an open gap — item 5 below. Seven results restate gaps
+Two separate facts live in that one check: the scoring is wrong, and what that
+file value means for the running kubelet is a second question this section used
+to answer with more confidence than the evidence supports — item 5 below.
+Seven results restate gaps
 already conceded here — audit logging (1.2.16–1.2.19, 3.2.1 → §6.2) and
 encryption at rest (1.2.27, 1.2.28 → §6.1) — which is corroboration, not news.
 Three more are artifacts of kind rather than findings (1.1.10, 4.1.3, 4.1.4:
@@ -640,59 +696,153 @@ reads the kubelet's `--cni-conf-dir` flag (kind's kubelets set none) and
 `/var/lib/cni/networks` (which does not exist here), so it never looked at the
 file kind actually writes. Reading that file directly turns an absence of data
 into a real finding — item 7. The remainder were genuinely undocumented before
-this scan. The ones that matter, loudest first:
+this scan.
 
-1. **The API server does not verify kubelet serving certificates.**
-   `--kubelet-certificate-authority` is absent (1.2.5, FAIL, confirmed on the
-   control-plane node) and the kubelets present self-signed serving certs
-   (4.2.9 — no `tlsCertFile` / `tlsPrivateKeyFile`). The apiserver → kubelet
-   channel is therefore encrypted but not authenticated in the direction that
-   matters, and anything able to occupy that path can present any certificate.
-   This is the most serious thing the scan found.
+**What changed on 2026-07-30.** Phase 5b wrote eight settings into
+[`clusters/kind-config.yaml`](../clusters/kind-config.yaml) and rebuilt the
+cluster from that file as a full DR drill
+([evidence](evidence/phase-5b-cis-remediation/attack-output.txt),
+[runbook](../runbooks/phase-5b-cis-remediation.md)). Seven of the eight checks
+it targeted flipped to PASS; the eighth, 4.2.9, was predicted in writing not to
+move and did not. The master target went from 46 PASS / 10 FAIL / 50 WARN / 0
+INFO to **51 / 6 / 49 / 0** and each worker from 17 / 2 / 6 / 0 to
+**19 / 2 / 4 / 0**, and with the seven intended checks masked out a status-line
+diff of the before and after reports is empty on all three targets — nothing
+else moved in either direction. Each item below carries its own status and the
+date it was read. None of it was closed by the scan; the scan is only what
+measured it.
+
+The ones that matter, loudest first:
+
+1. **The API server did not verify kubelet serving certificates. Since
+   2026-07-30 it does.** `--kubelet-certificate-authority` was absent (1.2.5,
+   FAIL, confirmed on the control-plane node) and each kubelet presented a
+   serving certificate it had signed itself, under a per-node ad-hoc CA
+   (`issuer=CN=seclab-worker-ca@1784637429` and two like it), so the
+   apiserver → kubelet channel was encrypted but not authenticated in the
+   direction that matters. That was the most serious thing the scan found, and
+   it is the one phase 5b answered most completely: the flag is now
+   `--kubelet-certificate-authority=/etc/kubernetes/pki/ca.crt` on the apiserver
+   process line, 1.2.5 is PASS, and with `serverTLSBootstrap: true` every
+   kubelet serves a certificate issued by the cluster CA `CN=kubernetes` with an
+   `O=system:nodes` subject. The proof is behavioural rather than textual:
+   between the rebuild and the CSR approvals `kubectl logs` failed on all three
+   nodes with `remote error: tls: internal error`, and each node's logs started
+   working the moment that node's kubelet-serving CSR was approved. **Two
+   residuals.** The approvals are manual — nothing in this repo and nothing in
+   the cluster approves a kubelet-serving CSR — so every rebuild has a window in
+   which logs, exec and top are down cluster-wide, and the drill found four
+   Pending CSRs on three nodes rather than the three it expected. And 4.2.9
+   still WARNs, correctly: the check reads `tlsCertFile` / `tlsPrivateKeyFile`
+   out of the kubelet config file, and `serverTLSBootstrap` removes those fields
+   rather than writing them. The scanner number stood still while the trust root
+   under it changed; neither reading on its own is the whole truth, which is why
+   both are recorded here.
 2. **Anonymous auth is on** (1.2.1) — observed, not inferred: unauthenticated
    `GET /version` and `GET /healthz` both return HTTP 200 and disclose exact
    `gitVersion`, `gitCommit` and `buildDate`, which is enough to match this
    cluster against public CVE lists. It is bounded — `GET /api/v1/secrets`
    returns 403, so RBAC still holds on real resources — and it is kubeadm's
    default, but it is free reconnaissance and this lab has not turned it off.
-3. **`AlwaysPullImages` is not enabled** (1.2.11), which bears on phase 4: a pod
-   can run an image already cached on a node without holding credentials to
-   pull it, so both the registry allow-list and the signature gate assume a
-   pull that may not occur.
+   **Unchanged by phase 5b**, and left alone on purpose: kubeadm's own bootstrap
+   and kind's readiness probing lean on anonymous auth while the cluster comes
+   up, so turning it off is a real risk to a rebuild rather than a one-line
+   patch. The rebuilt apiserver's process line carries no `--anonymous-auth`
+   flag (2026-07-30), so kubeadm's default still applies; the unauthenticated
+   HTTP 200s themselves were observed on 2026-07-26 and were not re-run after
+   the rebuild.
+3. **`AlwaysPullImages` was not enabled** (1.2.11); since 2026-07-30 it is. The
+   finding was a wrong-*value* one rather than a missing flag —
+   `--enable-admission-plugins=NodeRestriction` was already there and simply did
+   not list the plugin — and the value now reads
+   `NodeRestriction,AlwaysPullImages`, with 1.2.11 PASS. What proves the plugin
+   is live rather than merely named: a pod created with no `imagePullPolicy`
+   field is now stored with `Always`, where the identical pod on the old cluster
+   was defaulted to `IfNotPresent`. The gain is narrow and worth stating
+   narrowly. It bears on phase 4 because a pod could previously run an image
+   already cached on a node without a pull, so the registry allow-list and the
+   signature gate assumed a pull that might not happen; that pull now happens.
+   It does not widen what the signature gate checks, and it costs availability —
+   a cluster with this plugin on can only start pods whose images a registry
+   will actually serve, which is why the setting was gated on first pulling
+   kind's four side-loaded system images (CNI, local-path provisioner,
+   kube-proxy, CoreDNS) from a real registry, with a bogus tag pulled first as
+   the negative control. Had any of the four failed, the entry would have been
+   omitted entirely.
 4. **`--service-account-extend-token-expiration` is not false** (1.2.30), so
    service-account tokens outlive the bound lifetime their manifests imply —
    directly relevant to §3.3 and to A1, whose whole premise is a borrowed
-   token.
-5. **Three kubelet settings leave a protection off.** `seccompDefault` and
-   `podPidsLimit` are unset (4.2.14, 4.2.13) — the first is §6.3's gap, the
-   second leaves per-pod PID-exhaustion denial of service unbounded. And
-   `streamingConnectionIdleTimeout` is `0s`, read out of
-   `/var/lib/kubelet/config.yaml` on all three nodes on 2026-07-29 (4.2.5):
-   `0s` disables the timeout, so an idle `exec`, `attach` or `port-forward`
-   stream is never reaped and stays open until something else closes it. This
-   is the check kube-bench scores as a false PASS; the mis-scoring and the gap
-   are two facts, and this is the gap.
-6. **Profiling endpoints are exposed** on the API server (1.2.15), controller
-   manager (1.3.2) and scheduler (1.4.1). The latter two are mitigated by
-   `--bind-address=127.0.0.1`; the API server's is not.
-7. **Lower severity, recorded for completeness:** no `EventRateLimit` admission
+   token. **Unchanged by phase 5b:** still FAIL on the 2026-07-30 run, and
+   outside that phase's scope by decision rather than by oversight.
+5. **Three kubelet settings left a protection off; two of them are now on.**
+   `seccompDefault` and `podPidsLimit` were unset (4.2.14, 4.2.13) — the first
+   is §6.3's gap, the second left per-pod PID-exhaustion denial of service
+   unbounded. Both are set on every node since 2026-07-30 (`seccompDefault:
+   true`, `podPidsLimit: 4096`) and both checks are PASS on both workers. Where
+   the PID limit binds is worth recording, because the obvious probe reads the
+   wrong number: 4096 is on the **pod cgroup slice**, while each container scope
+   inside that slice still reads 18999 — systemd's `DefaultTasksMax` in the kind
+   node image, not a kubelet value at all. cgroup v2 enforces the limit
+   hierarchically, so the pod as a whole is capped at 4096; it was the
+   disagreement between a passing check and a failing in-container probe that
+   found this. **The third is unchanged, and its consequence is now stated with
+   less confidence than before, because two readings of it disagree.**
+   `/var/lib/kubelet/config.yaml` contains `streamingConnectionIdleTimeout: 0s`
+   on all three nodes (4.2.5, read 2026-07-29 and read again on the cluster
+   rebuilt 2026-07-30). The kubelet's own `/configz` reports the effective value
+   as `4h0m0s` on all three nodes, on the old cluster and on the new one, and
+   the kubelet is not started with a `--streaming-connection-idle-timeout` flag
+   that would explain the difference. Both readings are recorded; neither is
+   discarded. What is **no longer claimed** is the consequence this item used to
+   assert — that an idle `exec`, `attach` or `port-forward` stream is never
+   reaped. The file value says that, `/configz` contradicts it, and no
+   experiment was run on a live stream to settle which governs. (That a
+   zero-duration value is defaulted away by the kubelet is a plausible reading
+   and is **unverified inference**, not a finding.) The false PASS is a separate
+   fact and stands unchanged: kube-bench compares `noteq 0` against the string
+   `0s`, which is a scoring defect whatever the kubelet does with the value.
+6. **Profiling endpoints were exposed** on the API server (1.2.15), controller
+   manager (1.3.2) and scheduler (1.4.1). The latter two were mitigated by
+   `--bind-address=127.0.0.1`; the API server's was not. **Closed 2026-07-30:**
+   `--profiling=false` is on all three process lines and all three checks are
+   PASS. One limit on that claim, since it is the easiest place here to say more
+   than was done — the flags were read off the process lines and scored by
+   kube-bench, and **no request was made to a profiling endpoint before or
+   after**. This is a configuration change verified as configuration, not an
+   endpoint observed to have gone away.
+7. **Lower severity, recorded for completeness, and none of it remediated:** no
+   `EventRateLimit` admission
    plugin (1.2.9); the kubelet service file and `config.yaml` are mode 644 where
-   CIS asks for 600 (4.1.1, 4.1.9), and `/etc/cni/net.d/10-kindnet.conflist` is
+   CIS asks for 600 (4.1.1, 4.1.9 — still FAIL on both workers on 2026-07-30),
+   and `/etc/cni/net.d/10-kindnet.conflist` is
    mode 644 on all three nodes for the identical reason (1.1.9, read directly
    off the nodes 2026-07-29 — owner `root:root`, which is what 1.1.10 asks for,
    and the directory above it is mode 700 `root:root`, so only root on the node
    reaches the file today); the etcd data directory is `root:root` rather than
-   `etcd:etcd` (1.1.12 — mode 700 passes, so the intent is met, and kubeadm runs
+   `etcd:etcd` (1.1.12 — still FAIL on 2026-07-30; mode 700 passes, so the
+   intent is met, and kubeadm runs
    etcd as a root static pod); `DenyServiceExternalIPs` is off (1.2.3); and
    `--request-timeout`, both cipher-suite checks and
    `--terminated-pod-gc-threshold` sit at defaults (1.2.20, 1.2.29, 4.2.12,
-   1.3.1).
+   1.3.1). Every one of these checks reported the same status before and after
+   the rebuild. The 1.1.9 file-mode reading is from the pre-rebuild cluster and
+   was not repeated afterwards, and the defect behind it is unchanged: that
+   check's audit never reads the file kind actually writes.
 
-**Consequence, stated plainly:** every item above is still true of the running
-cluster. Nothing was remediated, no manifest changed, and no evidence directory
-shows any of them closed. That is the correct outcome for a measurement phase,
-but it makes this section a list of open gaps rather than a changelog, and
-items 1 and 2 would be the first things to fix on a cluster that mattered.
+**Consequence, stated plainly:** items 2, 4 and 7 are still true of the running
+cluster; items 1, 3, 5 and 6 are now wholly or partly closed, by a
+configuration change committed to `clusters/kind-config.yaml` and applied by
+rebuilding the cluster from it on 2026-07-30 — not by anything the benchmark
+did. This section is therefore a changelog and a list of open gaps at the same
+time, and the open half is the larger one: **6 FAIL and 49 WARN remain on the
+master target and 2 FAIL / 4 WARN on each worker as of 2026-07-30**. Item 2,
+anonymous auth, is now the first thing to fix on a cluster that mattered, with
+audit logging (§6.2) the gap that would hurt most during an incident. Nothing
+here was granted an exception to move a number: no scanner-shaped exception was
+built, and kube-bench still runs in `cis-benchmark` outside both enforcement
+layers (§6.7). Every count and status in this section is the 2026-07-30
+reading, so a later scan or a later rebuild makes them incomplete rather than
+false.
 **Two scope caveats, one of them now closed.** The node scan of 2026-07-26
 produced a single Pod, which ran on `seclab-worker`; `seclab-worker2` was not
 scanned by kube-bench at all, so the node-level findings rested on the scanner
@@ -701,16 +851,23 @@ re-run as a DaemonSet
 (`docs/evidence/phase-5-cis/daemonset-kube-bench-node.yaml`), which schedules
 one Pod per eligible node. Both workers were scanned, and both returned 17 PASS
 / 2 FAIL / 6 WARN / 0 INFO — reports that are byte-identical to the 2026-07-26
-Job's once glog timestamps are stripped (evidence §8). That closed a
+Job's once glog timestamps are stripped (evidence §8) — those are the
+pre-remediation figures, and the same DaemonSet returns 19 / 2 / 4 / 0 on both
+workers after the 2026-07-30 rebuild. That closed a
 **coverage** gap and nothing else: no item above was remediated by it, and a
-DaemonSet of scanners enforces nothing. The second caveat stands unchanged:
+DaemonSet of scanners enforces nothing. The second caveat stands, amended:
 4.2.5 and 1.1.9, which items 5 and 7 record from a **direct read** of all three
 nodes rather than from the scan, are still direct reads. The DaemonSet run
 reproduced 4.2.5's false PASS on both workers without re-testing the value
 behind it, and it says nothing at all about 1.1.9, which is a `master`-target
-check. And per §6.8, a kind cluster passes and fails a great many CIS checks
+check. 4.2.5's direct read was repeated on the cluster rebuilt 2026-07-30 and
+reproduced exactly — the file's `0s` and `/configz`'s `4h0m0s`, on all three
+nodes — while 1.1.9's was not repeated at all. And per §6.8, a kind cluster
+passes and fails a great many CIS checks
 because of what kubeadm chose, not because of a hardening decision this lab
-made — the scan measures the substrate at least as much as it measures the lab.
+made — the scan measures the substrate at least as much as it measures the lab,
+and the eight settings phase 5b added are a narrow exception to that rather
+than a rebuttal of it.
 
 **6.13 The runtime sensor is itself privileged, ungated and unwatched.** §6.4
 records what phase 6 bought and what it does not do with it; this item records
@@ -777,10 +934,16 @@ surface this lab has taken on. Six things, none of them remediated.
    cluster with three kernels the enrichment behaviour would be different.
 6. **Nothing retains the alerts.** Restated from §6.4 because it is the
    load-bearing limit and the easiest one to forget: stdout only, no shipper,
-   no store, no page. Each pod's log holds three alert lines from the
+   no store, no page. Each pod's log held three alert lines from the
    2026-07-29 attack window — the two documented above plus an earlier,
    unrecorded shell-spawn rehearsal at `15:12:42.954798594` — and every one of
-   them survives exactly as long as a container log does.
+   them survived exactly as long as a container log does, which the 2026-07-30
+   rebuild then demonstrated instead of arguing: `kind delete` destroyed the
+   Falco pods and the logs that were the alerts' only home. On the reinstalled
+   sensor, the co-located pod's log was enumerated whole and holds exactly two
+   lines, both of them the DR drill's own re-run. The 2026-07-29 lines went with
+   the containers that wrote them, and by this item's own terms there was
+   nowhere else for them to be.
 
 **Consequence, stated plainly:** this cluster can now see a category of attack
 it previously could not, and can still do nothing about it — while carrying a
