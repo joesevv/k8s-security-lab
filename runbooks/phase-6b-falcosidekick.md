@@ -28,9 +28,16 @@ footnotes:**
    stands unamended: Falco detects and does not prevent. The attack in
    section 4 succeeded, printed its output and exited 0, exactly as both
    phase 6 behaviours did. 6b earns **no row** in the threat model's
-   Control → ATT&CK table for the same reason phase 6 earned none. The single
-   sentence 6b makes false is phase 6's *"the line's next hop does not
-   exist"*. Everything else in phase 6's runbook is still true.
+   Control → ATT&CK table for the same reason phase 6 earned none. What 6b
+   does falsify is broader than one sentence: it retires every present-tense
+   output-channel reading in phase 6's runbook — the header's "routed,
+   stored", caveat 2's pipeline list, the `http_output: false` /
+   `json_output: false` readings and *"the line's next hop does not exist"*,
+   "no rule name is printed anywhere", and "the retention model is: none".
+   Those readings are preserved there as the pre-upgrade state and marked at
+   each site — see the dated pointer under phase 6's title. What that runbook
+   says that 6b leaves standing: nothing is blocked, nobody is paged, and
+   there is no Talon, no rota and no owner.
 2. **Still NOBODY IS PAGED.** falcosidekick ships integrations for Slack,
    Teams, PagerDuty, Opsgenie, SMTP and dozens more. **Exactly one output is
    enabled and it is the in-cluster Web UI** — proved in section 6 from

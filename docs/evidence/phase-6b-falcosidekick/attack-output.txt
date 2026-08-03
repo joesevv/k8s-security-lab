@@ -771,6 +771,9 @@ drwxr-xr-x 1 root root 4096 Aug  3 18:36 ..
    in 60 s". This lab produced 4 changes in about 6 minutes, which meets none
    of them. THERE IS NO dump.rdb. Every stored event exists only in RAM, on a
    volume whose whole purpose is to stop that being true.
+[CORRECTED — SEE CORRECTIONS: "meets none of them" is true of the ~6 minutes
+observed and must NOT be read as "no snapshot is ever written"; `save 3600 1`
+comes due an hour after a change, so the exposure is a window, not forever.]
 
 Test it rather than reason about it:
 
@@ -968,6 +971,12 @@ namespaceSelector to [demo, demo-kyverno-only]. Nothing on this cluster
 evaluated any of these workloads. Phase 6 section 1f already conceded that for
 the sensor; 6b puts four more pods behind the same exemption, and two of them
 are network services rather than a read-only agent.
+[CORRECTED — SEE CORRECTIONS: "four more pods" is wrong. It is FIVE, which is
+what this section's own heading says; the count in section 3's own pod listing
+is the ground truth.]
+[CORRECTED — SEE CORRECTIONS: "two of them are network services" is wrong
+too, and it is a separate error from the count above. All THREE workloads
+6b adds are network listeners; none of them is a read-only agent.]
 
 8b. WOULD THEY PASS `restricted` IF ANYTHING GATED THEM? NO — BUT READ HOW
 THEY FAIL, BECAUSE IT IS NOT HOW FALCO FAILS. The namespace's `warn:
@@ -1070,3 +1079,106 @@ NOT PROVEN HERE
 - Any measurement of what falcosidekick drops under load. `inputs_total` was
   read at two points in time; no sustained rate was generated and
   `syscall_event_drops` was not sampled.
+
+============================================================
+CORRECTIONS — 2026-08-03
+============================================================
+
+Three corrections, made the way phase 5b's evidence made its four: the
+original lines are NOT rewritten, and each site carries a one-line
+`[CORRECTED — SEE CORRECTIONS]` bracket so that a reader who skims cannot take
+the imprecise text at face value. Those three brackets, in sections 7a and 8a,
+are the only edits made anywhere outside this section. No captured output and
+no exit code changes here; C2 corrects a count printed in prose, which that
+section's own heading already had right, and no conclusion changes. C3
+corrects a second count in that same 8a sentence, against a live capture taken
+on 2026-08-03 and printed below.
+
+C1 — SECTION 7a, THE SAVE-THRESHOLD SENTENCE. As printed:
+
+  "The three save thresholds are "1 change in 3600 s", "100 changes in 300 s",
+   "10000 changes in 60 s". This lab produced 4 changes in about 6 minutes,
+   which meets none of them."
+
+That is true of the window that was observed, and it invites a reading that is
+not true: that no snapshot would ever be written. `save 3600 1` fires a
+snapshot once 3600 s have elapsed with AT LEAST ONE change, so at this lab's
+volume a snapshot WOULD eventually be taken. The store had simply not been
+alive long enough for the slowest of the three rules to come due.
+
+THE PRECISE CLAIM, and the one the README and the threat model use: at this
+event volume an RDB snapshot trails the writes it protects by UP TO AN HOUR.
+The exposure is a window, not a permanent condition. Nothing 7a demonstrates
+is affected and no number changes: `appendonly no`, `/data` empty with no
+dump.rdb, `LASTSAVE 1785782208` still the process's startup value, the store
+about six minutes old, and `DBSIZE` 4 -> 0 when the pod was deleted. The events
+were lost because no snapshot had been taken YET — a sharper statement than
+"none ever would be", and the one this capture supports.
+
+NOT PROVEN EITHER WAY: what this store does after an hour of uptime with at
+least one change. No such window was observed — the Redis pod was deleted about
+six minutes after it started — so the paragraph above rests on redis's
+documented `save` semantics plus the `CONFIG GET save` output printed in 7a,
+and it is stated as such rather than as a measurement.
+
+C2 — SECTION 8a, THE POD COUNT IN THE PROSE. As printed:
+
+  "Phase 6 section 1f already conceded that for the sensor; 6b puts four more
+   pods behind the same exemption, and two of them are network services rather
+   than a read-only agent."
+
+FOUR is wrong. It is FIVE — and 8a's own heading two lines above it already
+says FIVE NEW PODS, so the heading and the sentence under it disagreed.
+
+THE GROUND TRUTH is the pod listing already printed in section 3 of this file,
+re-read on 2026-08-03 and unchanged at 8 pods in the namespace:
+
+  falco-p95h2, falco-p9ljh, falco-t827z          3   sensor DaemonSet, phase 6
+  falco-falcosidekick-* (Deployment, 2/2)        2   NEW in 6b
+  falco-falcosidekick-ui-* (Deployment, 2/2)     2   NEW in 6b
+  falco-falcosidekick-ui-redis-0 (StatefulSet)   1   NEW in 6b
+                                                 -
+  total in namespace                             8
+  new in 6b                                      5
+
+This corrects the NUMBER only; no other sentence in 8a is rewritten. The
+three-image count, the four `restricted` categories in 8b and the namespace's
+`enforce=privileged` label are all unchanged by it.
+
+C3 — SECTION 8a, THE "NETWORK SERVICES" COUNT IN THE SAME SENTENCE. As
+printed:
+
+  "...and two of them are network services rather than a read-only agent."
+
+TWO is wrong, and it is a separate error from C2's. There are THREE new
+workloads and THREE new Services, one per workload — every workload 6b adds
+listens. Under the pod reading it is five pods across three listening
+workloads; under the workload reading it is three of three. Either way "two"
+understates it, and the "rather than a read-only agent" contrast implies one
+of the three is such an agent. None of them is.
+
+THE GROUND TRUTH is the namespace's Service list, re-read live on 2026-08-03:
+
+$ kubectl -n falco get svc
+NAME                           TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)             AGE
+falco-falcosidekick            ClusterIP   10.96.81.224    <none>        2801/TCP,2810/TCP   55m
+falco-falcosidekick-ui         ClusterIP   10.96.163.190   <none>        2802/TCP            55m
+falco-falcosidekick-ui-redis   ClusterIP   10.96.245.44    <none>        6379/TCP            55m
+(exit code: 0)
+
+Three Services — the same three names, ClusterIPs and ports the section 3
+capture printed at install time, unchanged.
+
+THE PRECISE CLAIM: 6b adds three workloads and all three are network
+listeners — falcosidekick on 2801 (the alert intake Falco POSTs to) and 2810
+(its own Prometheus metrics), falcosidekick-ui on 2802, and the Redis on 6379.
+Each of those ports is exercised elsewhere in this file: 2801 was read through
+the apiserver pod proxy for falcosidekick's metrics, 2802 answered
+`/api/v1/healthz` with 200 over a port-forward, and 6379 answered `redis-cli`
+and is the address the UI's own log dials (`10.96.245.44:6379`). The sensor
+DaemonSet has no Service in this namespace at all.
+
+This corrects the NUMBER and that one contrast; no other sentence in 8a is
+rewritten. C2's five-pod count, the three-image count, the four `restricted`
+categories in 8b and the namespace's `enforce=privileged` label are all
+unchanged by it.
