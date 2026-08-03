@@ -377,13 +377,16 @@ T1610 nor T1204.003 would be honest, and reading it as T1525 would stretch
 closes an endpoint no technique in this matrix names. A wrong technique ID is
 worse than a missing row.
 
-Phase 6 has deliberately **no row here either**, for a different reason.
-Falco does engage with runtime techniques — it matches the syscalls and names
-what it saw — but the only artifact it produces is a line on a pod's stdout
-that nothing routes, stores or acts on (§6.4). A (P) marking is the easiest
+Phases 6 and 6b have deliberately **no row here either**, for a different
+reason. Falco does engage with runtime techniques — it matches the syscalls and
+names what it saw — but the only artifact it produces is an alert, and since
+2026-08-03 that alert is routed to a store and queryable there rather than left
+on a pod's stdout (§6.4). Nothing still acts on it. A (P) marking is the easiest
 overclaim available in this document: (P) is defined above as "raises cost or
-covers one variant", and an alert nobody reads does neither. An attacker who
-spawned the shell in `demo` on 2026-07-29 kept the shell. ATT&CK keeps
+covers one variant", and an alert nobody reads does neither, whether it is read
+out of a log or out of a dashboard. An attacker who spawned the shell in `demo`
+on 2026-07-29 kept the shell, and the one who spawned the marked shell on
+2026-08-03 kept that one too. ATT&CK keeps
 detections separate from mitigations for exactly this reason, and this table
 has no detection column; adding one would mean re-deriving every row above
 against a standard they were not written to. What the sensor saw, what it did
@@ -430,8 +433,9 @@ Falco (§6.4, §6.13) changes that only in part, and not in the direction this
 item is about: it is genuinely detective, but it watches syscalls on the nodes,
 not requests at the API server, so it still records nothing about *who called
 what*. Deleting a NetworkPolicy or reading a Secret through the API leaves no
-trace on this cluster either way, and Falco's own output is a container's
-stdout — not queryable, not retained, not an audit trail.
+trace on this cluster either way, and Falco's own output — routed to a store
+and queryable there since 2026-08-03 (§6.4) — is a record of syscalls on the
+nodes, not of who called what at the API server, so it is not an audit trail.
 
 **6.3 No node or kernel hardening.** No AppArmor or SELinux profile beyond
 `seccompProfile: RuntimeDefault`, no gVisor or Kata, and all three nodes are
@@ -455,12 +459,13 @@ kernel-level escape that gets past PSA and past that filter lands on the host
 directly — there is no second wall.
 Since 2026-07-29 a kernel-level eBPF probe watches that same shared kernel
 (§6.4), so such an escape would stand a chance of being *seen*. It is still not
-a second wall: seeing is not stopping, nothing reads the alert, and the probe
+a second wall: seeing is not stopping, nothing acts on what is seen — since
+2026-08-03 the alert is routed to a store and no further (§6.4) — and the probe
 itself is a privileged component on the kernel it watches (§6.13).
 
-**6.4 Runtime behaviour is now observed, and nothing responds to what is
-observed.** Every *control* in this document still fires at admission time or at
-connection time. A workload that is admitted and *then* misbehaves — a shell
+**6.4 Runtime behaviour is now observed and filed, and nothing responds to what
+is observed.** Every *control* in this document still fires at admission time or
+at connection time. A workload that is admitted and *then* misbehaves — a shell
 spawned in a container, a miner started inside an allow-listed and correctly
 signed image — is still not **stopped** by anything here, and signature
 verification remains explicitly not a behavioural control. What changed on
@@ -471,27 +476,50 @@ shell in the hardened `demo/nginx` pod produced `A shell was spawned in a
 container with an attached terminal` at priority Notice, and a busybox copy
 executed out of `/dev/shm` produced `File execution detected from /dev/shm` at
 priority Warning — both inside the attack window, with pod name, namespace,
-image and uid 101 resolved on the alert. Message text and priority are what an
-alert line carries here; `json_output` is off, so the stock rule names behind
-them are an identification against the shipped ruleset and not a captured
-field. **Both attacks succeeded.**
+image and uid 101 resolved on the alert. Message text and priority are what
+those 2026-07-29 alert lines carry; `json_output` was off then, so the stock
+rule names behind them are an identification against the shipped ruleset and
+not a captured field — which changed on 2026-08-03 and is the smaller half of
+what phase 6b bought, below. **Both attacks succeeded.**
 The shell returned exit 0; the staged binary ran (`evt_res=SUCCESS`); afterwards
 the pod was still Running with its restart count unchanged and the payload
-still sitting in `/dev/shm` until it was cleaned up by hand. **What happens to
-a Falco alert on this cluster is: nothing.** It is written to the falco
-container's stdout and no further — `file_output`, `http_output`,
-`program_output` and `json_output` are all disabled, `responseActions.enabled`
-is `false`, and no falcosidekick, Talon, log shipper or alert router is
-installed anywhere on the cluster — so the alert lives in a container log
-until rotation or pod restart and is read only by someone who already went
-looking for it. One channel is nominally on and is worth naming rather than
-omitting: `syslog_output` is `true`, but it writes to the container's syslog
-socket and no syslog daemon runs in that image, so nothing consumes it either.
-There is no routing, no persistence, no on-call and no automated response.
-**Detection without response is not mitigation.** That is why this
-item stays in residual risk instead of being closed, why phase 6 takes no row
-in §5, and why what the sensor itself introduces is written up separately in
-§6.13.
+still sitting in `/dev/shm` until it was cleaned up by hand.
+
+**What happens to a Falco alert on this cluster is: it gets filed, and then
+nothing.** Until 2026-08-03 it was written to the falco container's stdout and
+no further. Phase 6b changed the routing half of that, and only that half:
+`falcosidekick.enabled=true` on the existing release flipped Falco's own
+`http_output.enabled` to `true` with `url: http://falco-falcosidekick:2801`
+and `json_output` to `true` — read back out of a running container, not off the
+chart — so an alert now POSTs to falcosidekick, which writes it into the Web
+UI's Redis. **Two things improved, and they are worth naming exactly.** An
+alert now outlives the container that produced it: all three Falco pods were
+deleted, `grep -c` on every replacement pod's log returned 0, and the marked
+event was still retrievable from the store under the same UUID. And it is
+queryable in one place, with the rule name (`"rule":"Terminal shell in
+container"`) and the ruleset's own ATT&CK tags (`T1059`, `mitre_execution`)
+travelling with it — enrichment phase 6 could not capture.
+
+**Nothing else improved, and one thing acquired a new failure mode.**
+`responseActions.enabled` is still `false` and no responder — Falco Talon or
+anything else — is installed, so no action follows an alert. Exactly one
+falcosidekick output is enabled and it is the in-cluster Web UI (`Enabled
+Outputs: [WebUI]`, from the component's own startup line): no credential was
+entered anywhere, so the UI keeps the chart's default one, no output in this
+release is configured to reach outside the cluster, and the UI is served only
+through `kubectl port-forward`. There is still no rota, no
+owner and no notification, and **a dashboard nobody opens is still an alert
+nobody reads.** `file_output` and `program_output` remain off. One channel is
+nominally on and is worth naming rather than omitting: `syslog_output` is
+`true`, but it writes to the container's syslog socket and no syslog daemon
+runs in that image, so nothing consumes it either. And the store the alert now
+lives in is not durable: deleting the Redis pod took it from four events to
+zero, and ingest then stayed broken until the Web UI was restarted by hand
+(§6.13 items 6 and 7).
+**Detection without response is not mitigation, and routing is not response.**
+That is why this item stays in residual risk instead of being closed, why
+neither phase 6 nor phase 6b takes a row in §5, and why what the sensor and its
+new plumbing introduce is written up separately in §6.13.
 
 **6.5 The CVE gate is report-only.** Trivy runs with `exit-code: '0'`
 ([`.github/workflows/supply-chain.yml`](../.github/workflows/supply-chain.yml)),
@@ -869,10 +897,12 @@ made — the scan measures the substrate at least as much as it measures the lab
 and the eight settings phase 5b added are a narrow exception to that rather
 than a rebuttal of it.
 
-**6.13 The runtime sensor is itself privileged, ungated and unwatched.** §6.4
-records what phase 6 bought and what it does not do with it; this item records
-what the sensor *costs*, because installing Falco added the largest new attack
-surface this lab has taken on. Six things, none of them remediated.
+**6.13 The runtime sensor is itself privileged, ungated and unwatched — and so
+is the alert pipeline now bolted to it.** §6.4 records what phases 6 and 6b
+bought and what they do not do with it; this item records what the sensor and
+its pipeline *cost*, because installing Falco added the largest new attack
+surface this lab has taken on and phase 6b put five more pods behind the same
+exemption on 2026-08-03. Seven things, none of them remediated.
 
 1. **It runs `privileged: true`.** That is the chart's default for
    `driver.kind=modern_ebpf` (`driver.modernEbpf.leastPrivileged` defaults to
@@ -898,6 +928,22 @@ surface this lab has taken on. Six things, none of them remediated.
    rather than inherited silently, and the same spec submitted to `demo` is
    refused — by PSA as a Pod, by Kyverno as a DaemonSet. Documentation is not
    enforcement, and a refusal elsewhere is not a control here.
+   **Phase 6b enlarged this hole rather than leaving it alone.** Since
+   2026-08-03 the same ungated namespace also holds five falcosidekick, Web UI
+   and Redis pods from three more images, two of them network services rather
+   than a read-only agent, and nothing on this cluster evaluated any of them —
+   which also means nothing compelled the manifest-list digest pins those
+   images carry; that discipline is self-imposed and self-verified. The
+   apiserver priced it for free during the upgrade: the namespace still carries
+   `warn: restricted`, so it emitted **four PSA `restricted` warnings**, three
+   of them about the new workloads, and as rendered none of those pods would be
+   admitted by `restricted`. They fail on four categories —
+   `allowPrivilegeEscalation`, capabilities, `runAsNonRoot`,
+   `seccompProfile` — not the sensor's six: none is privileged, none
+   host-mounts anything, none asks for a host namespace, and the chart exposes
+   every field they are missing. **"Could be gated and is not" is the honest
+   sentence**, and closing it was deliberately kept out of a routing-only
+   upgrade so that one change could be attributed to one cause.
 3. **The sensor's own supply chain is unverified in the sense phase 4 means.**
    All four OCI artifacts are pinned by digest — the Falco and falcoctl images
    plus the ruleset and container-plugin artifacts — and falcoctl **reported**
@@ -914,6 +960,18 @@ surface this lab has taken on. Six things, none of them remediated.
    falcoctl ref. It was found and pinned, and the miss is recorded in
    [`../clusters/falco-install.md`](../clusters/falco-install.md) rather than
    tidied away.
+   **Phase 6b widened this too.** falcosidekick 2.32.0, falcosidekick-ui 2.2.0
+   and `redis/redis-stack` 7.2.0-v11 are each pinned by manifest-list digest
+   across four chart value paths, and not one was signature-verified: they are
+   Docker Hub images, outside the `ImageValidatingPolicy`'s glob, with no
+   falcoctl init container to check them and still no cosign binary on this
+   host. Seven digest-pinned artifacts now run in `falco` — two carrying a
+   verification claim made by the component that pulled them, five carrying
+   none. An eighth is dormant rather than absent: the falcosidekick subchart
+   ships a `helm.sh/hook: test-success` Pod running `appropriate/curl` with no
+   registry, no tag and no digest. `helm upgrade` never creates it and it is not
+   on the cluster, but `helm test falco` would pull `:latest`, so that command
+   must not be run while this repo's thesis is immutability.
 4. **The false-negative rate is unknown and was not measured.** Two behaviours
    were fired and each produced an alert; that says nothing about what would
    slip past. One counter-example is already on record: the textbook
@@ -932,25 +990,70 @@ surface this lab has taken on. Six things, none of them remediated.
    `k8s_pod_name`, `container_name` and the image; the other two print `<NA>`.
    Any figure drawn from these logs must be divided by three, and on a real
    cluster with three kernels the enrichment behaviour would be different.
-6. **Nothing retains the alerts.** Restated from §6.4 because it is the
-   load-bearing limit and the easiest one to forget: stdout only, no shipper,
-   no store, no page. Each pod's log held three alert lines from the
-   2026-07-29 attack window — the two documented above plus an earlier,
-   unrecorded shell-spawn rehearsal at `15:12:42.954798594` — and every one of
-   them survived exactly as long as a container log does, which the 2026-07-30
-   rebuild then demonstrated instead of arguing: `kind delete` destroyed the
-   Falco pods and the logs that were the alerts' only home. On the reinstalled
-   sensor, the co-located pod's log was enumerated whole and holds exactly two
-   lines, both of them the DR drill's own re-run. The 2026-07-29 lines went with
-   the containers that wrote them, and by this item's own terms there was
-   nowhere else for them to be.
+6. **Retention exists now, and it is fragile.** This item read "nothing retains
+   the alerts" until 2026-08-03, and phase 6b is what changed it — which is a
+   different claim from "solved". What is now true: an alert survives the death
+   of every sensor that saw it. All three Falco pods were deleted and the marked
+   event was still retrievable from the Web UI's Redis under the same UUID,
+   while `grep -c` on all three replacement pods' logs returned 0. What is still
+   not true: the store keeps nothing across its own restart. `appendonly` is
+   `no`, the RDB configuration is redis-stack's default `save 3600 1 300 100 60
+   10000`, `/data` held no `dump.rdb`, and deleting the Redis pod took `DBSIZE`
+   from 4 to 0 with the 1Gi PVC still Bound to the same volume — reattached
+   empty, because nothing had ever been written to it. The only one of those
+   thresholds this lab's alert volume can reach is `3600 1`, which comes due
+   3600 s after a change, so a snapshot trails the writes it protects by up to
+   an hour; this store had been alive about six minutes and had taken none.
+   That is a window, not a permanent condition, and the distinction is
+   corrected in the evidence file's own corrections section.
+   **The record this item was written for stands.** Each pod's log held three
+   alert lines from the 2026-07-29 attack window — the two documented in §6.4
+   plus an earlier, unrecorded shell-spawn rehearsal at `15:12:42.954798594` —
+   and every one of them survived exactly as long as a container log does,
+   which the 2026-07-30 rebuild then demonstrated instead of arguing: `kind
+   delete` destroyed the Falco pods and the logs that were the alerts' only
+   home. On the reinstalled sensor, the co-located pod's log was enumerated
+   whole and holds exactly two lines, both of them the DR drill's own re-run.
+   The 2026-07-29 lines went with the containers that wrote them, and by that
+   term there was nowhere else for them to be. The 6b upgrade did it once more
+   on the way past: the four alerts that existed immediately before it were
+   enumerated whole, and afterwards the three replacement pods each counted
+   zero. Neither loss is prevented by what runs today — a `kind delete` takes
+   the PVC's backing directory inside the `seclab-worker2` node container with
+   it, which is reasoned from the local-path volume's path and node affinity
+   rather than demonstrated, and a restart of one Redis pod is already enough.
+7. **The alert pipeline fails silently, and nothing watches it.** The data loss
+   in item 6 was not the worst of that test. After the Redis pod was deleted,
+   ingest did not resume: falcosidekick's POSTs were rejected and it logged
+   `exceeding post rate limit (500)`, which names the wrong cause. The real one
+   is in the Web UI's own log — `Unknown index name`. The `eventIndex`
+   RediSearch index the UI queries is created once, at UI startup ("Index does
+   not exist / Create Index"), so the restart took the index with the data and
+   the UI never rebuilt it; every subsequent alert was detected by all three
+   sensors, POSTed, and dropped. **Nothing self-healed and nothing raised the
+   alarm.** Recovery took a manual
+   `kubectl rollout restart deployment/falco-falcosidekick-ui`, and the only
+   thing that noticed the outage was a human running `grep` on purpose. The
+   single point of failure is unguarded in the other direction too: one Redis
+   pod holds the whole history, its RWO PVC pins it to `seclab-worker2` so it
+   can schedule nowhere else, and it runs with **no password and no
+   NetworkPolicy** — anything that can reach its Service on 6379 can read the
+   alert history or delete it, which this phase demonstrated is a one-command
+   operation by doing it accidentally. There is no monitoring of the
+   monitoring.
 
 **Consequence, stated plainly:** this cluster can now see a category of attack
-it previously could not, and can still do nothing about it — while carrying a
-privileged, ungated new component to get that visibility. Wiring an alert
-router and a response action, even one that merely annotates the offending pod,
-is what would turn this into a control, and that work is not done. Until it is,
-§6.4 stays open and no §5 row is earned.
+it previously could not, and can now file what it saw somewhere that outlives
+the sensor — and it can still do nothing about it, while carrying a privileged,
+ungated component plus five ungated pods of plumbing to get that far. This
+paragraph used to say that wiring an alert router and a response action, even
+one that merely annotates the offending pod, is what would turn this into a
+control. Half of that is now done, and only half: the router exists and is
+proved (§6.4), the response action does not exist at all,
+`responseActions.enabled` is still `false`, and nothing is configured to tell
+a person that any of it happened. A record that outlives its sensor is a better
+record; it is not a control. Until something acts on an alert, §6.4 stays open
+and no §5 row is earned — not by phase 6 and not by phase 6b.
 
 ---
 

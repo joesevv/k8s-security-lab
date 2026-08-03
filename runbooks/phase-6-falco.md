@@ -11,6 +11,17 @@ with the verbatim alerts they raised, and the evidence that neither behaviour
 was prevented, routed, stored or answered. Commands are in execution order;
 each has a one-line purpose and the observed output.
 
+**This runbook is a record of the cluster as phase 6 left it on 2026-07-29
+and is not rewritten to match later work.** On 2026-08-03 phase 6b gave the
+alert a next hop — falcosidekick, a Redis store and a Web UI, with Falco's own
+`http_output` and `json_output` flipped to `true` in the running container.
+**Every output-channel reading below is the PRE-UPGRADE state and is preserved
+as such**: it is the before-half of the comparison 6b's evidence draws, so the
+original sentences stand unedited and a dated bracket at each superseded site
+says so on the spot, pointing at `runbooks/phase-6b-falcosidekick.md` and
+`docs/evidence/phase-6b-falcosidekick/`. 6b routes and nothing more: it still
+blocks nothing, still pages nobody, and adds no Talon, no rota and no owner.
+
 Host: Windows 11 + Docker Desktop (WSL2). Commands were run from Git Bash
 unless noted. Kubernetes node image v1.35.5, kernel
 `6.18.33.2-microsoft-standard-WSL2`, Falco 0.44.1 (chart
@@ -40,6 +51,12 @@ footnotes:**
    entire lifetime is: falco stdout → the kubelet's container log on that node
    → gone at pod restart or log rotation. An alert nobody reads is a
    capability, not a control.
+
+   [Pre-6b state. Superseded 2026-08-03 in part — 6b added `http_output`, a
+   falcosidekick, a Redis store on a Bound PVC and a dashboard, so
+   `stdout_output` is no longer the only live channel and retention is
+   non-zero, though not durable. STILL TRUE as written: no Talon, no page, no
+   on-call rota, no owner. See `runbooks/phase-6b-falcosidekick.md`.]
 3. **Threat model §6.4 is AMENDED by this phase and NOT closed.** Its title
    clause "until Falco lands" is now satisfiable, but only half its substance
    changes: runtime behaviour is now *detected*; it is still not *stopped*,
@@ -79,6 +96,12 @@ blocks.
   priority, a message and a set of enriched fields. **What it does NOT do:**
   block, kill, evict, quarantine, deny, page, store, forward or retry. It has
   no admission hook, no `responseActions`, and no downstream of any kind.
+
+  [Pre-6b state. Superseded 2026-08-03 in part — 6b set `http_output: true`
+  to `falco-falcosidekick:2801` and the alerts land in a Redis, so "store",
+  "forward" and "no downstream of any kind" no longer hold. STILL TRUE as
+  written: no block, kill, evict, quarantine, deny, page or retry. See
+  `runbooks/phase-6b-falcosidekick.md`.]
 - **A dedicated `falco` namespace** —
   `docs/evidence/phase-6-falco/00-namespace-falco.yaml`, carrying
   `enforce: privileged`, `warn: restricted`, `audit: restricted`. **Why it is
@@ -120,6 +143,11 @@ container** — `file_output: false`, `http_output: false` with an empty `url`,
 in the image consumes. Only `stdout_output` is live. So the honest sentence is
 not "Falco is configured to alert"; it is "Falco writes a line to a file
 descriptor and the line's next hop does not exist."
+
+[Pre-6b state. Superseded 2026-08-03 — `http_output` is now `true` with
+`url: http://falco-falcosidekick:2801` and `json_output` is now `true`, both
+read back out of the running container, so the next hop exists. See
+`runbooks/phase-6b-falcosidekick.md`.]
 
 ### One kernel, three sensors — divide every count by three
 
@@ -602,6 +630,10 @@ anywhere. This is the stock rule commonly named "Terminal shell in container",
 but that name was **not** read out of the loaded rules file by any command in
 this run and is recorded as an identification, not as a captured field.
 
+[Pre-6b state. Superseded 2026-08-03 — with `json_output: true`, 6b's stored
+alert carries `"rule":"Terminal shell in container"` as a field rather than as
+an identification. See `runbooks/phase-6b-falcosidekick.md`.]
+
 **Every alert line in that pod's log is accounted for, and the count is a
 function of when you look.** `falco-6pq4p` has restartCount 0, so its log
 spans the whole pinned install; every capture in this section greps for a
@@ -826,6 +858,12 @@ exists to avoid.
 And nothing downstream exists on the cluster either — not merely unconfigured
 in Falco, absent:
 
+[Pre-6b state. Superseded 2026-08-03 — the `helm ls` and `kubectl get pods`
+NONE results below are the pre-upgrade readings; falcosidekick, its Web UI and
+a Redis now run in this namespace, so the sidekick grep no longer returns NONE.
+STILL TRUE as written: no Talon, Loki, Elastic, Fluent, Alertmanager or
+Prometheus. See `runbooks/phase-6b-falcosidekick.md`.]
+
 ```bash
 helm ls -A | grep -iE 'sidekick|talon|loki|elastic|fluent|alertmanager|prometheus' || echo NONE
 # NONE                                                                 (exit 0)
@@ -854,6 +892,11 @@ node, and it is gone at pod restart or log rotation. There is no PVC, no
 shipper, no index, no dashboard and no rota. If both behaviours in section 3
 had happened at 3am, the only trace this morning would be whatever is left in
 three pods' stdout, and nobody would have been told.
+
+[Pre-6b state. Superseded 2026-08-03 — 6b's alert outlived every sensor pod in
+a Redis with a Bound 1Gi PVC and a dashboard on top. NOT durable: no
+`dump.rdb` had been written and deleting the Redis pod took `DBSIZE` 4 → 0.
+Still no rota, still nobody told. See `runbooks/phase-6b-falcosidekick.md`.]
 
 **What was NOT tuned, stated plainly.** The startup log in 2d shows a single
 rules file, `/etc/falco/falco_rules.yaml`, from the pinned upstream
