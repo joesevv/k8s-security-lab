@@ -1,0 +1,1072 @@
+Phase 6b — falcosidekick alert routing (captured 2026-08-03)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, 3 nodes
+(seclab-control-plane, seclab-worker, seclab-worker2). All three "nodes" are
+containers sharing ONE WSL2 kernel, so every count of copies below is 3 and
+every count of EVENTS is 1. Phase 6's divide-every-count-by-three rule is
+unchanged and is now visible in the sidekick's own metrics (section 5).
+Release: helm `falco` in namespace `falco`, chart falcosecurity/falco 9.1.0,
+UPGRADED IN PLACE from REVISION 1 to REVISION 2. Falco itself is untouched:
+same app 0.44.1, same image digest, same pinned ruleset, same modern_ebpf
+driver. What changed is where the alert GOES.
+  falcosidekick    docker.io/falcosecurity/falcosidekick:2.32.0
+                  @sha256:1976da72151850aae4436f33a5ed94bdef469f42a9b61c182b4feeb5441fb081
+  falcosidekick-ui docker.io/falcosecurity/falcosidekick-ui:2.2.0
+                  @sha256:0faadedfdff7e6af8be0d7d90efb0638cedc337e4e5c3e57f527da2f6722c851
+  redis            docker.io/redis/redis-stack:7.2.0-v11
+                  @sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b
+
+============================================================
+0) WHAT 6b CHANGES, AND WHAT IT STILL DOES NOT. THE HONESTY THESIS, UP FRONT.
+============================================================
+
+PHASE 6 SAID: "Falco writes a line to a file descriptor and the line's next
+hop does not exist." THAT SENTENCE IS NOW FALSE, AND ONLY THAT SENTENCE. The
+next hop exists: Falco POSTs JSON to a Service, falcosidekick accepts it, and
+falcosidekick writes it into a Redis that a Web UI reads. That is the whole
+of what this phase adds.
+
+FALCO STILL DETECTS AND STILL DOES NOT PREVENT. Nothing in 6b blocks, kills,
+evicts, quarantines or denies anything. The attack in section 5 SUCCEEDED —
+it printed its output and its shell ran to completion — exactly as both
+attacks in phase 6 did. 6b earns no row in the threat model's Control →
+ATT&CK table for the same reason phase 6 earned none: routing an alert is not
+a mitigation.
+
+STILL NOBODY IS PAGED. There is NO on-call, NO rota, NO owner, NO
+notification and NO external sink of any kind. falcosidekick supports fifty
+destinations; exactly one is enabled here and it is the in-cluster Web UI —
+proven from falcosidekick's own startup line in section 7, not from the
+chart's intent. An alert that reaches a dashboard nobody opens is still an
+alert nobody reads. The difference 6b makes is narrower and worth stating
+exactly: the alert now OUTLIVES the sensor that raised it, and can be
+retrieved after the fact by a human who goes looking. That is the whole
+delta, it is demonstrated in section 6, and it is not the same thing as
+having a response capability.
+
+AND THE RETENTION IS WORSE THAN THE PVC SUGGESTS. Section 7 TESTS the store
+rather than reading its spec, and the tested answer is bad: the Redis has a
+real 1Gi PersistentVolumeClaim, Bound, and it still lost every event when its
+pod was deleted, because redis-stack's default RDB save thresholds were never
+reached and no snapshot had ever been written. Worse, the ingest path did not
+merely lose the data — it STAYED BROKEN until the Web UI pods were manually
+restarted. Both are recorded with the commands that found them.
+
+THE SENSOR'S OWN LOGS ARE STILL THE SAME DISPOSABLE THING THEY ALWAYS WERE.
+Section 1 captures four real alert lines that existed before this upgrade, and
+section 1c shows them gone — destroyed by the very DaemonSet restart that
+installed the fix. That is not bookkeeping. It is the problem 6b addresses,
+demonstrated once more on the way past.
+
+THE PHASE ADDS ATTACK SURFACE AND SECTION 8 STATES IT. Three new images, five
+new pods, a Redis with no password, and a Web UI whose Secret carries the
+chart's default credential `admin:admin`. All of it runs in a namespace with
+PSA `enforce: privileged` and outside every Kyverno policy's namespaceSelector.
+Section 8 reads the apiserver's own verdict on whether these pods would pass
+`restricted` if anything gated them. They would not — but they fail on four
+categories, not phase 6's six, and the difference is stated because "could be
+gated and is not" is a more useful sentence than "is not gated".
+
+PROVENANCE. Every command, output, exit code and number below is transcribed
+from a raw capture file written at the moment the command ran. Nothing is
+reconstructed, nothing is paraphrased, and no label, prefix or annotation has
+been added to any captured output. Where output is shortened it is marked
+[... N lines elided ...]. Bare values are quoted bare.
+
+============================================================
+1) THE BEFORE-STATE, INCLUDING THE ALERTS THIS UPGRADE IS ABOUT TO DESTROY
+============================================================
+
+1a. THE RELEASE AS PHASE 6 LEFT IT. One release, revision 1, three pods, and
+NOTHING ELSE IN THE NAMESPACE — no Service, no Deployment, no StatefulSet:
+
+$ helm -n falco list
+NAME 	NAMESPACE	REVISION	UPDATED                              	STATUS  	CHART      	APP VERSION
+falco	falco    	1       	2026-07-30 09:05:06.3921778 -0500 CDT	deployed	falco-9.1.0	0.44.1
+(exit code: 0)
+
+$ kubectl -n falco get pods,svc,deploy,statefulset -o wide
+NAME              READY   STATUS    RESTARTS      AGE    IP           NODE                   NOMINATED NODE   READINESS GATES
+pod/falco-g8d62   1/1     Running   1 (76m ago)   4d4h   10.244.2.7   seclab-worker          <none>           <none>
+pod/falco-hzkbw   1/1     Running   1 (76m ago)   4d4h   10.244.1.5   seclab-worker2         <none>           <none>
+pod/falco-lbrt9   1/1     Running   1 (76m ago)   4d4h   10.244.0.5   seclab-control-plane   <none>           <none>
+(exit code: 0)
+
+=> the `svc`, `deploy` and `statefulset` sections print nothing because none
+   exist. That is the phase-6 topology: a DaemonSet and no downstream.
+
+1b. THE OUTPUT CHANNELS, READ OUT OF A RUNNING CONTAINER — not out of the
+chart. This is phase 6 section 4's method and it is repeated here so the
+after-reading in section 4 has something to be compared against:
+
+$ MSYS_NO_PATHCONV=1 kubectl -n falco exec falco-g8d62 -c falco -- sed -n '/^http_output:/,/^[a-z]/p' /etc/falco/falco.yaml
+http_output:
+  ca_bundle: ""
+  ca_cert: ""
+  ca_path: /etc/falco/certs/
+  client_cert: /etc/falco/certs/client/client.crt
+  client_key: /etc/falco/certs/client/client.key
+  compress_uploads: false
+  echo: false
+  enabled: false
+  insecure: false
+  keep_alive: false
+  max_consecutive_timeouts: 5
+  mtls: false
+  url: ""
+  user_agent: falcosecurity/falco
+json_include_message_property: false
+(exit code: 0)
+
+$ kubectl -n falco exec falco-g8d62 -c falco -- sh -c 'for k in stdout_output file_output http_output program_output syslog_output json_output; do echo "== $k =="; grep -A2 "^$k:" /etc/falco/falco.yaml; done'
+== stdout_output ==
+stdout_output:
+  enabled: true
+syscall_event_drops:
+== file_output ==
+file_output:
+  enabled: false
+  filename: ./events.txt
+== http_output ==
+http_output:
+  ca_bundle: ""
+  ca_cert: ""
+== program_output ==
+program_output:
+  enabled: false
+  keep_alive: false
+== syslog_output ==
+syslog_output:
+  enabled: true
+time_format_iso_8601: false
+== json_output ==
+json_output: false
+libs_logger:
+  enabled: true
+(exit code: 0)
+
+=> `json_output: false`, `http_output.enabled: false`, `http_output.url: ""`.
+   `json_include_message_property`, `syscall_event_drops`, `time_format_iso_8601`
+   and `libs_logger` are the -A2 context spilling into the NEXT top-level key;
+   they are printed because the command prints them, not because they are part
+   of the block above them. stdout_output is the only live channel.
+
+1c. FOUR REAL ALERTS EXIST RIGHT NOW, AND IN NINETY SECONDS THEY WILL NOT.
+Enumerated whole immediately before the upgrade. Only the timestamp, priority
+and the leading words of each rule's output string are printed, so the block
+fits; the full first three lines are in the raw capture and one is quoted
+below:
+
+$ date -u +"%Y-%m-%dT%H:%M:%S.%NZ"; for p in falco-g8d62 falco-hzkbw falco-lbrt9; do echo "== $p =="; kubectl -n falco logs $p -c falco | grep -oE '^[0-9:.]+: (Notice|Warning|Error|Critical) [A-Za-z /]+'; done
+2026-08-03T18:35:44.205947000Z
+== falco-g8d62 ==
+17:15:58.596277394: Notice Unexpected connection to K
+17:15:59.106566367: Notice Unexpected connection to K
+17:16:53.685165726: Notice Unexpected connection to K
+== falco-hzkbw ==
+17:15:58.596275295: Notice Unexpected connection to K
+17:15:59.106563683: Notice Unexpected connection to K
+17:16:53.685164417: Notice Unexpected connection to K
+18:34:56.191257800: Notice Shell spawned by untrusted binary 
+== falco-lbrt9 ==
+17:16:53.683726256: Notice Unexpected connection to K
+(exit code: 0)
+
+=> the `[A-Za-z /]+` class stops at the digit in "K8s", which is why every
+   line ends at "K". FOUR DISTINCT EVENTS, seen 8 times between three pods.
+   Three are the same rule firing on kube-system / kyverno traffic; the fourth
+   is the shell this evidence run itself spawned when it read the config in
+   1b — an evidence command tripping a detection rule, recorded rather than
+   filtered. WHY THE THREE PODS DISAGREE, in part: falco-lbrt9's container
+   started 29 s later than the other two and so never saw the 17:15:58 and
+   17:15:59 events —
+
+$ kubectl -n falco get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[0].restartCount,STARTED:.status.containerStatuses[0].state.running.startedAt
+NAME          NODE                   RESTARTS   STARTED
+falco-g8d62   seclab-worker          1          2026-08-03T17:15:53Z
+falco-hzkbw   seclab-worker2         1          2026-08-03T17:15:53Z
+falco-lbrt9   seclab-control-plane   1          2026-08-03T17:16:22Z
+(exit code: 0)
+
+=> 17:16:22Z minus 17:15:53Z = 29 s. That accounts for lbrt9's two missing
+   lines. It does NOT account for the 18:34:56 shell alert appearing in ONE
+   pod's log only; no command in this run establishes why, so no reason is
+   offered for it. It is recorded as observed.
+
+One of those lines in full, so "four real alerts" is not taken on trust:
+
+$ kubectl -n falco logs falco-g8d62 -c falco | grep -E '^[0-9:.]+: (Notice|Warning) '
+17:15:58.596277394: Notice Unexpected connection to K8s API Server from container | connection=10.244.0.2:49896->10.96.0.1:443 lport=443 rport=49896 fd_type=ipv4 fd_proto=tcp evt_type=connect user=root user_uid=0 user_loginuid=-1 process=local-path-prov proc_exepath=/usr/local/bin/local-path-provisioner parent=<NA> command=local-path-prov --debug start --helper-image docker.io/kindest/local-path-helper:v20260131-7181c60a --config /etc/config/config.json terminal=0 container_id=c7cf3eecdd4d container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>
+[... 2 lines elided — the kyverno and reports-controller copies of the same rule, each ~1200 chars; the full three lines are in the raw capture ...]
+(exit code: 0)
+
+1d. AND NOW THEY ARE GONE. Taken AFTER the section 3 upgrade, against the pod
+names captured above:
+
+$ date -u +"%Y-%m-%dT%H:%M:%S.%NZ"; kubectl -n falco logs falco-g8d62 -c falco
+2026-08-03T18:38:01.636745800Z
+error: error from server (NotFound): pods "falco-g8d62" not found in namespace "falco"
+(exit code: 1 — the pod does not exist, so neither does its log)
+
+$ for p in falco-p95h2 falco-p9ljh falco-t827z; do echo "== $p =="; kubectl -n falco logs $p -c falco | grep -cE 'Unexpected connection to K8s API Server'; done
+== falco-p95h2 ==
+0
+== falco-p9ljh ==
+0
+== falco-t827z ==
+0
+(exit code: 1 — grep's, from the last iteration finding no match)
+
+=> THE UPGRADE THAT INSTALLS THE FIX DESTROYS THE EVIDENCE THE FIX WOULD HAVE
+   SAVED. Three replacement pods, three empty counts. Those four events are
+   unrecoverable from anywhere on this cluster. This is the same loss the
+   2026-07-30 rebuild caused and that threat model §6.13 item 6 records, and
+   it is the last time in this lab's history it happens for a routed alert.
+
+============================================================
+2) DISCOVERY — WHAT THE CHART WOULD DO, AND THE DIGESTS RESOLVED
+============================================================
+
+2a. THE SUBCHART IS A REAL DEPENDENCY WITH ITS OWN PINNED VERSION. `helm show
+values falcosecurity/falco` prints only a THREE-KEY STUB for falcosidekick —
+`enabled`, `fullfqdn`, `listenPort` — because the real value tree lives in the
+dependency, not the parent. Reading only the parent's values would have missed
+every image path pinned in section 3:
+
+$ helm pull falcosecurity/falco --version 9.1.0 --untar --untardir <scratch>
+$ cat <scratch>/falco/Chart.lock
+dependencies:
+- name: falcosidekick
+  repository: https://falcosecurity.github.io/charts
+  version: 0.12.1
+- name: k8s-metacollector
+  repository: https://falcosecurity.github.io/charts
+  version: 0.1.10
+- name: falco-talon
+  repository: https://falcosecurity.github.io/charts
+  version: 0.3.0
+digest: sha256:3f7b1ab016fdfde5b210b63cf85fac25d4fab830f416065d1409f48e61151d97
+generated: "2026-06-11T10:06:20.688661378Z"
+(exit code: 0)
+
+=> falcosidekick subchart 0.12.1, app 2.31.1. Its `values.yaml` is 1419 lines
+   and the webui block starts at line 1220. Four image tag paths matter, and
+   two of them point at the SAME image:
+     falcosidekick.image.tag                      docker.io/falcosecurity/falcosidekick:2.32.0
+     falcosidekick.webui.image.tag                docker.io/falcosecurity/falcosidekick-ui:2.2.0
+     falcosidekick.webui.initContainer.image.tag  docker.io/redis/redis-stack:7.2.0-v11
+     falcosidekick.webui.redis.image.tag          docker.io/redis/redis-stack:7.2.0-v11
+   Note that the subchart's own `appVersion` is 2.31.1 while its default image
+   tag is 2.32.0. The IMAGE is what runs; 2.32.0 is what is pinned, and
+   falcosidekick's own startup line in section 7 prints 2.32.0.
+
+2b. THE CHART AUTO-WIRES FALCO'S CONFIG. THIS IS THE ANSWER TO THE QUESTION
+"DO I HAVE TO SET json_output MYSELF?" AND THE ANSWER IS NO. From the parent
+chart's `templates/_helpers.tpl`:
+
+$ sed -n '120,160p' <scratch>/falco/templates/_helpers.tpl
+[... 22 lines elided — the rbac apiVersion helper and the falcosidekick.url helper that builds "http://falco-falcosidekick:2801" ...]
+{{/*
+Set appropriate falco configuration if falcosidekick has been configured.
+*/}}
+{{- define "falco.falcosidekickConfig" -}}
+{{- if .Values.falcosidekick.enabled  -}}
+    {{- $_ := set .Values.falco "json_output" true -}}
+    {{- $_ := set .Values.falco "json_include_output_property" true -}}
+    {{- $_ := set .Values.falco.http_output "enabled" true -}}
+    {{- $_ := set .Values.falco.http_output "url" (include "falcosidekick.url" .) -}}
+{{- end -}}
+{{- end -}}
+[... 8 lines elided — the start of the unrelated falco.configSyscallSource helper ...]
+(exit code: 0)
+
+=> `falcosidekick.enabled=true` ALONE flips four Falco settings. NO EXTRA
+   --set FLAG IS NEEDED and none was used. That template is the chart's
+   INTENT; section 4 proves it landed in the running container's config,
+   which is the only proof this repo accepts.
+
+2c. WHAT THE UPGRADE WOULD CREATE, rendered and read before anything was
+applied:
+
+$ helm template falco falcosecurity/falco --namespace falco --version 9.1.0 <all 15 --set flags from section 3> | grep -nE '^# Source:|^kind: '
+[... 26 lines elided — the ServiceAccount, Secret, ConfigMap, Role and RoleBinding entries ...]
+900:# Source: falco/charts/falcosidekick/templates/service-ui.yaml
+902:kind: Service
+927:# Source: falco/charts/falcosidekick/templates/service-ui.yaml
+929:kind: Service
+954:# Source: falco/charts/falcosidekick/templates/service.yaml
+956:kind: Service
+987:# Source: falco/templates/daemonset.yaml
+989:kind: DaemonSet
+1185:# Source: falco/charts/falcosidekick/templates/deployment-ui.yaml
+1187:kind: Deployment
+1275:# Source: falco/charts/falcosidekick/templates/deployment.yaml
+1277:kind: Deployment
+1364:# Source: falco/charts/falcosidekick/templates/deployment-ui.yaml
+1366:kind: StatefulSet
+1440:# Source: falco/charts/falcosidekick/templates/tests/test-connection.yaml
+1442:kind: Pod
+(exit code: 0)
+
+=> two Deployments, one StatefulSet, three Services. THE REDIS IS A
+   StatefulSet WITH A REAL PVC, not an emptyDir — read the rendered spec
+   rather than the `storageEnabled: true` value that produced it:
+
+$ sed -n '1364,1439p' <raw>/s1-helm-template-rendered.yaml
+[... 60 lines elided — metadata, labels, selector and the redis container's probes ...]
+          volumeMounts:
+          - name: falco-falcosidekick-ui-redis-data
+            mountPath: /data
+          resources:
+            {}
+
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: falco-falcosidekick-ui-redis-data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+(exit code: 0)
+
+=> A 1Gi RWO PVC mounted at /data. READ THAT AND YOU WOULD CONCLUDE THE EVENTS
+   PERSIST. Section 7 tests it and they do not. This is exactly why the repo
+   proves things from behaviour instead of from specs.
+
+2d. A FOURTH IMAGE EXISTS IN THE CHART AND IS NOT PINNED. It is rendered above
+at line 1442 and it is NOT installed by `helm upgrade`, because of one
+annotation:
+
+$ sed -n '1440,1460p' <raw>/s1-helm-template-rendered.yaml
+# Source: falco/charts/falcosidekick/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "falco-falcosidekick-test-connection"
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: falcosidekick
+    helm.sh/chart: falcosidekick-0.12.1
+    app.kubernetes.io/instance: falco
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": test-success
+spec:
+  containers:
+    - name: curl
+      image: appropriate/curl
+      command: ['curl']
+      args:  ["-X", "POST", 'falco-falcosidekick:2801/ping']
+  restartPolicy: Never
+
+(exit code: 0)
+
+=> `image: appropriate/curl` — NO REGISTRY, NO TAG, NO DIGEST. It is gated by
+   `helm.sh/hook: test-success`, so `helm upgrade` never creates it and
+   `kubectl get pods` in section 3 does not show it. `helm test falco` WOULD
+   create it and would pull `docker.io/appropriate/curl:latest`. THAT COMMAND
+   WAS NOT RUN and must not be, while the repo's thesis is immutability. This
+   is recorded because phase 6 section 2e was marked down for exactly this
+   failure mode — an unpinned artifact surviving a pin that looked complete —
+   and the honest statement is that this one is dormant, not absent.
+
+2e. THE THREE DIGESTS, AND THE COMMAND THAT RESOLVED EACH. All three are
+MANIFEST LISTS, the form a multi-arch kubelet resolves, which is the same
+standard phase 6 applied to the Falco and falcoctl images:
+
+$ docker buildx imagetools inspect falcosecurity/falcosidekick:2.32.0
+Name:      docker.io/falcosecurity/falcosidekick:2.32.0
+MediaType: application/vnd.docker.distribution.manifest.list.v2+json
+Digest:    sha256:1976da72151850aae4436f33a5ed94bdef469f42a9b61c182b4feeb5441fb081
+
+Manifests:
+  Name:      docker.io/falcosecurity/falcosidekick:2.32.0@sha256:399d95934a67b1c6b57d3e1f678694b3407f89f878e8fd072dba51968fa9745f
+  MediaType: application/vnd.docker.distribution.manifest.v2+json
+  Platform:  linux/amd64
+[... remaining per-platform manifest entries elided ...]
+(exit code: 0)
+
+$ docker buildx imagetools inspect falcosecurity/falcosidekick-ui:2.2.0
+Name:      docker.io/falcosecurity/falcosidekick-ui:2.2.0
+MediaType: application/vnd.docker.distribution.manifest.list.v2+json
+Digest:    sha256:0faadedfdff7e6af8be0d7d90efb0638cedc337e4e5c3e57f527da2f6722c851
+[... per-platform manifest entries elided ...]
+(exit code: 0)
+
+$ docker buildx imagetools inspect redis/redis-stack:7.2.0-v11
+Name:      docker.io/redis/redis-stack:7.2.0-v11
+MediaType: application/vnd.docker.distribution.manifest.list.v2+json
+Digest:    sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b
+[... per-platform manifest entries elided; this list carries linux/arm64 FIRST and linux/amd64 second ...]
+(exit code: 0)
+
+=> the `Digest:` line is the manifest-LIST digest and is what gets pinned. The
+   per-platform `Name:` lines carry a DIFFERENT digest (the amd64 image's own),
+   and pinning that one would break on any other architecture. The redis list
+   prints arm64 first, which is a reminder that the first entry is not "the"
+   image. NOTHING ON THIS CLUSTER COMPELLED ANY OF THESE PINS: Kyverno's four
+   ValidatingPolicies and its ImageValidatingPolicy are scoped by
+   namespaceSelector to [demo, demo-kyverno-only] and do not evaluate anything
+   in `falco`. Every pin here is self-imposed and self-verified, and section 3
+   shows the digests landing in the live objects.
+
+============================================================
+3) THE UPGRADE
+============================================================
+
+Restating ALL of revision 1's --set flags is deliberate and not redundant.
+`--reuse-values` was NOT used: this repo keeps no values.yaml anywhere, so the
+written command IS the record, and a command that only names the deltas would
+stop replaying the install. Revision 1 carried ELEVEN --set flags (confirmed
+against `helm -n falco get values falco`, which listed exactly those eleven
+settings). Two of them change value and four are added, for fifteen.
+
+$ helm upgrade falco falcosecurity/falco \
+  --namespace falco \
+  --version 9.1.0 \
+  --set driver.kind=modern_ebpf \
+  --set image.tag=0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b \
+  --set falcoctl.image.tag=0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02 \
+  --set falcoctl.artifact.follow.enabled=false \
+  --set falcoctl.config.artifact.install.refs[0]=ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 \
+  --set falcoctl.config.artifact.follow.refs[0]=ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 \
+  --set collectors.containerEngine.pluginRef=ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891 \
+  --set collectors.kubernetes.enabled=false \
+  --set falcosidekick.enabled=true \
+  --set falcosidekick.webui.enabled=true \
+  --set falcosidekick.image.tag=2.32.0@sha256:1976da72151850aae4436f33a5ed94bdef469f42a9b61c182b4feeb5441fb081 \
+  --set falcosidekick.webui.image.tag=2.2.0@sha256:0faadedfdff7e6af8be0d7d90efb0638cedc337e4e5c3e57f527da2f6722c851 \
+  --set falcosidekick.webui.initContainer.image.tag=7.2.0-v11@sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b \
+  --set falcosidekick.webui.redis.image.tag=7.2.0-v11@sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b \
+  --set tty=true \
+  --timeout 10m --wait
+I0803 13:36:17.563243   23700 warnings.go:107] "Warning: would violate PodSecurity \"restricted:latest\": privileged (container \"falco\" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.capabilities.drop=[\"ALL\"]), restricted volume types (volumes \"container-engine-socket-0\", \"container-engine-socket-1\", \"container-engine-socket-2\", \"container-engine-socket-3\", \"container-engine-socket-4\", \"container-engine-socket-5\", \"boot-fs\", \"lib-modules\", \"usr-fs\", \"etc-fs\", \"sys-fs\", \"proc-fs\" use restricted volume type \"hostPath\"), runAsNonRoot != true (pod or containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers \"falcoctl-artifact-install\", \"falco\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")"
+I0803 13:36:17.580782   23700 warnings.go:107] "Warning: would violate PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false (containers \"wait-redis\", \"falcosidekick-ui\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers \"wait-redis\", \"falcosidekick-ui\" must set securityContext.capabilities.drop=[\"ALL\"]), runAsNonRoot != true (pod or containers \"wait-redis\", \"falcosidekick-ui\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers \"wait-redis\", \"falcosidekick-ui\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")"
+I0803 13:36:17.596974   23700 warnings.go:107] "Warning: would violate PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false (container \"falcosidekick\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container \"falcosidekick\" must set securityContext.capabilities.drop=[\"ALL\"]), runAsNonRoot != true (pod or container \"falcosidekick\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container \"falcosidekick\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")"
+I0803 13:36:17.614988   23700 warnings.go:107] "Warning: would violate PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false (container \"redis\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container \"redis\" must set securityContext.capabilities.drop=[\"ALL\"]), runAsNonRoot != true (pod or container \"redis\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container \"redis\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")"
+Release "falco" has been upgraded. Happy Helming!
+NAME: falco
+LAST DEPLOYED: Mon Aug  3 13:36:16 2026
+NAMESPACE: falco
+STATUS: deployed
+REVISION: 2
+DESCRIPTION: Upgrade complete
+NOTES:
+Falco agents are spinning up on each node in your cluster. After a few
+seconds, they are going to start monitoring your containers looking for
+security issues.
+(exit code: 0 — first attempt, no retry, no rollback)
+
+=> FOUR PSA warnings, not one. The namespace's `warn: restricted` label makes
+   the apiserver enumerate, in its own words, what each new workload does that
+   `restricted` forbids. That is section 8's evidence and it arrived for free.
+
+$ helm -n falco list
+NAME 	NAMESPACE	REVISION	UPDATED                             	STATUS  	CHART      	APP VERSION
+falco	falco    	2       	2026-08-03 13:36:16.905806 -0500 CDT	deployed	falco-9.1.0	0.44.1
+(exit code: 0)
+
+$ kubectl -n falco get pods,svc,deploy,statefulset,pvc -o wide
+NAME                                         READY   STATUS    RESTARTS   AGE   IP            NODE                   NOMINATED NODE   READINESS GATES
+pod/falco-falcosidekick-ccbb99b56-cmh2b      1/1     Running   0          82s   10.244.1.6    seclab-worker2         <none>           <none>
+pod/falco-falcosidekick-ccbb99b56-qtjxm      1/1     Running   0          82s   10.244.2.8    seclab-worker          <none>           <none>
+pod/falco-falcosidekick-ui-d4779ff66-bn2jj   1/1     Running   0          82s   10.244.1.7    seclab-worker2         <none>           <none>
+pod/falco-falcosidekick-ui-d4779ff66-zs94v   1/1     Running   0          82s   10.244.2.9    seclab-worker          <none>           <none>
+pod/falco-falcosidekick-ui-redis-0           1/1     Running   0          82s   10.244.1.9    seclab-worker2         <none>           <none>
+pod/falco-p95h2                              1/1     Running   0          81s   10.244.2.10   seclab-worker          <none>           <none>
+pod/falco-p9ljh                              1/1     Running   0          44s   10.244.1.10   seclab-worker2         <none>           <none>
+pod/falco-t827z                              1/1     Running   0          26s   10.244.0.6    seclab-control-plane   <none>           <none>
+
+NAME                                   TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)             AGE   SELECTOR
+service/falco-falcosidekick            ClusterIP   10.96.81.224    <none>        2801/TCP,2810/TCP   82s   app.kubernetes.io/component=core,app.kubernetes.io/instance=falco,app.kubernetes.io/name=falcosidekick
+service/falco-falcosidekick-ui         ClusterIP   10.96.163.190   <none>        2802/TCP            82s   app.kubernetes.io/component=ui,app.kubernetes.io/instance=falco,app.kubernetes.io/name=falcosidekick
+service/falco-falcosidekick-ui-redis   ClusterIP   10.96.245.44    <none>        6379/TCP            82s   app.kubernetes.io/component=ui-redis,app.kubernetes.io/instance=falco,app.kubernetes.io/name=falcosidekick
+
+NAME                                     READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS         IMAGES                                                                                                                   SELECTOR
+deployment.apps/falco-falcosidekick      2/2     2            2           82s   falcosidekick      docker.io/falcosecurity/falcosidekick:2.32.0@sha256:1976da72151850aae4436f33a5ed94bdef469f42a9b61c182b4feeb5441fb081     app.kubernetes.io/component=core,app.kubernetes.io/instance=falco,app.kubernetes.io/name=falcosidekick
+deployment.apps/falco-falcosidekick-ui   2/2     2            2           82s   falcosidekick-ui   docker.io/falcosecurity/falcosidekick-ui:2.2.0@sha256:0faadedfdff7e6af8be0d7d90efb0638cedc337e4e5c3e57f527da2f6722c851   app.kubernetes.io/component=ui,app.kubernetes.io/instance=falco,app.kubernetes.io/name=falcosidekick
+
+NAME                                            READY   AGE   CONTAINERS   IMAGES
+statefulset.apps/falco-falcosidekick-ui-redis   1/1     82s   redis        docker.io/redis/redis-stack:7.2.0-v11@sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b
+
+NAME                                                                                     STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE   VOLUMEMODE
+persistentvolumeclaim/falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0   Bound    pvc-3925c476-d2aa-475d-8250-0c0cc8cb65c0   1Gi        RWO            standard       <unset>                 82s   Filesystem
+(exit code: 0)
+
+=> all three pinned digests are on the LIVE objects, not just in the command.
+   Note the `falco-falcosidekick` Service exposes TWO ports: 2801 (the alert
+   intake Falco POSTs to) and 2810 (falcosidekick's own Prometheus metrics).
+   Running is not the proof; sections 4 to 6 are.
+
+============================================================
+4) FALCO'S OWN CONFIG ACTUALLY CHANGED — READ FROM THE RUNNING CONTAINER
+============================================================
+
+Section 2b showed the chart's INTENT. This is the running sensor's config,
+read the phase-6 way, and it is the only thing that settles the question:
+
+$ MSYS_NO_PATHCONV=1 kubectl -n falco exec falco-p95h2 -c falco -- sed -n '/^http_output:/,/^[a-z]/p' /etc/falco/falco.yaml
+http_output:
+  ca_bundle: ""
+  ca_cert: ""
+  ca_path: /etc/falco/certs/
+  client_cert: /etc/falco/certs/client/client.crt
+  client_key: /etc/falco/certs/client/client.key
+  compress_uploads: false
+  echo: false
+  enabled: true
+  insecure: false
+  keep_alive: false
+  max_consecutive_timeouts: 5
+  mtls: false
+  url: http://falco-falcosidekick:2801
+  user_agent: falcosecurity/falco
+json_include_message_property: false
+(exit code: 0)
+
+$ kubectl -n falco exec falco-p95h2 -c falco -- grep -E '^json_output:|^json_include_output_property:' /etc/falco/falco.yaml
+json_include_output_property: true
+json_output: true
+(exit code: 0)
+
+=> compare against 1b, line for line. `enabled: false` -> `enabled: true`.
+   `url: ""` -> `url: http://falco-falcosidekick:2801`. `json_output: false` ->
+   `json_output: true`. NOT ONE --set FLAG NAMED ANY OF THOSE THREE. The
+   `falco.falcosidekickConfig` helper from 2b did it, and the proof that it
+   took effect is here in the container, not in the template.
+
+Everything else is unchanged: `stdout_output` is still `enabled: true`, so the
+old channel still works and phase 6's runbook does not become wrong. And
+`json_output: true` has a second consequence phase 6 explicitly could not
+have: phase 6's preamble records that rule NAMES were "a named unverified
+input" because json_output was false and no alert line carried one. From here
+on the rule name IS a captured field — section 5 reads
+`"rule":"Terminal shell in container"` straight out of the stored event.
+
+============================================================
+5) THE ROUTED ALERT, END TO END, WITH THE MARKER
+============================================================
+
+5a. THE BASELINE, TAKEN PER-POD AND NOT THROUGH THE SERVICE. falcosidekick
+runs 2 replicas and each keeps its OWN counters, so a curl to the Service
+returns whichever pod answered and is useless as a baseline. Both pods are
+queried directly through the apiserver's pod-proxy subresource:
+
+$ date -u +"%Y-%m-%dT%H:%M:%S.%NZ"; for p in <the two sidekick pods>; do echo "== $p =="; kubectl -n falco get --raw "/api/v1/namespaces/falco/pods/$p:2801/proxy/metrics" | grep -E "^falcosecurity_falcosidekick_(falco_events_total|inputs_total|outputs_total)"; done
+2026-08-03T18:38:41.259718400Z
+== falco-falcosidekick-ccbb99b56-cmh2b ==
+falcosecurity_falcosidekick_falco_events_total{hostname="seclab-worker2",k8s_ns_name="",k8s_pod_name="",priority="3",priority_raw="notice",rule="Run shell untrusted",source="syscall"} 1
+falcosecurity_falcosidekick_inputs_total{source="requests",status="accepted"} 1
+falcosecurity_falcosidekick_outputs_total{destination="webui",status="ok"} 1
+== falco-falcosidekick-ccbb99b56-qtjxm ==
+(exit code: 1 — grep's, from the second pod having no matching lines at all)
+
+=> BASELINE: 1 event accepted cluster-wide, all of it on cmh2b; qtjxm has
+   received nothing and prints no lines. The one event is not from an attack —
+   it is `Run shell untrusted`, fired by this evidence run's own `kubectl exec`
+   into a falco container three minutes earlier. Recorded, not filtered.
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+1
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli FT._LIST
+eventIndex
+(exit code: 0)
+
+=> one stored event, and one RediSearch index named `eventIndex`. Remember
+   that index; section 7 is about what happens to it.
+
+5b. THE ATTACK. Phase 6 section 3a's method exactly: the stock rule requires
+`proc.tty != 0`, and `kubectl exec -it` from Git Bash does NOT allocate a PTY,
+so the exec is driven through util-linux `script` on the control-plane node.
+Target is `demo/nginx-78c88678f4-8k5lb` — PSA `enforce: restricted`, uid 101,
+all capabilities dropped, read-only root filesystem. The hardened workload,
+not a helper pod stood up to be easy to detect:
+
+$ echo "T0=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; docker exec seclab-control-plane script -q -c "kubectl exec -it -n demo nginx-78c88678f4-8k5lb -- /bin/sh -c 'tty; id; echo P6B-ROUTED-MARKER'" /dev/null; echo "T1=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+T0=2026-08-03T18:39:03.234989100Z
+^@/dev/pts/0
+uid=101(nginx) gid=101(nginx) groups=101(nginx)
+P6B-ROUTED-MARKER
+(exit code: 0)
+T1=2026-08-03T18:39:03.694388700Z
+
+=> a real PTY (`/dev/pts/0`) and uid 101. THE ATTACK SUCCEEDED — it printed
+   its output and exited 0. Nothing blocked it, exactly as in phase 6. The
+   window is T0 18:39:03.234989100Z -> T1 18:39:03.694388700Z, 459.4 ms wide.
+
+5c. THE SAME EVENT AT THE SIDEKICK, 8 SECONDS LATER:
+
+$ date -u +"%Y-%m-%dT%H:%M:%S.%NZ"; for p in <the two sidekick pods>; do echo "== $p =="; kubectl -n falco get --raw "/api/v1/namespaces/falco/pods/$p:2801/proxy/metrics" | grep -E "^falcosecurity_falcosidekick_(falco_events_total|inputs_total|outputs_total)"; done
+2026-08-03T18:39:11.365199600Z
+== falco-falcosidekick-ccbb99b56-cmh2b ==
+falcosecurity_falcosidekick_falco_events_total{hostname="seclab-control-plane",k8s_ns_name="",k8s_pod_name="",priority="3",priority_raw="notice",rule="Terminal shell in container",source="syscall"} 1
+falcosecurity_falcosidekick_falco_events_total{hostname="seclab-worker2",k8s_ns_name="",k8s_pod_name="",priority="3",priority_raw="notice",rule="Run shell untrusted",source="syscall"} 1
+falcosecurity_falcosidekick_falco_events_total{hostname="seclab-worker2",k8s_ns_name="",k8s_pod_name="",priority="3",priority_raw="notice",rule="Terminal shell in container",source="syscall"} 1
+falcosecurity_falcosidekick_inputs_total{source="requests",status="accepted"} 3
+falcosecurity_falcosidekick_outputs_total{destination="webui",status="ok"} 3
+== falco-falcosidekick-ccbb99b56-qtjxm ==
+falcosecurity_falcosidekick_falco_events_total{hostname="seclab-worker",k8s_ns_name="demo",k8s_pod_name="nginx-78c88678f4-8k5lb",priority="3",priority_raw="notice",rule="Terminal shell in container",source="syscall"} 1
+falcosecurity_falcosidekick_inputs_total{source="requests",status="accepted"} 1
+falcosecurity_falcosidekick_outputs_total{destination="webui",status="ok"} 1
+(exit code: 0)
+
+=> the arithmetic, written out rather than asserted:
+     inputs_total  cmh2b 1 -> 3   (+2)
+     inputs_total  qtjxm 0 -> 1   (+1)      the metric did not exist before
+     TOTAL         1 -> 4         (+3)
+   THREE POSTs FOR ONE ATTACK. That is phase 6 section 3c's shared-kernel
+   artifact arriving at the sidekick: three Falco pods on one kernel each saw
+   the same execve and each POSTed it. DIVIDE BY THREE. The Service's
+   round-robin split them 2/1 across the sidekick replicas, which is why
+   per-pod baselines were necessary.
+   Read the `hostname` and `k8s_*` labels: the copy on qtjxm carries
+   `k8s_ns_name="demo"` and `k8s_pod_name="nginx-78c88678f4-8k5lb"` and comes
+   from `hostname="seclab-worker"` — the sensor co-located with the target's
+   containerd. The other two carry EMPTY k8s labels. Only one of the three
+   copies is worth anything, and it is not the first one to arrive.
+   `outputs_total{destination="webui",status="ok"}` moved 1 -> 4 in step: all
+   three were written onward, none errored.
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+4
+(exit code: 0)
+
+=> 1 -> 4. The store agrees with the counters.
+
+5d. THE STORED EVENT ITSELF — the k8s-enriched copy, retrieved from the Web
+UI's backing store by key. Falcosidekick-UI stores each event as a Redis HASH
+(not a JSON document: `JSON.GET` returns `Existing key has wrong Redis type`),
+with the whole event in a `json` field:
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli HGET event:a6c5ccd6-3d83-4dce-9487-1bf0270eea55 json
+{"uuid":"a6c5ccd6-3d83-4dce-9487-1bf0270eea55","output":"18:39:03.551716000: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo P6B-ROUTED-MARKER terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=7b14da7f1677 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=7312fa98595737958df41e20f21a2880dd9775f455c6bf76e638024dc755d201 k8s_pod_name=nginx-78c88678f4-8k5lb k8s_ns_name=demo","priority":"Notice","rule":"Terminal shell in container","time":"2026-08-03T18:39:03.551716Z","source":"syscall","output_fields":{"container.id":"7b14da7f1677","container.image.repository":"docker.io/nginxinc/nginx-unprivileged","container.image.tag":"7312fa98595737958df41e20f21a2880dd9775f455c6bf76e638024dc755d201","container.name":"nginx","evt.arg.flags":"EXE_LOWER_LAYER","evt.time":1785782343551716000,"evt.type":"execve","k8s.ns.name":"demo","k8s.pod.name":"nginx-78c88678f4-8k5lb","proc.cmdline":"sh -c tty; id; echo P6B-ROUTED-MARKER","proc.exepath":"/bin/busybox","proc.name":"sh","proc.pname":null,"proc.tty":34816,"user.loginuid":-1,"user.name":"<NA>","user.uid":101},"hostname":"seclab-worker","tags":["","T1059","container","maturity_stable","mitre_execution","shell"]}
+(exit code: 0)
+
+=> THE MARKER IS IN THE STORED EVENT, twice: once in the human `output`
+   string and once in the structured field `"proc.cmdline":"sh -c tty; id;
+   echo P6B-ROUTED-MARKER"`. `"time":"2026-08-03T18:39:03.551716Z"` sits
+   inside the 5b window 18:39:03.234989100Z -> 18:39:03.694388700Z.
+   `"proc.tty":34816` is the non-zero TTY the rule requires and `"user.uid":101`
+   confirms it fired against the NON-ROOT hardened workload — the same two
+   facts phase 6 section 3b established, now as typed fields instead of a
+   substring of a log line.
+   THREE THINGS HERE DID NOT EXIST IN PHASE 6 AT ALL:
+     "rule":"Terminal shell in container"  — phase 6's preamble had to record
+       the rule name as an unverified identification. It is now a stored field.
+     "tags":["","T1059","container","maturity_stable","mitre_execution","shell"]
+       — the ruleset's own ATT&CK reference travelled with the event. The empty
+       first element is in the data as shown, not a transcription artifact.
+     "uuid" — a stable identifier, so the same event can be referred to twice.
+
+$ for k in <all 4 keys>; do echo "== $k =="; kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli HGET "$k" json; done > <raw>/s4-redis-all-events-json.txt
+$ grep -c "P6B-ROUTED-MARKER" <raw>/s4-redis-all-events-json.txt
+3
+(exit code: 0)
+
+=> 3 of the 4 stored documents carry the marker: the triplication again. The
+   fourth is the pre-attack `Run shell untrusted` event from the baseline.
+
+============================================================
+6) SURVIVAL ACROSS THE SENSOR POD'S DEATH — THE POINT OF THE PHASE
+============================================================
+
+6a. THE ALERT IS IN THE SENSOR'S OWN LOG FIRST, as it always was:
+
+$ kubectl -n falco logs falco-p95h2 -c falco | grep -c "P6B-ROUTED-MARKER"
+1
+(exit code: 0)
+
+6b. KILL THE SENSOR THAT PRODUCED IT. falco-p95h2 is the pod on seclab-worker
+— the ONLY one of the three whose copy carried the k8s metadata:
+
+$ kubectl -n falco delete pod falco-p95h2
+pod "falco-p95h2" deleted from falco namespace
+(exit code: 0)
+
+$ kubectl -n falco logs falco-p95h2 -c falco
+error: error from server (NotFound): pods "falco-p95h2" not found in namespace "falco"
+(exit code: 1)
+
+6c. AND THEN KILL ALL THREE, so no reader has to wonder whether a surviving
+pod still held a copy. The DaemonSet recreates them; this is safe and
+reversible:
+
+$ kubectl -n falco delete pod -l app.kubernetes.io/name=falco
+pod "falco-p9ljh" deleted from falco namespace
+pod "falco-rlw27" deleted from falco namespace
+pod "falco-t827z" deleted from falco namespace
+(exit code: 0)
+
+$ kubectl -n falco rollout status daemonset/falco --timeout=180s
+Waiting for daemon set "falco" rollout to finish: 0 of 3 updated pods are available...
+Waiting for daemon set "falco" rollout to finish: 1 of 3 updated pods are available...
+Waiting for daemon set "falco" rollout to finish: 2 of 3 updated pods are available...
+daemon set "falco" successfully rolled out
+(exit code: 0)
+
+$ date -u +"%Y-%m-%dT%H:%M:%S.%NZ"; for p in <the three new falco pods>; do echo -n "$p P6B-ROUTED-MARKER-lines="; kubectl -n falco logs $p -c falco | grep -c "P6B-ROUTED-MARKER"; done
+2026-08-03T18:41:08.911483000Z
+falco-6hp56 P6B-ROUTED-MARKER-lines=0
+falco-cq9ck P6B-ROUTED-MARKER-lines=0
+falco-tz6ts P6B-ROUTED-MARKER-lines=0
+(exit code: 1 — grep's, from the last iteration finding no match)
+
+=> THE STDOUT CHANNEL IS NOW COMPLETELY WIPED. Under phase 6 this is the
+   moment the alert ceased to exist. Every trace of it in every pod log on the
+   cluster is gone, and `kubectl logs --previous` cannot help: these are new
+   PODS, not restarted containers.
+
+6d. AND THE EVENT IS STILL THERE:
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+4
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli HGET event:a6c5ccd6-3d83-4dce-9487-1bf0270eea55 json
+{"uuid":"a6c5ccd6-3d83-4dce-9487-1bf0270eea55","output":"18:39:03.551716000: Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=<NA> user_uid=101 user_loginuid=-1 process=sh proc_exepath=/bin/busybox parent=<NA> command=sh -c tty; id; echo P6B-ROUTED-MARKER terminal=34816 exe_flags=EXE_LOWER_LAYER container_id=7b14da7f1677 container_name=nginx container_image_repository=docker.io/nginxinc/nginx-unprivileged container_image_tag=7312fa98595737958df41e20f21a2880dd9775f455c6bf76e638024dc755d201 k8s_pod_name=nginx-78c88678f4-8k5lb k8s_ns_name=demo","priority":"Notice","rule":"Terminal shell in container","time":"2026-08-03T18:39:03.55171
+[... the remainder of the document is byte-identical to the copy printed in full in 5d and is truncated here at 700 bytes ...]
+(exit code: 0)
+
+$ grep -c "P6B-ROUTED-MARKER" <raw>/s4-redis-all-events-after-sensor-wipe.txt
+3
+(exit code: 0)
+
+=> SAME UUID, SAME MARKER, SAME k8s METADATA, AFTER EVERY SENSOR THAT SAW IT
+   WAS DESTROYED. All three copies survive. THAT IS THE ONE THING PHASE 6b
+   ADDS THAT PHASE 6 DID NOT HAVE, and it is demonstrated rather than
+   asserted. It is also the ONLY thing: nothing here stopped the attack,
+   nothing told anyone, and section 7 is about how fragile even this is.
+
+============================================================
+7) THE LIMITS, EACH TESTED RATHER THAN ASSUMED
+============================================================
+
+7a. THE PVC IS REAL AND IT DID NOT SAVE THE DATA. Section 2c's rendered spec
+promised a 1Gi PVC and section 3 showed it Bound. Read the actual persistence
+configuration out of the running Redis, not out of the chart:
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli CONFIG GET save
+save
+3600 1 300 100 60 10000
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli CONFIG GET appendonly
+appendonly
+no
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli CONFIG GET dir
+dir
+/data
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- ls -la /data
+total 8
+drwxrwxrwx 2 root root 4096 Aug  3 18:36 .
+drwxr-xr-x 1 root root 4096 Aug  3 18:36 ..
+(exit code: 0)
+
+=> RDB SNAPSHOTS ONLY, NO APPEND-ONLY FILE, AND /data IS EMPTY. The three save
+   thresholds are "1 change in 3600 s", "100 changes in 300 s", "10000 changes
+   in 60 s". This lab produced 4 changes in about 6 minutes, which meets none
+   of them. THERE IS NO dump.rdb. Every stored event exists only in RAM, on a
+   volume whose whole purpose is to stop that being true.
+
+Test it rather than reason about it:
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+4
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli LASTSAVE
+1785782208
+$ kubectl -n falco delete pod falco-falcosidekick-ui-redis-0
+pod "falco-falcosidekick-ui-redis-0" deleted from falco namespace
+(exit code: 0)
+
+$ kubectl -n falco get pod falco-falcosidekick-ui-redis-0 -o wide
+NAME                             READY   STATUS    RESTARTS   AGE   IP            NODE             NOMINATED NODE   READINESS GATES
+falco-falcosidekick-ui-redis-0   1/1     Running   0          8s    10.244.1.12   seclab-worker2   <none>           <none>
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+0
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- ls -la /data
+total 8
+drwxrwxrwx 2 root root 4096 Aug  3 18:36 .
+drwxr-xr-x 1 root root 4096 Aug  3 18:42 ..
+$ kubectl -n falco get pvc
+NAME                                                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0   Bound    pvc-3925c476-d2aa-475d-8250-0c0cc8cb65c0   1Gi        RWO            standard       <unset>                 6m14s
+(exit code: 0)
+
+=> DBSIZE 4 -> 0. THE PVC IS STILL BOUND, STILL 1Gi, STILL THE SAME VOLUME —
+   AND EVERY EVENT IS GONE, INCLUDING THE ONE SECTION 6 JUST PROVED SURVIVES A
+   SENSOR RESTART. The volume was reattached (its mtime moved to 18:42) and it
+   was empty when it was reattached, because nothing had ever been written to
+   it. `LASTSAVE 1785782208` is the process's startup value, not a snapshot of
+   these events. WHAT 6b BUYS IS SURVIVAL OF THE SENSOR, NOT SURVIVAL OF THE
+   STORE. Both sentences are needed and neither implies the other.
+
+7b. AND IT IS WORSE THAN LOSING THE DATA — THE INGEST PATH STAYED BROKEN.
+Fire a fresh marked attack after the Redis restart and watch it fail to land:
+
+$ echo "T0=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; docker exec seclab-control-plane script -q -c "kubectl exec -it -n demo nginx-78c88678f4-8k5lb -- /bin/sh -c 'echo P6B-REDIS-RESTART-MARKER'" /dev/null; echo "T1=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+T0=2026-08-03T18:42:55.776913600Z
+P6B-REDIS-RESTART-MARKER
+(exit code: 0)
+T1=2026-08-03T18:42:56.170526700Z
+
+$ for p in <the three falco pods>; do echo -n "$p "; kubectl -n falco logs $p -c falco | grep -c "P6B-REDIS-RESTART-MARKER"; done
+falco-6hp56 1
+falco-cq9ck 1
+falco-tz6ts 1
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+0
+
+=> ALL THREE SENSORS DETECTED IT AND THE STORE STAYED EMPTY. The alert is back
+   to being a line in a pod log. Find out where it stopped:
+
+$ kubectl -n falco logs -l app.kubernetes.io/component=core --tail=10 --prefix
+[... 16 lines elided — the startup lines and the successful 18:39:03 POSTs already shown in section 5 ...]
+[pod/falco-falcosidekick-ccbb99b56-qtjxm/falcosidekick] 2026/08/03 18:42:56 [ERROR] : WebUI - exceeding post rate limit (500)
+[pod/falco-falcosidekick-ccbb99b56-qtjxm/falcosidekick] 2026/08/03 18:42:56 [ERROR] : WebUI - internal server error
+[pod/falco-falcosidekick-ccbb99b56-cmh2b/falcosidekick] 2026/08/03 18:42:56 [ERROR] : WebUI - exceeding post rate limit (500)
+[pod/falco-falcosidekick-ccbb99b56-cmh2b/falcosidekick] 2026/08/03 18:42:56 [ERROR] : WebUI - internal server error
+(exit code: 0)
+
+$ kubectl -n falco logs -l app.kubernetes.io/component=ui -c falcosidekick-ui --tail=20 --prefix
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:36:58 [WARN] : Index does not exist
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:36:58 [WARN] : Create Index
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:36:58 [INFO] : Falcosidekick UI is listening on 0.0.0.0:2802
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:36:58 [INFO] : log level is info
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:42:24 [ERROR]: [0] dial tcp 10.96.245.44:6379: connect: connection refused
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui]
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:42:56 [ERROR]: [0] Unknown index name
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui]
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui] 2026/08/03 18:42:56 [ERROR]: [0] Unknown index name
+[pod/falco-falcosidekick-ui-d4779ff66-bn2jj/falcosidekick-ui]
+[pod/falco-falcosidekick-ui-d4779ff66-zs94v/falcosidekick-ui] 2026/08/03 18:37:00 [INFO] : Falcosidekick UI is listening on 0.0.0.0:2802
+[pod/falco-falcosidekick-ui-d4779ff66-zs94v/falcosidekick-ui] 2026/08/03 18:37:00 [INFO] : log level is info
+[pod/falco-falcosidekick-ui-d4779ff66-zs94v/falcosidekick-ui] 2026/08/03 18:42:56 [ERROR]: [0] Unknown index name
+[pod/falco-falcosidekick-ui-d4779ff66-zs94v/falcosidekick-ui]
+(exit code: 0)
+
+=> ROOT CAUSE, IN THE COMPONENT'S OWN WORDS: `Unknown index name`. The
+   `eventIndex` from 5a is a RediSearch index that the UI creates ONCE, AT
+   STARTUP ("Index does not exist / Create Index", 18:36:58). The Redis
+   restart took the index with the data, and the UI never recreates it, so
+   every subsequent write fails. falcosidekick surfaces that as HTTP 500 and
+   mislabels it "exceeding post rate limit", which is a misleading error
+   message pointing at the wrong cause — worth knowing before someone tunes a
+   rate limit that is not the problem.
+   NOTHING SELF-HEALED. The empty lines between the UI's ERROR lines are in the
+   output as shown. Recovery required a manual restart:
+
+$ kubectl -n falco rollout restart deployment/falco-falcosidekick-ui
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (containers "wait-redis", "falcosidekick-ui" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (containers "wait-redis", "falcosidekick-ui" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or containers "wait-redis", "falcosidekick-ui" must set securityContext.runAsNonRoot=true), seccompProfile (pod or containers "wait-redis", "falcosidekick-ui" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+deployment.apps/falco-falcosidekick-ui restarted
+$ kubectl -n falco rollout status deployment/falco-falcosidekick-ui --timeout=180s
+[... 6 "Waiting for deployment ... rollout to finish" lines elided ...]
+deployment "falco-falcosidekick-ui" successfully rolled out
+(exit code: 0)
+
+$ echo "T0=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; docker exec seclab-control-plane script -q -c "kubectl exec -it -n demo nginx-78c88678f4-8k5lb -- /bin/sh -c 'echo P6B-RECOVERY-MARKER'" /dev/null; echo "T1=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+T0=2026-08-03T18:44:12.434356600Z
+P6B-RECOVERY-MARKER
+(exit code: 0)
+T1=2026-08-03T18:44:12.816606100Z
+4
+(exit code: 0)
+
+$ for k in <all 4 keys>; do j=$(... HGET "$k" json); echo "$k | marker=$(echo "$j" | grep -c 'P6B-RECOVERY-MARKER') | rule=$(echo "$j" | grep -o '"rule":"[^"]*"') | host=$(echo "$j" | grep -o '"hostname":"[^"]*"')"; done
+event:dc357fe3-3d84-4492-9377-156d0a5a7e7f | marker=1 | rule="rule":"Run shell untrusted" | host="hostname":"seclab-worker2"
+event:039afd7a-0670-46b1-a672-43550fcb9de0 | marker=0 | rule="rule":"Run shell untrusted" | host="hostname":"seclab-worker2"
+event:32e56879-2e1a-4b24-ae10-74e132d88781 | marker=1 | rule="rule":"Terminal shell in container" | host="hostname":"seclab-worker"
+event:1e5beff6-9811-4ed4-80a5-51026b488676 | marker=1 | rule="rule":"Terminal shell in container" | host="hostname":"seclab-control-plane"
+(exit code: 0)
+
+=> INGEST RESTORED, and the release is left healthy. Three of the four stored
+   documents carry the recovery marker — the triplication once more. Note that
+   the seclab-worker2 sensor filed its copy of the SAME execve under a
+   DIFFERENT rule, `Run shell untrusted` rather than `Terminal shell in
+   container`. No command in this run establishes why, so no reason is offered;
+   it is recorded because a reader counting events by rule name would otherwise
+   get a different answer than a reader counting by marker.
+   THE OPERATIONAL SENTENCE THIS SECTION EARNS: this alert pipeline has a
+   single point of failure that loses all history AND silently stops accepting
+   new events, and the only thing that noticed was a human running `grep` on
+   purpose. Nothing alerted on the alerting being down.
+
+7c. NOTHING PAGES ANYBODY, AND THIS IS A CONFIGURATION FACT:
+
+$ kubectl -n falco logs -l app.kubernetes.io/component=core --tail=200 --prefix | grep 'Enabled Outputs'
+[pod/falco-falcosidekick-ccbb99b56-cmh2b/falcosidekick] 2026/08/03 18:36:22 [INFO]  : Enabled Outputs: [WebUI]
+[pod/falco-falcosidekick-ccbb99b56-qtjxm/falcosidekick] 2026/08/03 18:36:22 [INFO]  : Enabled Outputs: [WebUI]
+(exit code: 0)
+
+=> ONE OUTPUT. falcosidekick ships integrations for Slack, Teams, PagerDuty,
+   Opsgenie, SMTP, webhooks and dozens more; NONE is configured, no credential
+   of any kind was entered, and nothing in this release can reach outside the
+   cluster. There is still no rota, no owner and no notification. 6b moved the
+   alert from a disposable log to a durable-ish store; it did not put it in
+   front of a person.
+
+7d. AND IT ALL DIES WITH THE CLUSTER. The PVC's backing volume is a directory
+inside a kind node container:
+
+$ kubectl get pv -o custom-columns=NAME:.metadata.name,CLAIM:.spec.claimRef.name,PATH:.spec.hostPath.path,NODE:'.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]'
+NAME                                       CLAIM                                                              PATH                                                                                                                                          NODE
+pvc-3925c476-d2aa-475d-8250-0c0cc8cb65c0   falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0   /var/local-path-provisioner/pvc-3925c476-d2aa-475d-8250-0c0cc8cb65c0_falco_falco-falcosidekick-ui-redis-data-falco-falcosidekick-ui-redis-0   seclab-worker2
+
+=> `/var/local-path-provisioner/...` INSIDE the `seclab-worker2` container.
+   `kind delete cluster` removes that container and the directory with it.
+   This was NOT proven by deleting the cluster — deleting it is out of scope
+   for this phase — so the claim rests on the path and the node name printed
+   above plus kind's documented behaviour, and it is stated as such. It is
+   also node-pinned: the PVC is RWO and bound to seclab-worker2, so the Redis
+   pod can only ever schedule there.
+
+7e. THE WEB UI IS REACHABLE ONLY BY PORT-FORWARD, AND ITS API DEMANDS
+CREDENTIALS THAT WERE NOT SUPPLIED. All three Services are ClusterIP; no
+Ingress, no NodePort, no LoadBalancer:
+
+$ kubectl -n falco port-forward svc/falco-falcosidekick-ui 2802:2802 &
+$ curl -s -i http://127.0.0.1:2802/api/v1/healthz
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=UTF-8
+Date: Mon, 03 Aug 2026 18:41:54 GMT
+Content-Length: 16
+
+{"status":"ok"}
+(exit code: 0)
+
+$ curl -s -w 'http_code=%{http_code}\n' -o <scratch>/uiroot.html http://127.0.0.1:2802/
+http_code=200
+(exit code: 0)
+
+$ curl -s -i http://127.0.0.1:2802/api/v1/events/count -H 'Accept: application/json' | head -12
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=UTF-8
+Www-Authenticate: basic realm=Restricted
+Date: Mon, 03 Aug 2026 18:42:11 GMT
+Content-Length: 27
+
+{"message":"Unauthorized"}
+(exit code: 0)
+
+=> the UI's static page is served to ANY unauthenticated caller that can reach
+   port 2802 (200), while its data API refuses one (401, basic auth). NO
+   CREDENTIAL WAS SUPPLIED TO IT AT ANY POINT IN THIS PHASE — every event
+   retrieval above went to Redis directly with `redis-cli`, which needs none,
+   and that is itself the finding in section 8.
+
+============================================================
+8) THE ATTACK SURFACE THIS PHASE ADDS
+============================================================
+
+8a. FIVE NEW PODS, THREE NEW IMAGES, NONE OF THEM GATED BY ANYTHING. The
+`falco` namespace is `pod-security.kubernetes.io/enforce=privileged`, and
+Kyverno's four ValidatingPolicies and its ImageValidatingPolicy are scoped by
+namespaceSelector to [demo, demo-kyverno-only]. Nothing on this cluster
+evaluated any of these workloads. Phase 6 section 1f already conceded that for
+the sensor; 6b puts four more pods behind the same exemption, and two of them
+are network services rather than a read-only agent.
+
+8b. WOULD THEY PASS `restricted` IF ANYTHING GATED THEM? NO — BUT READ HOW
+THEY FAIL, BECAUSE IT IS NOT HOW FALCO FAILS. The namespace's `warn:
+restricted` label made the apiserver answer this for free during the section 3
+upgrade. Three of its four warnings are about the new workloads:
+
+  falcosidekick-ui + wait-redis :  allowPrivilegeEscalation, capabilities,
+                                   runAsNonRoot, seccompProfile   (4)
+  falcosidekick                 :  allowPrivilegeEscalation, capabilities,
+                                   runAsNonRoot, seccompProfile   (4)
+  redis                         :  allowPrivilegeEscalation, capabilities,
+                                   runAsNonRoot, seccompProfile   (4)
+  falco + falcoctl (unchanged)  :  privileged, allowPrivilegeEscalation,
+                                   capabilities, restricted volume types
+                                   (12 hostPath mounts), runAsNonRoot,
+                                   seccompProfile                 (6)
+
+(The table above is a COUNT of the categories named in the four verbatim
+warnings quoted in section 3; it is a summary of that output, not a separate
+capture.)
+
+=> FOUR CATEGORIES, NOT SIX. None of the three new workloads is `privileged`,
+   none uses a `hostPath`, none requests a host namespace. What they are
+   missing is four fields that are pure boilerplate to add:
+   `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`,
+   `runAsNonRoot: true`, `seccompProfile.type: RuntimeDefault`. The
+   falcosidekick and UI Deployments already set `runAsUser: 1234` and
+   `fsGroup: 1234` at pod level (read from the rendered spec), so they are
+   ALREADY running as non-root — they just never assert it in the field PSA
+   reads. The redis StatefulSet sets no securityContext at all.
+   SO THE HONEST SENTENCE IS "COULD BE GATED AND IS NOT", not "cannot be
+   gated". The chart exposes `securityContext` values for every one of these
+   containers. Closing this is a values change, not a redesign, and it was NOT
+   done in this phase — deliberately, because the spec for 6b was routing, and
+   changing the hardening posture in the same upgrade would have made it
+   impossible to say which change caused what.
+
+8c. A REDIS WITH NO PASSWORD, REACHABLE BY ANY POD ON THE CLUSTER. Section 5d
+and 7a retrieved and destroyed every stored alert with plain `redis-cli` and
+no credential. The subchart's `webui.redis.password` default is the empty
+string and it was left there; no NetworkPolicy in this repo covers the `falco`
+namespace. THE ALERT STORE IS THEREFORE READABLE AND WRITABLE, WITHOUT
+AUTHENTICATION, BY ANYTHING THAT CAN REACH 10.96.245.44:6379. An attacker who
+lands anywhere on this cluster can delete the record of their own detection —
+which section 7a demonstrates is a one-command operation, even if it did it by
+accident.
+
+8d. THE WEB UI SHIPS A DEFAULT CREDENTIAL AND IT IS IN A SECRET ON THE
+CLUSTER. From the rendered `secrets-ui.yaml`:
+
+$ sed -n '39,57p' <raw>/s1-helm-template-rendered.yaml
+[... 15 lines elided — apiVersion, kind, metadata and labels ...]
+type: Opaque
+data:
+  FALCOSIDEKICK_UI_USER: "YWRtaW46YWRtaW4="
+---
+
+=> that base64 value decodes to the subchart's documented default
+   `webui.user: "admin:admin"` and no command in this run decoded it or used
+   it; the value is quoted as the rendered manifest prints it and the mapping
+   to `admin:admin` comes from the subchart's own values.yaml comment, which is
+   a NAMED UNVERIFIED INPUT here. It was NOT overridden, because overriding it
+   means putting a password somewhere, and this phase deliberately entered no
+   credential anywhere. The 401 in 7e is that credential doing its job against
+   a caller who does not have it; it is not a claim that the credential is a
+   good one.
+
+8e. A DORMANT UNPINNED IMAGE. Section 2d: `helm test falco` would create a Pod
+running `appropriate/curl` with no registry, no tag and no digest. Do not run
+it. The three images this phase actually installs are all pinned by
+manifest-list digest and all three digests are visible on the live objects in
+section 3.
+
+8f. WHAT IS STILL TRUE FROM PHASE 6, UNCHANGED BY ANY OF THIS: the Falco
+DaemonSet still runs `privileged: true` with twelve hostPath mounts,
+`driver.modernEbpf.leastPrivileged` is still `false`, `responseActions` is
+still `false`, no custom rule has been written, no noise baseline exists, no
+false-negative rate has been measured, and `cat /etc/shadow` is still
+invisible to the stock rule on this hardened workload (phase 6 section 3f).
+6b changed exactly one thing and section 6 is the whole of it.
+
+============================================================
+NOT PROVEN HERE
+============================================================
+- That any alert reaches a human. Nothing is configured to notify anyone.
+- That the store is durable. 7a proves the opposite at this event volume.
+- That events survive `kind delete cluster`. 7d gives the path and the node
+  but the cluster was not deleted.
+- That the three new images are trustworthy. They are pinned, which proves the
+  BYTES ARE STABLE, not that they are safe. None was signature-verified: no
+  cosign binary exists on this host, and unlike the two ghcr artifacts phase 6
+  pinned, these are Docker Hub images with no falcoctl init container to
+  verify them.
+- That `restricted` would admit these pods with the four fields added. Only
+  the current failure was measured; no hardened variant was submitted.
+- Why the seclab-worker2 sensor files some execves under `Run shell untrusted`
+  and others under `Terminal shell in container` (7b), and why the 18:34:56
+  pre-upgrade shell alert appeared in one pod's log only (1c). Both are
+  recorded as observed and neither is explained.
+- Any measurement of what falcosidekick drops under load. `inputs_total` was
+  read at two points in time; no sustained rate was generated and
+  `syscall_event_drops` was not sampled.

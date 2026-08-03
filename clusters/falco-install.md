@@ -173,3 +173,156 @@ namespaceSelector to `[demo, demo-kyverno-only]`, so none of them evaluates
 anything in the `falco` namespace; that unenforced namespace is a second
 concrete instance of the residual risk conceded in threat model §6.7, alongside
 `cis-benchmark`.
+
+---
+
+# Phase 6b upgrade — falcosidekick alert routing
+
+Applied 2026-08-03 to the same `falco` release on the same cluster, taking it
+from REVISION 1 to **REVISION 2**. Everything above this line is the phase-6
+record and is unchanged; this section is additive.
+
+**Falco itself is not modified.** Same chart 9.1.0, same app 0.44.1, same
+image digest, same pinned ruleset artifact, same pinned container plugin, same
+`modern_ebpf` driver, same `privileged: true`, same twelve hostPath mounts.
+What changes is where the alert goes: Falco now POSTs JSON to an in-cluster
+falcosidekick, which writes it to a Redis that a Web UI reads. The alert
+therefore **outlives the sensor pod that raised it** — proven by destroying
+every Falco pod on the cluster and retrieving the event afterwards, in
+`docs/evidence/phase-6b-falcosidekick/attack-output.txt` §6.
+
+The sealed-secrets model still holds: there is still **no `values.yaml`
+anywhere in this repo**, so the command below restates every one of revision
+1's eleven `--set` flags verbatim alongside the new ones. **`--reuse-values`
+was deliberately NOT used** — it would have made the written record stop
+replaying the install, which is the one property this file exists to keep.
+
+## Exact command
+
+```bash
+helm upgrade falco falcosecurity/falco \
+  --namespace falco \
+  --version 9.1.0 \
+  --set driver.kind=modern_ebpf \
+  --set image.tag=0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b \
+  --set falcoctl.image.tag=0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02 \
+  --set falcoctl.artifact.follow.enabled=false \
+  --set falcoctl.config.artifact.install.refs[0]=ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 \
+  --set falcoctl.config.artifact.follow.refs[0]=ghcr.io/falcosecurity/rules/falco-rules@sha256:36d143c0ae2d5569da0274ea6bef188bac02b95abe51e44cfff16f38d3d6b9e0 \
+  --set collectors.containerEngine.pluginRef=ghcr.io/falcosecurity/plugins/plugin/container@sha256:f3d531f370e8e7907f5fbfc27f8cf99863563ae02174e420f8bbf8b2b4828891 \
+  --set collectors.kubernetes.enabled=false \
+  --set falcosidekick.enabled=true \
+  --set falcosidekick.webui.enabled=true \
+  --set falcosidekick.image.tag=2.32.0@sha256:1976da72151850aae4436f33a5ed94bdef469f42a9b61c182b4feeb5441fb081 \
+  --set falcosidekick.webui.image.tag=2.2.0@sha256:0faadedfdff7e6af8be0d7d90efb0638cedc337e4e5c3e57f527da2f6722c851 \
+  --set falcosidekick.webui.initContainer.image.tag=7.2.0-v11@sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b \
+  --set falcosidekick.webui.redis.image.tag=7.2.0-v11@sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b \
+  --set tty=true \
+  --timeout 10m --wait
+```
+
+Why each NEW override:
+
+- `falcosidekick.enabled=true` — the flag phase 6 set to `false` and wrote a
+  paragraph justifying. That paragraph's reasoning was that fan-out "needs a
+  real destination (Slack, PagerDuty, a log store) that this lab does not
+  have", and it still stands for *external* destinations: none is configured
+  here and none will be. What changed is that the subchart's own Web UI is a
+  real, in-cluster, credential-free-to-stand-up destination, so the alert can
+  be given a next hop without inventing a fake page. **This flag alone also
+  rewrites Falco's config**: the chart's `falco.falcosidekickConfig` helper
+  sets `json_output: true`, `json_include_output_property: true`,
+  `http_output.enabled: true` and `http_output.url` to the sidekick Service.
+  No `--set` flag names any of those four, and none was added — the helper is
+  quoted and the resulting live config is read back out of a running container
+  in the evidence file §2b and §4.
+- `falcosidekick.webui.enabled=true` — brings up the UI Deployment **and** its
+  Redis StatefulSet, which is where an alert actually survives. Without the UI
+  the sidekick would have zero enabled outputs and would drop every event it
+  accepted. This is the store, not a screenshot.
+- `falcosidekick.image.tag=2.32.0@sha256:…`,
+  `falcosidekick.webui.image.tag=2.2.0@sha256:…`,
+  `falcosidekick.webui.initContainer.image.tag=7.2.0-v11@sha256:…`,
+  `falcosidekick.webui.redis.image.tag=7.2.0-v11@sha256:…` — pin all three new
+  images by **manifest-list** digest, resolved with `docker buildx imagetools
+  inspect` (all three report
+  `application/vnd.docker.distribution.manifest.list.v2+json`), in the same
+  `tag@sha256:` form the Falco and falcoctl pins above use because these
+  subchart templates also build their ref as `registry/repository:tag`. **Four
+  value paths, three distinct images**: the Web UI's `wait-redis` init
+  container and the Redis itself both run `redis/redis-stack:7.2.0-v11`, and
+  missing the init container's separate path would leave a floating tag behind
+  a pin that looked complete — the same trap the `pluginRef` correction
+  recorded above. As with phase 6, **nothing on this cluster compelled these
+  pins**: Kyverno's policies do not reach the `falco` namespace. They are the
+  repo's standard, self-imposed and self-verified against the live objects.
+
+Not set, and worth noting because a reader may assume otherwise: **no external
+sink, no `webui.redis.password`, no `webui.user` override, no Ingress and no
+NodePort.** `falcosidekick.webui.redis.storageEnabled` was left at its chart
+default `true`, which produces a real 1Gi PVC — and that PVC did **not** save
+the data when the Redis pod was deleted, because redis-stack's default RDB
+thresholds (`save 3600 1 300 100 60 10000`, `appendonly no`) are never met at
+this lab's alert volume and no `dump.rdb` had ever been written. That is
+tested, not assumed, in the evidence file §7a, and it is an unremediated gap,
+not a claim of durability. The subchart's default `webui.user` (`admin:admin`)
+is left in place and ships in the `falco-falcosidekick-ui` Secret; overriding
+it would mean putting a password somewhere, and no credential was entered
+anywhere in this phase.
+
+## Pinned versions added by 6b (observed)
+
+| What | Value |
+| --- | --- |
+| falcosidekick subchart | `falcosidekick` **0.12.1** (from the parent chart's `Chart.lock`; appVersion 2.31.1) |
+| falcosidekick image | `docker.io/falcosecurity/falcosidekick:2.32.0` |
+| falcosidekick digest | `sha256:1976da72151850aae4436f33a5ed94bdef469f42a9b61c182b4feeb5441fb081` (manifest list) |
+| Web UI image | `docker.io/falcosecurity/falcosidekick-ui:2.2.0` |
+| Web UI digest | `sha256:0faadedfdff7e6af8be0d7d90efb0638cedc337e4e5c3e57f527da2f6722c851` (manifest list) |
+| Redis image | `docker.io/redis/redis-stack:7.2.0-v11` (used by BOTH the Redis StatefulSet and the UI's `wait-redis` init container) |
+| Redis digest | `sha256:96a8426b991a06c1e07198c5af5a62d0b24e87a7dfd6a1efaff19c2d80af836b` (manifest list) |
+
+Note the subchart's `appVersion` is 2.31.1 while its default image tag is
+2.32.0. The image is what runs, 2.32.0 is what is pinned, and falcosidekick's
+own startup line prints `Falcosidekick version: 2.32.0`.
+
+`helm -n falco list` after the upgrade:
+
+```
+NAME 	NAMESPACE	REVISION	UPDATED                             	STATUS  	CHART      	APP VERSION
+falco	falco    	2       	2026-08-03 13:36:16.905806 -0500 CDT	deployed	falco-9.1.0	0.44.1
+```
+
+The upgrade succeeded on its first attempt with no retry and no rollback. It
+added two Deployments (2 replicas each), one StatefulSet, three ClusterIP
+Services and one Bound 1Gi PVC, and rolled the Falco DaemonSet — which
+destroyed the four alert lines then in the pods' logs, a loss captured
+verbatim in the evidence file §1c/§1d because it is the problem 6b addresses.
+
+## Admission note (6b)
+
+The `warn: restricted` label made the upgrade print **four** PSA warnings
+instead of phase 6's one. The three new workloads violate `restricted` on
+**four** categories each — `allowPrivilegeEscalation`, `capabilities`,
+`runAsNonRoot`, `seccompProfile` — and on none of the other two the Falco
+DaemonSet trips: **none of them is `privileged`, none uses a `hostPath`, none
+requests a host namespace.** All four missing fields are exposed as chart
+values, and the falcosidekick and UI pods already run as `runAsUser: 1234`
+without asserting `runAsNonRoot`. So the accurate sentence is *could be gated
+and is not*, and hardening them was deliberately kept out of a routing
+upgrade. Nothing gates them today: PSA here is `enforce: privileged` and all
+five Kyverno policies remain scoped to `[demo, demo-kyverno-only]`. Alongside
+that, the Redis has **no password and no NetworkPolicy**, so anything on the
+cluster that can reach its Service port can read or delete the entire alert
+history. These are new instances of threat model §6.7's conceded residual
+risk, enumerated in the evidence file §8.
+
+## Rollback
+
+`helm rollback falco 1 --namespace falco` restores the phase-6 state and
+reverts Falco's ConfigMap so `json_output` and `http_output` return to
+`false`. **It was not run during this phase** — the upgrade succeeded first
+time — so that command is written from `helm rollback`'s documented behaviour
+and has not been executed against this cluster. The Redis PVC is created from
+a `volumeClaimTemplates` and is **not** removed by a rollback or by
+`helm uninstall`; delete it explicitly if that is what you want.
