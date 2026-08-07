@@ -1120,6 +1120,7 @@ least one change. No such window was observed — the Redis pod was deleted abou
 six minutes after it started — so the paragraph above rests on redis's
 documented `save` semantics plus the `CONFIG GET save` output printed in 7a,
 and it is stated as such rather than as a measurement.
+[CONFIRMED 2026-08-07 — SEE CONFIRMATION BELOW: the window WAS observed.]
 
 C2 — SECTION 8a, THE POD COUNT IN THE PROSE. As printed:
 
@@ -1182,3 +1183,357 @@ This corrects the NUMBER and that one contrast; no other sentence in 8a is
 rewritten. C2's five-pod count, the three-image count, the four `restricted`
 categories in 8b and the namespace's `enforce=privileged` label are all
 unchanged by it.
+
+============================================================
+CONFIRMATION — 2026-08-07: THE SNAPSHOT WINDOW C1 PREDICTED, OBSERVED
+============================================================
+
+Four days after the run above, the host this lab sits on restarted Docker. The
+three kind node containers exited and were started again, every pod in the
+`falco` namespace restarted with them, and the Redis came back WITH ITS DATA.
+Nobody designed this as an experiment. No command in this repo asked for it,
+there was no hypothesis, no control and no plan; it was noticed only because a
+later session listed `/data` for an unrelated reason and found a file there
+that 7a had recorded as absent.
+
+An accidental observation is still an observation. It is written down here
+because it bears directly on a claim this file already makes: C1 above ends
+`NOT PROVEN EITHER WAY: what this store does after an hour of uptime with at
+least one change`, and that is precisely the window that has now elapsed. This
+section CONFIRMS C1's reasoning. It corrects nothing, and it changes no
+number, no exit code and no captured output anywhere above it.
+
+Everything below was re-captured live on 2026-08-07 with read-only commands.
+Nothing was restarted, deleted, written to or otherwise disturbed to produce
+it. The readings span about twenty minutes of wall clock, so "now" is not the
+same instant in every capture; where that matters the timestamps are given and
+the arithmetic is anchored to a named reading. Three of the commands pipe
+through a carriage-return strip: `redis-cli INFO` returns CRLF-terminated
+payload and this host's `python -m json.tool` writes CRLF, and the third is
+defensive. That is a line-ending change and nothing else.
+
+F1 — THE RESTART HAPPENED, AND IT WAS NOT ISSUED FROM HERE.
+
+$ docker ps -a
+CONTAINER ID   IMAGE                  COMMAND                  CREATED      STATUS          PORTS                       NAMES
+cf8b74a9f771   kindest/node:v1.35.5   "/usr/local/bin/entr…"   8 days ago   Up 42 minutes   127.0.0.1:60625->6443/tcp   seclab-control-plane
+ced3cdc8c1fc   kindest/node:v1.35.5   "/usr/local/bin/entr…"   8 days ago   Up 42 minutes                               seclab-worker2
+19c7d47bf44b   kindest/node:v1.35.5   "/usr/local/bin/entr…"   8 days ago   Up 42 minutes                               seclab-worker
+(exit code: 0)
+
+$ docker inspect -f '{{.Name}} RestartCount={{.RestartCount}} StartedAt={{.State.StartedAt}} FinishedAt={{.State.FinishedAt}} ExitCode={{.State.ExitCode}}' seclab-control-plane seclab-worker seclab-worker2
+/seclab-control-plane RestartCount=0 StartedAt=2026-08-07T16:29:39.167604678Z FinishedAt=2026-08-07T16:25:52.463260599Z ExitCode=0
+/seclab-worker RestartCount=0 StartedAt=2026-08-07T16:29:39.28838167Z FinishedAt=2026-08-07T16:25:52.463240452Z ExitCode=0
+/seclab-worker2 RestartCount=0 StartedAt=2026-08-07T16:29:39.397954877Z FinishedAt=2026-08-07T16:25:52.463224431Z ExitCode=0
+(exit code: 0)
+
+$ kubectl -n falco get pods -o wide
+NAME                                      READY   STATUS    RESTARTS      AGE     IP           NODE                   NOMINATED NODE   READINESS GATES
+falco-6hp56                               1/1     Running   2 (42m ago)   3d22h   10.244.1.8   seclab-worker2         <none>           <none>
+falco-cq9ck                               1/1     Running   2 (42m ago)   3d22h   10.244.0.5   seclab-control-plane   <none>           <none>
+falco-falcosidekick-ccbb99b56-cmh2b       1/1     Running   2 (42m ago)   3d22h   10.244.1.2   seclab-worker2         <none>           <none>
+falco-falcosidekick-ccbb99b56-qtjxm       1/1     Running   2 (42m ago)   3d22h   10.244.2.4   seclab-worker          <none>           <none>
+falco-falcosidekick-ui-5765796fbf-9tmdn   1/1     Running   2 (42m ago)   3d22h   10.244.1.3   seclab-worker2         <none>           <none>
+falco-falcosidekick-ui-5765796fbf-zbjx5   1/1     Running   2 (42m ago)   3d22h   10.244.2.5   seclab-worker          <none>           <none>
+falco-falcosidekick-ui-redis-0            1/1     Running   2 (42m ago)   3d22h   10.244.1.4   seclab-worker2         <none>           <none>
+falco-tz6ts                               1/1     Running   2 (42m ago)   3d22h   10.244.2.6   seclab-worker          <none>           <none>
+(exit code: 0)
+
+$ kubectl -n falco get pod falco-falcosidekick-ui-redis-0 -o jsonpath='{range .status.containerStatuses[*]}{.name}{" restartCount="}{.restartCount}{" lastState.terminated.exitCode="}{.lastState.terminated.exitCode}{" reason="}{.lastState.terminated.reason}{" finishedAt="}{.lastState.terminated.finishedAt}{" currentStartedAt="}{.state.running.startedAt}{"\n"}{end}'
+redis restartCount=2 lastState.terminated.exitCode=255 reason=Unknown finishedAt=2026-08-07T16:29:39Z currentStartedAt=2026-08-07T16:29:45Z
+(exit code: 0)
+
+=> THE NODES STOPPED AND STARTED AGAIN; THE PODS DID NOT MOVE. All three node
+   containers finished at 2026-08-07T16:25:52Z and started at 16:29:39Z —
+   16:29:39.167604678 minus 16:25:52.463260599 is 226.704 SECONDS, which is
+   three minutes and 46.7 seconds with the nodes gone. `ExitCode=0` on all
+   three is a clean stop of the node process, which is what a Docker shutdown
+   looks like and not what a crash looks like. The Redis container's previous
+   run is recorded `exitCode=255 reason=Unknown`, which is what kubelet writes
+   for a container that vanished with its node. `AGE 3d22h` with `RESTARTS 2`
+   means these are the SAME POD OBJECTS created on 2026-08-03, restarted in
+   place — not rescheduled pods. NOTE THE 2: two restarts are counted and only
+   the most recent is dated by anything captured here. The earlier one is
+   somewhere in the four days between the two runs and nothing in this section
+   explains it.
+
+F2 — THERE IS A dump.rdb, AND ITS TIMESTAMP IS THE WHOLE POINT.
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- ls -la /data
+total 24
+drwxrwxrwx 2 root root  4096 Aug  3 19:42 .
+drwxr-xr-x 1 root root  4096 Aug  7 16:29 ..
+-rw-r--r-- 1 root root 13282 Aug  3 19:42 dump.rdb
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- stat -c "%n %s bytes mtime=%Y (%y)" /data/dump.rdb
+/data/dump.rdb 13282 bytes mtime=1785786145 (2026-08-03 19:42:25.087474950 +0000)
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- date -u
+Fri Aug  7 17:12:50 UTC 2026
+(exit code: 0)
+
+=> 7a READ THIS EXACT DIRECTORY AND FOUND IT EMPTY. It is not empty now: a
+   13282-byte `dump.rdb` sits in it, and `stat` prints the mtime twice, once
+   as a raw UNIX SECOND and once rendered, 1785786145 and 2026-08-03
+   19:42:25.087474950 +0000. The `+0000` is `stat`'s own output, so the date
+   in the `ls` column above is UTC too and no assumption about the container's
+   timezone is needed.
+
+   THE ARITHMETIC, WITH THE UNITS NAMED, BECAUSE THE UNITS ARE THE CLAIM:
+
+     dump.rdb mtime, `stat %Y`, whole UNIX SECONDS         1785786145
+     the routed event of section 5, field `evt.time`,
+       as that stored document prints it, NANOSECONDS  1785782343551716000
+     the same event in whole UNIX SECONDS (ns / 1e9)       1785782343
+                                                          ----------
+     gap                                                        3802 s
+
+   3802 s is 63 min 22 s. Carrying the sub-second parts on both sides
+   (1785786145.087474950 - 1785782343.551716000) gives 3801.536 s, which is 63
+   min 21.5 s. Either way THE SNAPSHOT TRAILED THE EVENTS IT WOULD HAVE
+   PROTECTED BY JUST OVER AN HOUR, which is the shape C1 predicted and the
+   first time this lab has seen it.
+
+   WHY JUST OVER AN HOUR RATHER THAN EXACTLY ONE. `save 3600 1` counts 3600 s
+   from LASTSAVE, not from the write, and LASTSAVE starts life as the
+   process's own start time — F4 below demonstrates that on the live process
+   instead of asserting it. 1785786145 - 3600 = 1785782545 =
+   2026-08-03T18:42:25Z, which is when the REPLACEMENT Redis was coming up: 7a
+   caught it at `AGE 8s` moments after the delete, and 7b's 18:42:55 marker
+   found it already serving. The implied start therefore falls inside the
+   window 7a and 7b bracket. THAT PROCESS'S ACTUAL START TIME WAS NEVER
+   CAPTURED and cannot be recovered now — the pod has restarted twice since —
+   so this is a consistency check, and it is offered as one and not as a
+   measurement.
+
+F3 — THE DATA CAME BACK OFF THAT FILE, AND IT IS THE SAME DATA.
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli DBSIZE
+10
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli INFO persistence | tr -d '\r'
+# Persistence
+[... 8 lines elided — `loading:0`, `async_loading:0` and the six `current_*` fork and copy-on-write gauges, all zero ...]
+rdb_changes_since_last_save:27
+rdb_bgsave_in_progress:0
+rdb_last_save_time:1786120185
+rdb_last_bgsave_status:ok
+rdb_last_bgsave_time_sec:-1
+rdb_current_bgsave_time_sec:-1
+rdb_saves:0
+rdb_last_cow_size:0
+rdb_last_load_keys_expired:0
+rdb_last_load_keys_loaded:7
+aof_enabled:0
+[... 11 lines elided — the rest of the `aof_*` block and the two `module_fork_*` gauges ...]
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli FT._LIST
+eventIndex
+(exit code: 0)
+
+$ for k in $(kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli --scan --count 100 | tr -d '\r'); do echo -n "$k "; kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli HGET $k json | grep -o '"time":"[^"]*"'; done | sort -k2
+event:039afd7a-0670-46b1-a672-43550fcb9de0 "time":"2026-08-03T18:43:52.372154136Z"
+event:1e5beff6-9811-4ed4-80a5-51026b488676 "time":"2026-08-03T18:44:12.680634306Z"
+event:32e56879-2e1a-4b24-ae10-74e132d88781 "time":"2026-08-03T18:44:12.680643336Z"
+event:dc357fe3-3d84-4492-9377-156d0a5a7e7f "time":"2026-08-03T18:44:12.680648859Z"
+event:3500a95f-ea56-410f-8767-f0e59dca4075 "time":"2026-08-03T19:01:16.358104781Z"
+event:f32bc1a5-2892-4f22-a160-fba3c0afda22 "time":"2026-08-03T19:01:25.149555769Z"
+event:9f31b74b-469b-4424-bff6-e81279eb8e92 "time":"2026-08-03T19:01:36.280983585Z"
+event:bd8164fd-2604-425c-a24e-ad239e78275c "time":"2026-08-07T16:30:28.202450422Z"
+event:6a1aeeb8-943c-44b2-a4c4-07393f36b358 "time":"2026-08-07T16:30:28.202451572Z"
+event:f9789198-a841-478c-8acb-c87556c096ed "time":"2026-08-07T16:30:28.202452827Z"
+(exit code: 0)
+
+=> `rdb_last_load_keys_loaded:7` IS THE DECISIVE LINE: seven keys were read
+   off disk when this process started. `rdb_saves:0` says this process has
+   taken no snapshot of its own, so those seven cannot have come from anything
+   it did — they came off the 19:42:25 file. The ten stored documents split
+   exactly the way that implies. SEVEN are dated 2026-08-03 and every one of
+   them is EARLIER than the 19:42:25 mtime, which is what a snapshot taken at
+   19:42:25 would contain. THREE are dated 2026-08-07T16:30:28, 43 s after
+   this Redis started at 16:29:45. Seven restored plus three new is the
+   `DBSIZE 10` above. Four of the seven are the same UUIDs 7b printed on
+   2026-08-03 — `dc357fe3`, `039afd7a`, `32e56879`, `1e5beff6` — still
+   carrying their original `time` fields. The RediSearch index survived with
+   them: `FT._LIST` returns the `eventIndex` 5a created. THE NEWEST STORED
+   EVENT PREDATES EVERY COMMAND IN THIS SECTION, so nothing read here added to
+   what it was reading.
+
+F4 — THE CONFIG IS UNCHANGED, AND THE WINDOW WAS OPEN AGAIN AT THE MOMENT OF
+READING.
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli CONFIG GET appendonly
+appendonly
+no
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli CONFIG GET save
+save
+3600 1 300 100 60 10000
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli CONFIG GET dir
+dir
+/data
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli LASTSAVE
+1786120185
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli TIME
+1786122770
+112631
+(exit code: 0)
+
+$ kubectl -n falco exec falco-falcosidekick-ui-redis-0 -- redis-cli INFO server | grep -E 'server_time_usec|uptime_in_seconds'
+server_time_usec:1786123274436971
+uptime_in_seconds:3089
+(exit code: 0)
+
+=> NOT ONE PERSISTENCE SETTING MOVED. `appendonly no`, `save 3600 1 300 100 60
+   10000`, `dir /data` — character for character what 7a read on 2026-08-03.
+   Whatever this section confirms, it confirms it about the SAME CONFIGURATION
+   7a condemned.
+
+   LASTSAVE AGAINST THE CLOCK, WITH THE UNITS NAMED:
+
+     LASTSAVE, UNIX SECONDS                               1786120185
+     `TIME` element 1, UNIX SECONDS                       1786122770
+     `TIME` element 2, MICROSECONDS into that second          112631
+       — 0.112631 s, NOT nanoseconds
+                                                          ----------
+     now - LASTSAVE, at the `TIME` reading                      2585 s
+
+   2585 s is 43 min 5 s. AND LASTSAVE IS NOT A SAVE: `rdb_saves:0` above says
+   this process has never written one. It is the process's start time, and two
+   further captures agree. `state.running.startedAt` in F1 is
+   2026-08-07T16:29:45Z, which is 1786120185 as a UNIX second. And the `INFO
+   server` pair above, read about eight minutes after `TIME`, gives
+   `server_time_usec:1786123274436971` — MICROSECONDS since the epoch, so
+   1786123274.436971 s — which minus `uptime_in_seconds:3089` is 1786120185
+   exactly. Three routes to the same number. This is the mechanism C1 named in
+   7a, where `LASTSAVE 1785782208` was likewise a startup value and not a
+   snapshot.
+
+   SO THE WINDOW WAS OPEN AGAIN WHILE THESE READINGS WERE TAKEN.
+   `rdb_changes_since_last_save:27` — twenty-seven changes sitting in RAM and
+   in no file. The next snapshot was due at 1786120185 + 3600 = 1786123785 =
+   2026-08-07T17:29:45Z, which is 1015 s (16 min 55 s) after the `TIME`
+   reading at 1786122770. A restart before then loses those twenty-seven.
+   WHETHER THAT SNAPSHOT ACTUALLY FIRED IS NOT OBSERVED HERE — no capture in
+   this section was taken after 17:29:45Z.
+
+F5 — WHAT THIS PROVES.
+
+C1 READ THE `save` SEMANTICS CORRECTLY. `save 3600 1` came due, a snapshot was
+written without anyone asking for one, and the store then survived a restart
+it had no other means of surviving: the process running now has taken no
+snapshot of its own and still came up with seven keys and an index it could
+only have read off disk.
+
+It follows that 7a's `DBSIZE 4 -> 0` WAS A TIMING ARTEFACT OF A STORE ABOUT
+SIX MINUTES OLD, not a demonstration that a snapshot is never written. 7a's
+own closing sentence — "The events were lost because no snapshot had been
+taken YET" — is the one that holds. The precise claim C1 handed to the README
+and the threat model, that at this event volume an RDB snapshot trails the
+writes it protects BY UP TO AN HOUR, now has a measurement behind it rather
+than only redis's documented semantics: 3802 s, once, on this lab.
+
+F6 — WHAT THIS DOES NOT PROVE, WHICH IS THE LONGER LIST.
+
+- IT DOES NOT MAKE THE STORE DURABLE IN ANY STRONG SENSE. `appendonly` is
+  still `no`, captured again above. Every write between one snapshot and the
+  next is unprotected, and a restart inside that window still destroys all of
+  it — as of the readings in F4 that was 27 changes with 16 min 55 s still to
+  run. What is confirmed here is A TIMING WINDOW, and a window is a bounded
+  stretch of guaranteed loss, not a guarantee of survival.
+- 7a'S LOSS IS NOT RETRACTED AND WAS NOT RECOVERED. Four events were destroyed
+  on 2026-08-03 and no snapshot ever contained them. The oldest document in
+  this `dump.rdb` is timestamped 18:43:52, AFTER the deletion: the file was
+  written by the replacement process an hour after IT came up, and the events
+  7a lost are not in it and never were.
+- NOTHING HERE TESTS `kind delete cluster`. What survived was a container
+  restart with the node's filesystem intact, which is a strictly weaker event.
+  7d stands exactly as 7d stated it — the PV is a directory inside the
+  `seclab-worker2` container, deleting the cluster takes the directory with
+  it, and that is still REASONED FROM THE PATH AND THE NODE NAME, NOT
+  DEMONSTRATED. This section does not upgrade it.
+- ONE SURVIVAL IS NOT A RATE. A Docker restart is not a disk failure, not a PV
+  deletion, not a node loss and not a corrupted RDB. This is n=1, unplanned,
+  and it landed on the one failure mode an hourly snapshot happens to cover.
+- AND NOBODY IS WATCHING, WHICH NONE OF THIS CHANGES. Re-read on 2026-08-07:
+
+$ kubectl -n falco logs -l app.kubernetes.io/component=core --tail=200 --prefix | grep 'Enabled Outputs'
+[pod/falco-falcosidekick-ccbb99b56-qtjxm/falcosidekick] 2026/08/07 16:29:45 [INFO]  : Enabled Outputs: [WebUI]
+[pod/falco-falcosidekick-ccbb99b56-cmh2b/falcosidekick] 2026/08/07 16:29:44 [INFO]  : Enabled Outputs: [WebUI]
+(exit code: 0)
+
+  One output, `[WebUI]`, exactly as 7c found it. No notifier, no credential,
+  no rota, no owner, and nothing in this release that can reach outside the
+  cluster. ROUTING IS STILL NOT RESPONSE. That the store now keeps its events
+  longer only means the record nobody reads is a longer one.
+
+F7 — THE INDEX BUG DID NOT RECUR, AND THE MECHANISM IS STILL UNPROVEN.
+
+$ kubectl -n falco logs -l app.kubernetes.io/component=ui -c falcosidekick-ui --tail=20 --prefix
+[pod/falco-falcosidekick-ui-5765796fbf-9tmdn/falcosidekick-ui] 2026/08/07 16:30:06 [INFO] : Falcosidekick UI is listening on 0.0.0.0:2802
+[pod/falco-falcosidekick-ui-5765796fbf-9tmdn/falcosidekick-ui] 2026/08/07 16:30:06 [INFO] : log level is info
+[pod/falco-falcosidekick-ui-5765796fbf-zbjx5/falcosidekick-ui] 2026/08/07 16:30:07 [INFO] : Falcosidekick UI is listening on 0.0.0.0:2802
+[pod/falco-falcosidekick-ui-5765796fbf-zbjx5/falcosidekick-ui] 2026/08/07 16:30:07 [INFO] : log level is info
+(exit code: 0)
+
+$ diff <(kubectl -n falco get rs falco-falcosidekick-ui-d4779ff66 -o jsonpath='{.spec.template}' | python -m json.tool | tr -d '\r') <(kubectl -n falco get rs falco-falcosidekick-ui-5765796fbf -o jsonpath='{.spec.template}' | python -m json.tool | tr -d '\r')
+2a3,5
+>         "annotations": {
+>             "kubectl.kubernetes.io/restartedAt": "2026-08-03T13:43:37-05:00"
+>         },
+11c14
+<             "pod-template-hash": "d4779ff66"
+---
+>             "pod-template-hash": "5765796fbf"
+(exit code: 1 — diff's, the two pod templates differ)
+
+=> FOUR LINES, AND `--tail=20` ASKED FOR TWENTY. Those four are the complete
+   current logs of both UI pods, two lines each; each pod's log was also read
+   in full with no `--tail` and returned the same two lines. There is no
+   `Unknown index name` in them, and no `Index does not exist` / `Create
+   Index` pair either — this UI went straight to `listening`, where the
+   18:36:58 start quoted in 7b had to create the index first. `FT._LIST` in F3
+   shows why: `eventIndex` was already in the dataset that came off the disk,
+   so an RDB snapshot preserves the index definition and not only the
+   documents.
+
+   THE POD NAMES CHANGED AND THAT IS NOT A CONFOUND. `d4779ff66` is the
+   ReplicaSet 7b restarted; `5765796fbf` is what that `rollout restart`
+   created, and the `diff` above is the entire difference between their pod
+   templates — the `restartedAt` annotation `rollout restart` stamps on, and
+   the pod-template-hash that follows from it. Same image digest, same args,
+   same securityContext, same everything else. The UI running today is the UI
+   6b installed.
+
+   BUT THIS IS NOT A CONTROLLED COMPARISON AND MUST NOT BE READ AS ONE. In 7b
+   the UI process DID NOT RESTART: it had been up since 18:36:58, it had
+   created `eventIndex` itself at that moment, and the store was emptied
+   UNDERNEATH IT, so `Unknown index name` came from a live process whose index
+   had gone. Here the UI process DID restart, and it came up against a store
+   that already had the index in it. TWO THINGS DIFFER, NOT ONE — whether the
+   store was populated, and whether the UI restarted — and this observation
+   cannot separate them. IT IS NOT ESTABLISHED HERE THAT AN EMPTY STORE CAUSES
+   THE BUG. What is established is narrower: a UI start against a populated
+   store neither recreates the index nor errors on it.
+
+   WHAT WOULD SETTLE IT: delete the Redis pod again while leaving the UI pods
+   strictly untouched, and separately restart the UI alone against an emptied
+   store, and read the two logs against each other. Neither was done. Doing it
+   means deliberately destroying the store a second time, which is outside
+   what a read-only confirmation is allowed to do.
+
+THIS SECTION CONFIRMS; IT CORRECTS NOTHING. No line above it is rewritten, no
+captured output and no exit code anywhere in this file changes, and C1's
+wording — its `NOT PROVEN EITHER WAY` paragraph included — stands exactly as
+it was written on 2026-08-03. That paragraph is now DISCHARGED rather than
+amended: the hour of uptime it said had never been observed has been observed,
+and C1's reading of `save 3600 1` was the correct one. A one-line pointer
+marked CONFIRMED 2026-08-07 has been added directly under C1 so that a reader
+who stops there learns the question was later settled. That line and this
+section are the only edits made to this file since 2026-08-03, and both are
+additions.
