@@ -2,8 +2,12 @@
 
 One page, two diagrams. The first is the **admission path** — the ordered set of
 gates every workload must pass before it exists, and where each attack dies. The
-second is the **sealed-secrets path** — the only other artifact that crosses
-from Git into the cluster.
+second is the **sealed-secrets path** — until 2026-08-07 the only other artifact
+that crossed from Git into the cluster. Phase 7 opened a third path and it is
+deliberately not drawn: ArgoCD now applies the 7 manifests under `workloads/`
+into `demo` continuously, which is neither a request passing through gates nor
+an artifact transformed once. The last section of this page says why it stays
+out.
 
 They are kept separate on purpose: the admission diagram is a request flowing
 through decision points, the secrets diagram is an artifact being transformed.
@@ -102,10 +106,13 @@ allow pair on TCP 8080.
 
 ## 2. The sealed-secrets path
 
-The other thing that crosses from Git into the cluster. The committed artifact
-is ciphertext; the key that reverses it is a Secret in `kube-system` that never
-leaves the cluster; and the ciphertext is bound to one `namespace/name`, so the
-same bytes applied anywhere else are refused.
+The second thing that crosses from Git into the cluster, and the only one of
+the two drawn here that is a single artifact transformed once — the third path,
+ArgoCD's continuous apply of `workloads/`, is dealt with at the end of this
+page. The committed artifact is ciphertext; the key that reverses it is a
+Secret in `kube-system` that never leaves the cluster; and the ciphertext is
+bound to one `namespace/name`, so the same bytes applied anywhere else are
+refused.
 
 ```mermaid
 flowchart TB
@@ -156,14 +163,15 @@ Runbooks with the full command logs, all in [`../runbooks/`](../runbooks/):
 [`phase-5-cis-benchmark.md`](../runbooks/phase-5-cis-benchmark.md),
 [`phase-5b-cis-remediation.md`](../runbooks/phase-5b-cis-remediation.md),
 [`phase-6-falco.md`](../runbooks/phase-6-falco.md),
-[`phase-6b-falcosidekick.md`](../runbooks/phase-6b-falcosidekick.md).
+[`phase-6b-falcosidekick.md`](../runbooks/phase-6b-falcosidekick.md),
+[`phase-7-argocd.md`](../runbooks/phase-7-argocd.md).
 
 What is **not** in these diagrams — no encryption at rest, no audit log, no
 CVE gate, and policies that stop at the `demo` namespace boundary — is
 enumerated with reasons in
 [§6 of the threat model](threat-model.md#6-residual-risk-and-what-is-deliberately-out-of-scope).
 
-**The runtime sensor is the one omission that is not a gap: it exists.** Since
+**The runtime sensor is the first omission that is not a gap: it exists.** Since
 2026-07-29 Falco 0.44.1 has run as a three-pod DaemonSet in namespace `falco`,
 reading syscalls on all three nodes through a modern eBPF probe, and since
 2026-08-03 that namespace also holds the alert pipeline phase 6b added: two
@@ -185,3 +193,27 @@ with the transcripts in [`evidence/phase-6-falco/`](evidence/phase-6-falco/) and
 [`evidence/phase-6b-falcosidekick/`](evidence/phase-6b-falcosidekick/) and the
 replays in [`../runbooks/phase-6-falco.md`](../runbooks/phase-6-falco.md) and
 [`../runbooks/phase-6b-falcosidekick.md`](../runbooks/phase-6b-falcosidekick.md).
+
+**The reconciliation controller is the second omission that is not a gap, and
+it stays out for the same reason.** Since 2026-08-07 ArgoCD v3.5.0 has run as
+seven pods in namespace `argocd`, holding one `Application` that syncs the 7
+manifests under `workloads/` into `demo` and — since `selfHeal` was turned on —
+putting them back when they change. That is a third way into the cluster from
+Git, beside a human's `kubectl apply` and the sealed secret, and unlike either
+it writes continuously and unprompted. It still gets no box in either diagram.
+The admission diagram's whole grammar is "gate → REJECTED" and ArgoCD refuses
+nothing: the drift it answers is admitted by PSA and Kyverno first, the pod
+starts, and only afterwards is the change undone — 10 min 8 s later with
+self-healing off, about a second with it on, and a container with a writable
+root filesystem ran either way. Drawing it beside PSA and Kyverno would say it
+refuses; drawing it beside the sealing controller would say it transforms one
+artifact once. It does neither. Two facts belong on this page even so, because
+they change what the first diagram is worth: the
+`argocd-application-controller` ClusterRole is **byte-identical** to the
+built-in `cluster-admin`, so the component that reconciles 7 objects can write
+any object on this cluster; and namespace `argocd` carries no Pod Security
+label and matches no Kyverno policy, so **nothing in that diagram evaluated any
+of the pods running it**. Both are in
+[§6.14 of the threat model](threat-model.md#6-residual-risk-and-what-is-deliberately-out-of-scope),
+with the transcript in [`evidence/phase-7-argocd/`](evidence/phase-7-argocd/)
+and the replay in [`../runbooks/phase-7-argocd.md`](../runbooks/phase-7-argocd.md).

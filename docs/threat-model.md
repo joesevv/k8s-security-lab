@@ -98,6 +98,61 @@ only as strong as the sealing private key (asset 2 in §2), which is itself
 stored **unencrypted at rest** in etcd (§6.1). Rotating the sealing key does not
 retroactively protect ciphertext already published in Git history.
 
+**A second crossing opened on 2026-08-07.** Until phase 7, every other manifest
+in this repo reached the cluster only because a human ran `kubectl apply`. One
+set of them now has a standing, automated path across this same boundary, and
+it has a different guard and a different uncovered set from the ciphertext
+above.
+
+**Crosses:** the 7 objects under [`workloads/`](../workloads/) — Namespace
+`demo`, the `nginx-sa` and `signed-app-sa` ServiceAccounts, the `nginx` and
+`signed-app` Deployments and their two Services — applied into `demo` by
+ArgoCD's `demo-workloads` Application
+([`gitops/application-workloads.yaml`](../gitops/application-workloads.yaml))
+from `targetRevision: main`. With `syncPolicy.automated` set and the
+controller's default reconcile interval of 180 s, that is a standing pull
+rather than a one-off apply. The revision the Application reported syncing was
+checked against `git ls-remote` and is the tip of `main`.
+
+**Guard:** honestly, very little, and the list is short enough to write out.
+The repo is public, so the clone is anonymous — there is no credential and no
+Secret in this path at all, which removes a thing to steal but constrains
+nothing about what gets pulled. `prune: false` bounds the deletion side: a
+manifest that vanishes from `main` leaves the live object standing, so a
+mis-scoped Application cannot sweep away the `developer` Role, the four
+NetworkPolicies or the SealedSecret that share the namespace. And the scope is
+one `source.path`, `workloads`. **Kubernetes RBAC is not on that list.** The
+`argocd-application-controller` ServiceAccount's ClusterRole was diffed against
+the built-in `cluster-admin` and the two rule sets are byte-identical
+(exit code: 0 — no difference), so nothing in the API server's authorization
+confines the controller to the 7 objects it syncs; that scoping is convention,
+not capability (§6.14 item 2). Admission is not on the list either, as far as
+the controller itself goes: namespace `argocd` carries no Pod Security label
+and sits outside the `[demo, demo-kyverno-only]` selector all five Kyverno
+policies use, so neither layer evaluates it (§6.14 item 3). The gates on `demo`
+do still evaluate what ArgoCD applies *there* — but all phase 7 showed is that
+a *compliant* spec was admitted and ran; no hostile commit was tested (§A2).
+
+**Not covered:** the content. Commit signature verification is not configured —
+no `signatureKeys` on the `default` AppProject and no keys in
+`argocd-gpg-keys-cm` — and nothing else inspects what the manifests say either,
+the AppProject's `sourceRepos`, `destinations` and `clusterResourceWhitelist`
+all being `*`. Whatever is on `main` is applied faithfully, so anyone who can
+merge to `main` can change what runs in `demo`. That is not the same as open:
+`main` carries the `protect-main` ruleset (`bypass_actors: []`,
+`current_user_can_bypass: "never"`), whose `pull_request` rule routes every
+change through a pull request instead of a direct push, so this path runs
+through review rather than around it. But the counterweight has to be stated at
+its real weight — `required_approving_review_count` is **0** and `joesevv` is
+the only collaborator, so one account can open a pull request and merge it
+seconds later with no second human, and review by a single maintainer is
+**a process control, not a technical one** (§6.10). Nothing on the cluster
+enforces it. Reconciliation does not close the gap either. It answers after the
+fact, so a hostile commit runs until a person notices it; and because a commit
+on `main` *is* the desired state, ArgoCD would not revert it at all — with the
+shipped `selfHeal: true` it would re-apply it every time an operator removed it
+by hand. §6.14 item 4 records the same finding from the cost side.
+
 ### 3.2 CI → registry → admission
 
 **Crosses:** the cosign signature — a Fulcio certificate plus a Rekor log entry
@@ -247,6 +302,25 @@ with it in place. Pod-controller coverage is therefore explicit `resourceRules`
 jobs/cronjobs) plus `pods/ephemeralcontainers` to close the `kubectl debug`
 injection path.
 
+**The compromised GitOps controller in that capability list stopped being
+hypothetical on 2026-08-07.** Phase 7 installed ArgoCD v3.5.0 into namespace
+`argocd` with a ServiceAccount whose ClusterRole is **byte-identical** to the
+built-in `cluster-admin` — `verbs ['*']` on `resources ['*']` in `apiGroups
+['*']`, plus `nonResourceURLs ['*']` — and gave it one `Application` holding
+standing, automated apply authority over 7 objects in `demo`, sourced from
+whatever is on `main`. This section's third assumed capability is therefore a
+resident component of this cluster rather than an imagined one, and its RBAC is
+not scoped to the 7 objects it syncs. Two things are worth separating. The
+gates above are unchanged and still evaluate whatever reaches them, whoever
+wrote it — but what phase 7 actually demonstrated is only that a *compliant*
+spec ArgoCD wrote into `demo` was applied and its pods ran without incident;
+**no hostile commit was tested**, so nothing here shows how PSA and Kyverno
+would treat a non-compliant workload delivered through git. And the controller itself is
+outside both gates: `argocd` is ungated, no commit signature verification is
+configured, and with `selfHeal: true` a bad commit would not merely be applied
+once — it would be re-applied every time an operator removed it by hand. §6.14
+records the whole of it.
+
 ### A3 — The neighbour pod (phase 2c, network)
 
 **Goal:** move laterally — reach `nginx` from another pod in the same namespace,
@@ -391,6 +465,27 @@ detections separate from mitigations for exactly this reason, and this table
 has no detection column; adding one would mean re-deriving every row above
 against a standard they were not written to. What the sensor saw, what it did
 not see, and what nothing does about either are in §6.4 and §6.13.
+
+Phase 7 takes **no row here either**, and the blocker is a technique ID rather
+than a doubt about effect. What ArgoCD answers is out-of-band modification of a
+running workload's security configuration — a `kubectl patch` that removed
+`readOnlyRootFilesystem` from the live `demo/nginx` Deployment — and unlike an
+alert nobody reads, this genuinely raises an attacker's cost: the change was
+undone automatically in 1.29 s, and with `selfHeal: true` it would be undone
+again every time it was re-made, so a (P) is arguable on the merits in a way it
+never was for phase 6. What is not arguable is which technique that maps to. No
+technique in the ATT&CK for Containers matrix cleanly names "modify the spec of
+a running workload"; the nearest candidates describe something else — T1610
+Deploy Container is the creation of a new container to evade defences rather
+than the weakening of an existing one, and reading this as T1562.001 Impair
+Defenses would mean treating a workload's own `securityContext` as a security
+tool being disabled. This document's standing rule decides it: **a wrong
+technique ID is worse than a missing row.** There is a second reason for care.
+Every row above is a mitigation that acts before or instead of the technique it
+names, and ArgoCD acts after — the weakened pod was admitted, started, and ran
+for roughly a second before the revert killed it (§6.14) — so even a defensible
+ID would need a marking this table does not have. The measured effect is
+recorded in §6.14 and in the README's attack → control table instead.
 
 ---
 
@@ -570,10 +665,18 @@ fail-closed (`failurePolicy: Fail`); a cluster-wide policy that also matched
 webhook ever misbehaved. **Consequence:** workloads in any other namespace,
 including `default` and `kube-system`, are constrained by neither PSA nor
 Kyverno here. Production would invert this — match cluster-wide and carve out
-explicit system-namespace exclusions. Two namespaces now make that concrete
-rather than hypothetical: `cis-benchmark` (§6.12) and, since 2026-07-29,
-`falco`, which is labelled `pod-security.kubernetes.io/enforce: privileged` and
-holds the most privileged workload on this cluster (§6.13). Phase 5b does not
+explicit system-namespace exclusions. Three namespaces now make that concrete
+rather than hypothetical: `cis-benchmark` (§6.12); `falco`, since 2026-07-29,
+which is labelled `pod-security.kubernetes.io/enforce: privileged` and holds
+the most privileged workload on this cluster (§6.13); and `argocd`, since
+2026-08-07, which carries **no** `pod-security.kubernetes.io/*` label of any
+kind, so it falls to the built-in `privileged` default — the apiserver has no
+`--admission-control-config-file` to move that — and is likewise outside the
+`[demo, demo-kyverno-only]` selector all five Kyverno policies use (§6.14). The
+third is a difference in kind rather than degree: the components in the first
+two namespaces are a scanner and a sensor, and the one in the third is a
+controller whose job is to write, holding `verbs ['*']` on `resources ['*']` to
+do it with. Phase 5b does not
 bear on this item, and it is worth saying so rather than letting a reader infer
 otherwise: `seccompDefault` and `podPidsLimit` are set on every node rather than
 in one namespace, but they are kubelet settings and not policies — no namespace
@@ -1054,6 +1157,111 @@ proved (§6.4), the response action does not exist at all,
 a person that any of it happened. A record that outlives its sensor is a better
 record; it is not a control. Until something acts on an alert, §6.4 stays open
 and no §5 row is earned — not by phase 6 and not by phase 6b.
+
+**6.14 The reconciliation layer arrives after the fact, and its price is
+cluster-admin in an ungated namespace.** Phase 7 (2026-08-07) added ArgoCD
+v3.5.0 in namespace `argocd`, running one `Application`, `demo-workloads`,
+which syncs this repo's `workloads/` path — 7 objects — into `demo` at
+`targetRevision: main` with `prune: false`. What it buys is real, and it is the
+first thing in this lab that acts on an attack rather than measuring, watching
+or filing one; this item records what that cost and what it does not reach.
+Five things, none of them remediated.
+
+1. **It corrects; it does not prevent, and the window never closes.** ArgoCD is
+   not an admission plugin and is not in the request path, so every correction
+   happens after the API server accepted the change and after the kubelet
+   started the resulting pod. The drift used to demonstrate it — removing
+   `readOnlyRootFilesystem: true` from the live `demo/nginx` Deployment, with
+   the file in git left untouched — was **admitted**: every rollout event
+   `Normal`, no PSA denial and no Kyverno denial, because `restricted` does not
+   require that field and none of the five Kyverno policies checks it. The
+   weakening was then confirmed at the kernel rather than off the spec, the
+   container's root mount going `overlay / overlay ro` → `rw` and a write into
+   `/var/cache/nginx` going from `Read-only file system` (exit code: 1) to
+   (exit code: 0). With `selfHeal: false` the Application reported
+   `OutOfSync / Healthy` and named `Deployment/nginx` correctly, and then did
+   nothing: the drift stood **10 min 8 s (608 s)** across 17 consecutive
+   samples and ended only because a human flipped a flag. With `selfHeal: true`
+   the standing drift was reverted by the controller itself —
+   `initiatedBy: {"automated":true}`, quicker than the 2 s poll could resolve,
+   so **no latency figure is claimed for that revert** — and the same drift
+   re-run was reverted in **1.29 s**, an upper bound at 1 s poll resolution and
+   not an instrumented latency. A pod from the drifted ReplicaSet was still
+   created, its image pulled, its container started (18:17:41Z) and killed
+   (18:17:42Z): a container with a writable root filesystem really ran, for
+   roughly **1 s**, bounded at about 0–2 s by the 1 s event resolution. 608 s
+   down to about one second is a smaller window, not a closed one, and
+   admission control — the layer that does not look at this field — is the only
+   one that could make it zero.
+2. **ArgoCD granted itself cluster-admin.** The `argocd-application-controller`
+   ClusterRole is `apiGroups ['*'] resources ['*'] verbs ['*']` plus
+   `nonResourceURLs ['*'] verbs ['*']`, and that was not summarised but diffed
+   against the built-in `cluster-admin` ClusterRole: the two rule sets are
+   **byte-identical** (exit code: 0 — no difference). The ServiceAccount bound
+   to it can therefore read every Secret in every namespace, including the
+   sealing private key that asset 2 in §2 rests on and every ServiceAccount
+   token on the cluster. `argocd-server` — the component behind the web UI —
+   separately holds `delete`, `get` and `patch` on every resource of every kind
+   cluster-wide, and whoever holds the initial admin password holds that. This
+   phase never retrieved that password and never opened the UI, but that is a
+   choice made here rather than a limit the install imposes. An Application on
+   this cluster is scoped by **convention** — its `source.path` — never by
+   capability.
+3. **Nothing on this cluster gates it.** Namespace `argocd` carries no
+   `pod-security.kubernetes.io/*` label at all, so it gets the built-in
+   `privileged` default and the apiserver has no
+   `--admission-control-config-file` to change that; and it sits outside the
+   `[demo, demo-kyverno-only]` namespace selector all five Kyverno policies
+   use. ArgoCD's 7 pods were admitted with no Pod Security check and no Kyverno
+   check, which makes `argocd` the third concrete instance of §6.7 after
+   `cis-benchmark` and `falco`. Two consequences follow rather than one. Any
+   pinning applied to ArgoCD here is self-imposed and unenforced — and it is
+   thinner than elsewhere in this repo, because the upstream manifest pins its
+   own images by **tag**, so the three digests recorded in the transcript are
+   what those tags meant on 2026-08-07 and not a control this repo enforces.
+   And the pattern is now a habit worth naming: every operational component
+   this lab has installed — a scanner, a sensor, an alert pipeline, and now a
+   controller that can write to anything — has been installed outside the
+   controls the lab exists to demonstrate.
+4. **Nothing verifies the content it syncs.** There are no `signatureKeys` on
+   the AppProject and no keys in `argocd-gpg-keys-cm`, so commit signature
+   verification is not configured and any commit that reaches `main` is applied
+   faithfully, signed or not. The `default` AppProject — the object whose job
+   is to constrain what Applications may do — constrains nothing:
+   `sourceRepos: ["*"]`, `destinations: [{namespace:"*",server:"*"}]`,
+   `clusterResourceWhitelist: [{group:"*",kind:"*"}]`. Every bit of scoping in
+   this phase comes from one Application's `source.path` field, so a second
+   Application, or an edit to this one, could target any namespace and any
+   cluster-scoped kind without tripping a guard. **`selfHeal: true` makes this
+   strictly worse rather than better:** a malicious or mistaken commit is not
+   applied once, it is re-applied automatically every time an operator removes
+   it by hand.
+5. **It only covers `workloads/`.** The Application manages exactly 7 objects —
+   Namespace `demo`, the `nginx-sa` and `signed-app-sa` ServiceAccounts, the
+   `nginx` and `signed-app` Deployments and their two Services. The rest of
+   `demo` is outside it: the `developer` Role and RoleBinding, the four
+   NetworkPolicies and the SealedSecret have **no drift control of any kind**.
+   That was measured rather than assumed — with `selfHeal` on, a label injected
+   onto the `developer` Role survived **4 min 57 s (297 s)** across 15
+   consecutive samples, spanning more than one 180 s reconcile cycle, while the
+   Application never left `Synced` and the in-scope field stayed correct
+   throughout, which is what proves the controller was alive rather than stuck.
+   A human removed the label, because ArgoCD was never going to. A green
+   Application says nothing about anything outside its `source.path` — and what
+   sits there is exactly what phases 2a, 2c and 3 built.
+
+**Consequence, stated plainly:** this cluster can now put back a change it had
+no way to refuse, in about a second instead of ten minutes, for 7 objects in
+one namespace — and it bought that with a cluster-admin-equivalent controller
+in a namespace nothing evaluates, syncing from a branch whose commits nothing
+verifies. Correction is a genuinely stronger answer than detection: phases 6
+and 6b end with an alert and an attacker who keeps what they took, and this
+phase ends with the state restored and the restoration timed. It is still not
+prevention, and the distance is measurable — 608 seconds, or about one, but
+never zero. What would close the remainder is not more GitOps: it is an
+admission policy requiring the field this drift removed, a one-policy change
+this lab has not made, together with a ClusterRole narrower than the one the
+upstream manifest ships.
 
 ---
 
