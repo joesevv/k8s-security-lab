@@ -1,0 +1,64 @@
+# Phase 8 — least-privilege identity for netpol-guard.
+#
+# COMMITTED BUT NOT APPLIED. Nothing in this file exists on the cluster; the
+# phase-8 demo ran the controller out of cluster against a kubeconfig. See
+# runbooks/phase-8-netpol-guard.md section 5 for why, and for the two things
+# that would have to be true first.
+#
+# The verbs below are exactly the API calls the binary makes, not a
+# conventional get/list/watch triple:
+#   pods            LIST    (main.go: CoreV1().Pods(ns).List)
+#   networkpolicies LIST    (main.go: NetworkingV1().NetworkPolicies(ns).List)
+#   networkpolicies GET     (main.go: restoreBaseline, existence check)
+#   networkpolicies CREATE  (main.go: restoreBaseline, --remediate only)
+# `watch` is deliberately ABSENT: this controller polls on a timer and never
+# opens a watch, so granting watch would be privilege it does not use. A
+# rewrite onto informers would need `watch` on both resources added here.
+#
+# What is NOT granted, and the point of leaving it out:
+#   - no UPDATE, PATCH or DELETE on networkpolicies. The apiserver, not the
+#     code, is what makes "it will never modify or delete a policy it did not
+#     create" true. A future bug cannot escalate past this Role.
+#   - no cluster scope at all. Role + RoleBinding, namespace `demo` only.
+#     Compare ArgoCD in this same cluster (phase 7, section 2c): its
+#     application controller holds a ClusterRole byte-identical to
+#     cluster-admin. This controller has 2 resources in 1 namespace.
+#   - no secrets, no exec, no pods/log.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: netpol-guard
+  namespace: demo
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: netpol-guard
+  namespace: demo
+rules:
+  # Read the pods whose isolation is being checked. LIST only — the
+  # controller never fetches an individual pod.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  # Read the policies, and create the ONE baseline policy that remediation
+  # restores. `get` is the existence check that makes remediation idempotent.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: netpol-guard
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: netpol-guard
+subjects:
+  - kind: ServiceAccount
+    name: netpol-guard
+    namespace: demo

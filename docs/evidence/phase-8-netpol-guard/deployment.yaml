@@ -1,0 +1,92 @@
+# Phase 8 — in-cluster Deployment for netpol-guard.
+#
+# COMMITTED BUT NOT APPLIED. This object does not exist on the cluster and
+# `kubectl apply -f` on it would FAIL today, for a reason worth stating
+# plainly rather than apologising for: the lab's own hardening forecloses it.
+#
+# THREE THINGS ARE MISSING, and none of them can be supplied by an agent:
+#
+#   1. THE IMAGE DOES NOT EXIST. `ghcr.io/joesevv/k8s-security-lab/netpol-guard`
+#      has never been published. .github/workflows/supply-chain.yml builds ONE
+#      context — `app/signed-app` — and only on `push` to `main`. Publishing
+#      this one requires a CI change plus a merge to main.
+#   2. IT WOULD BE DENIED AT ADMISSION EVEN IF IT EXISTED. The
+#      `require-keyless-signed-ghcr` ImageValidatingPolicy Denies any
+#      ghcr.io/joesevv/k8s-security-lab/* image in `demo` without a cosign
+#      keyless signature from this repo's pinned workflow identity. So CI must
+#      also sign it, exactly as it signs signed-app.
+#      (Phase 5b's AlwaysPullImages plugin is why `kind load` cannot be used to
+#      route around 1 and 2: the kubelet must pull from a registry.)
+#   3. IT COULD NOT REACH THE APISERVER. This pod would live in `demo`, where
+#      `default-deny` isolates every pod for Egress and the only egress
+#      carve-out, `allow-dns`, permits 53/UDP+TCP to CoreDNS and nothing else.
+#      The apiserver is reachable at Service kubernetes.default 10.96.0.1:443,
+#      which kube-proxy DNATs to the host-network endpoint 172.18.0.2:6443
+#      (verified: `kubectl get endpointslice -n default` -> 172.18.0.2:6443).
+#      Host-network endpoints cannot be selected by a podSelector, so a FIFTH
+#      NetworkPolicy with an `ipBlock` for the control-plane address would be
+#      required. It is deliberately NOT added here: `network/` is the phase-2c
+#      baseline this phase's invariant is defined against, and quietly widening
+#      it to host the watchdog would weaken the thing being watched.
+#
+# The controller a namespace runs INSIDE is subject to that namespace's own
+# rules. That is the honest cost of not exempting it, and it is the reason the
+# phase-8 demo ran out of cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netpol-guard
+  namespace: demo
+  labels:
+    app: netpol-guard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netpol-guard
+  template:
+    metadata:
+      labels:
+        app: netpol-guard
+    spec:
+      serviceAccountName: netpol-guard
+      # PSA `restricted` is enforced on `demo`
+      # (pod-security.kubernetes.io/enforce=restricted, v1.35), so these are
+      # requirements, not decoration.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: netpol-guard
+          # Pinned by tag, per disallow-latest-and-bare-tag. A digest pin
+          # (tag@sha256:...) is the repo's standard and belongs here too — it
+          # is absent because there is no published manifest to take a digest
+          # FROM. Filling in a digest that was never produced would be a
+          # fabrication, so the field is left honest and incomplete.
+          image: ghcr.io/joesevv/k8s-security-lab/netpol-guard:v0.1.0
+          # AlwaysPullImages (phase 5b) forces this value anyway; stated so the
+          # manifest does not read as if a cached image would be used.
+          imagePullPolicy: Always
+          args:
+            - --namespace=demo
+            # DETECT ONLY. Flipping this to true is the entire difference
+            # between stage 1 and stage 2 of this phase, and it should be a
+            # reviewed change to this file, not a runtime toggle.
+            - --remediate=false
+            - --interval=30s
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
