@@ -34,3 +34,10 @@ Thumbs.db
 
 # Local planning scratch notes — working docs, deliberately never committed
 NEXT-SESSION-fable-brief.md
+
+# Go build output. `go build ./...` drops the binary beside its source on
+# Windows, so app/netpol-guard/netpol-guard.exe is one stray build away from
+# being committed. The controller ships as source and a Dockerfile, never as
+# a checked-in binary.
+*.exe
+

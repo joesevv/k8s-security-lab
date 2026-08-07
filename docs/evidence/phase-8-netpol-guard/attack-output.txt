@@ -1,0 +1,778 @@
+Phase 8 — netpol-guard: a controller enforcing an invariant admission
+structurally cannot (captured 2026-08-07)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, 3 nodes
+(seclab-control-plane, seclab-worker, seclab-worker2), CNI kindnet
+(empirically confirmed to enforce NetworkPolicy, phase 2c and again here).
+Built: app/netpol-guard, Go 1.26.5 windows/amd64, k8s.io/client-go v0.35.5 —
+the exact patch match for the cluster's v1.35.5 server.
+Run mode: OUT OF CLUSTER, against the kubeconfig. Section 5b says why, and
+what in-cluster would require. The in-cluster manifests are committed
+UNAPPLIED alongside this file.
+All timestamps below are the controller's own, in local time (-05:00), with
+millisecond resolution.
+
+============================================================
+0) THE THESIS — WHAT ADMISSION STRUCTURALLY CANNOT DO
+============================================================
+
+ADMISSION VALIDATES THE OBJECT BEING WRITTEN. That is its entire contract. It
+receives an AdmissionReview for a specific resource on a specific verb and
+answers allow/deny. It is excellent at "this Pod must not be privileged" and
+it is the only layer that can make a bad state impossible rather than
+temporary.
+
+THE VIOLATION IN THIS PHASE IS CAUSED BY DELETING AN UNRELATED OBJECT.
+
+  $ kubectl delete networkpolicy default-deny -n demo
+
+At that instant no pod is created, no pod is updated, no pod is touched in any
+way. The `signed-app` pod keeps running, unmodified, with the same spec and
+the same uid — and it silently loses Ingress protection, because the only
+policy that was selecting it for Ingress is gone. There is NO AdmissionReview
+for that pod at the moment its protection disappears. A ValidatingPolicy has
+nothing to evaluate. A PSA profile has nothing to evaluate. There is no
+request. This is a structural limit of the request path, not a gap in this
+lab's policy set — section 3d shows the five Kyverno policies matching only
+`pods`/`deployments`/`jobs` on `CREATE, UPDATE`, never `networkpolicies`.
+
+Only something that CONTINUOUSLY RECONCILES OBSERVED STATE can notice. That is
+what phase 8 builds.
+
+IT ALSO CLOSES A GAP PHASE 7 MEASURED. ArgoCD's `demo-workloads` Application
+syncs `workloads/` and nothing else; `network/` is outside its scope. Phase 7
+drifted an out-of-scope object and watched ArgoCD ignore it for 4 min 57 s
+while reporting `Synced`. Section 3e re-confirms it here: throughout the
+entire unprotected window, ArgoCD reported `Synced` / `Healthy`.
+
+THE PHASE IS RUN TWICE, WITH ONE FLAG CHANGED.
+  STAGE 1 (section 3): --remediate=false. The invariant breaks. The controller
+  reports it on scan 4 and then reports it again on scans 5, 6, 7, 8, 9 and 10
+  and does nothing about it. The pod stays reachable.
+  STAGE 2 (section 4): --remediate=true. The SAME violation is restored in
+  19 milliseconds, on the first scan.
+The contrast between those numbers is the deliverable. Detection and
+correction are different products, and the flag between them is one boolean.
+
+IT IS NOT PREVENTION EITHER. Section 4d is the uncomfortable arithmetic: a
+controller that reconciles on a timer leaves a real window in which the pod
+genuinely was unprotected. This phase measured that window at the network
+level, not in theory — 226 milliseconds after the delete, a host that had been
+refused for 5 full seconds got HTTP 200 from the app.
+
+============================================================
+1) GROUND TRUTH — THE POLICIES, THE PODS, THE ISOLATION MATH
+============================================================
+
+1a. The four NetworkPolicies in `demo`, reduced to the only two fields the
+invariant depends on:
+
+$ kubectl get networkpolicy -n demo -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}podSelector={.spec.podSelector}{"\t"}policyTypes={.spec.policyTypes}{"\n"}{end}'
+allow-client-egress-to-nginx	podSelector={"matchLabels":{"access":"nginx"}}	policyTypes=["Egress"]
+allow-dns	podSelector={}	policyTypes=["Egress"]
+allow-nginx-ingress-from-client	podSelector={"matchLabels":{"app":"nginx"}}	policyTypes=["Ingress"]
+default-deny	podSelector={}	policyTypes=["Ingress","Egress"]
+(exit code: 0 — four policies, as committed in network/)
+
+=> `allow-dns` has an EMPTY podSelector and `Egress`. That single fact is what
+   makes this demo produce one specific violation instead of a general
+   collapse: after `default-deny` goes, every pod in the namespace is STILL
+   Egress-isolated, by `allow-dns`.
+
+1b. The pods, with their labels:
+
+$ kubectl get pods -n demo --show-labels
+NAME                         READY   STATUS    RESTARTS        AGE     LABELS
+nginx-78c88678f4-gxqtl       1/1     Running   0               3h32m   app=nginx,pod-template-hash=78c88678f4
+nginx-78c88678f4-jfhzk       1/1     Running   0               3h32m   app=nginx,pod-template-hash=78c88678f4
+signed-app-d9c5dfcbb-8mzkm   1/1     Running   3 (5h19m ago)   8d      app=signed-app,pod-template-hash=d9c5dfcbb
+(exit code: 0 — three pods; no pod carries access=nginx)
+
+1c. The isolation math, worked from 1a and 1b. Kubernetes semantics: a pod is
+isolated for a direction if ANY policy selects it with that direction in
+policyTypes; an empty podSelector selects every pod.
+
+  WITH all four policies:
+    nginx pods      Ingress: default-deny{} + allow-nginx-ingress-from-client
+                    Egress:  default-deny{} + allow-dns{}
+    signed-app      Ingress: default-deny{}                    <-- SOLE source
+                    Egress:  default-deny{} + allow-dns{}
+
+  WITHOUT default-deny:
+    nginx pods      Ingress: allow-nginx-ingress-from-client    still covered
+                    Egress:  allow-dns{}                        still covered
+    signed-app      Ingress: NOTHING                            <-- VIOLATION
+                    Egress:  allow-dns{}                        still covered
+
+=> Deleting `default-deny` does not break the namespace. It breaks exactly ONE
+   pod in exactly ONE direction. `signed-app` carries `app=signed-app`; the
+   only remaining Ingress policy selects `app=nginx`. Nothing else selects it.
+   Sections 3 and 4 test this prediction rather than assuming it.
+
+(Note on provenance: the compact listing in 1a was re-printed after this phase
+restored the baseline, so its content is the end state as well as the start
+state; the full pre-state `-o yaml` dump taken before anything was touched
+carries the identical podSelector and policyTypes values for all four.)
+
+1d. A consequence that dictates HOW the reachability probe had to be built.
+Because `allow-dns` keeps EVERY pod in `demo` Egress-isolated with only
+53/UDP+TCP to CoreDNS allowed, a phase-2c-style attacker pod INSIDE `demo`
+could not have demonstrated this regression: its egress to `signed-app` stays
+blocked before and after, so the probe would have failed identically in both
+states and proved nothing. The probe therefore had to originate OUTSIDE the
+reach of `demo`'s policies. Section 3a establishes one that works and, just as
+importantly, one that does not.
+
+============================================================
+2) THE CONTROLLER — BUILT, VETTED, UNIT-TESTED
+============================================================
+
+2a. `go` is NOT on PATH in non-interactive shells on this host. It is invoked
+by absolute path throughout, the same way this repo invokes `gh`:
+
+$ "C:\Program Files\Go\bin\go.exe" version
+go version go1.26.5 windows/amd64
+(exit code: 0)
+
+2b. Build and vet. Both produced NO output, which for these two commands is
+the success condition:
+
+$ "C:\Program Files\Go\bin\go.exe" build ./...
+(exit code: 0 — no output; the command writes nothing on success)
+
+$ "C:\Program Files\Go\bin\go.exe" vet ./...
+(exit code: 0 — no output; vet reports only problems)
+
+A NOTE ON THE COMMAND LINES BELOW. Sections 3 through 6 ran the binary
+produced by `go build -o <scratch>/netpol-guard.exe .` from this module,
+invoked by its absolute path, rather than `go run .` — so that the harness
+could start it, delete a policy underneath it, and stop it. It is the same
+program from the same source; the command lines are written as
+`$ netpol-guard --flags` for readability. Every line of OUTPUT below is
+verbatim from the captured stdout of those runs.
+
+2c. The unit tests. These cover the pure isolation logic: empty selector,
+matching selector, non-matching selector, one direction missing, both
+directions from different policies, no policies at all, the healthy namespace,
+and — as a fixture — the exact scenario this phase then runs against the live
+cluster:
+
+$ "C:\Program Files\Go\bin\go.exe" test -v ./...
+=== RUN   TestEvaluate
+=== RUN   TestEvaluate/empty_podSelector_with_both_policyTypes_isolates_every_pod,_labelled_or_not
+=== RUN   TestEvaluate/matching_selector_isolates_only_the_pods_it_selects
+=== RUN   TestEvaluate/non-matching_selector_isolates_nothing
+=== RUN   TestEvaluate/no_policies_at_all:_no_pod_is_isolated_in_either_direction
+=== RUN   TestEvaluate/one_direction_missing:_an_Egress-only_policy_leaves_Ingress_uncovered
+=== RUN   TestEvaluate/both_directions,_supplied_by_two_different_policies,_union_to_isolated
+=== RUN   TestEvaluate/the_healthy_demo_namespace:_all_four_policies_present,_invariant_holds
+=== RUN   TestEvaluate/default-deny_deleted:_signed-app_alone_loses_Ingress_isolation
+--- PASS: TestEvaluate (0.00s)
+    --- PASS: TestEvaluate/empty_podSelector_with_both_policyTypes_isolates_every_pod,_labelled_or_not (0.00s)
+    --- PASS: TestEvaluate/matching_selector_isolates_only_the_pods_it_selects (0.00s)
+    --- PASS: TestEvaluate/non-matching_selector_isolates_nothing (0.00s)
+    --- PASS: TestEvaluate/no_policies_at_all:_no_pod_is_isolated_in_either_direction (0.00s)
+    --- PASS: TestEvaluate/one_direction_missing:_an_Egress-only_policy_leaves_Ingress_uncovered (0.00s)
+    --- PASS: TestEvaluate/both_directions,_supplied_by_two_different_policies,_union_to_isolated (0.00s)
+    --- PASS: TestEvaluate/the_healthy_demo_namespace:_all_four_policies_present,_invariant_holds (0.00s)
+    --- PASS: TestEvaluate/default-deny_deleted:_signed-app_alone_loses_Ingress_isolation (0.00s)
+=== RUN   TestEvaluateAttributesPoliciesByName
+--- PASS: TestEvaluateAttributesPoliciesByName (0.00s)
+=== RUN   TestMissing
+=== RUN   TestMissing/both_directions_covered
+=== RUN   TestMissing/ingress_missing
+=== RUN   TestMissing/egress_missing
+=== RUN   TestMissing/both_missing
+--- PASS: TestMissing (0.00s)
+    --- PASS: TestMissing/both_directions_covered (0.00s)
+    --- PASS: TestMissing/ingress_missing (0.00s)
+    --- PASS: TestMissing/egress_missing (0.00s)
+    --- PASS: TestMissing/both_missing (0.00s)
+=== RUN   TestEffectivePolicyTypes
+=== RUN   TestEffectivePolicyTypes/explicit_Ingress+Egress
+=== RUN   TestEffectivePolicyTypes/explicit_Ingress_only
+=== RUN   TestEffectivePolicyTypes/explicit_Egress_only
+=== RUN   TestEffectivePolicyTypes/absent_policyTypes,_no_egress_rules:_Ingress_is_implied
+=== RUN   TestEffectivePolicyTypes/absent_policyTypes,_egress_rules_present:_Ingress+Egress_implied
+--- PASS: TestEffectivePolicyTypes (0.00s)
+    --- PASS: TestEffectivePolicyTypes/explicit_Ingress+Egress (0.00s)
+    --- PASS: TestEffectivePolicyTypes/explicit_Ingress_only (0.00s)
+    --- PASS: TestEffectivePolicyTypes/explicit_Egress_only (0.00s)
+    --- PASS: TestEffectivePolicyTypes/absent_policyTypes,_no_egress_rules:_Ingress_is_implied (0.00s)
+    --- PASS: TestEffectivePolicyTypes/absent_policyTypes,_egress_rules_present:_Ingress+Egress_implied (0.00s)
+=== RUN   TestBaselineDefaultDenyMatchesTheCommittedBaseline
+--- PASS: TestBaselineDefaultDenyMatchesTheCommittedBaseline (0.00s)
+PASS
+ok  	github.com/joesevv/k8s-security-lab/app/netpol-guard	3.533s
+(exit code: 0 — 4 top-level tests, 17 subtests, all PASS)
+
+=> The single most important line in the module is
+   `metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)`. It is what turns
+   podSelector `{}` into `labels.Everything()`. A hand-rolled map comparison
+   would treat the empty selector as "matches nothing", the controller would
+   report a healthy namespace as catastrophically broken, and the FIRST test
+   case above is the one that would catch it.
+
+2d. The image builds, runs, and is non-root — but it is not published:
+
+$ docker build -t netpol-guard:localtest app/netpol-guard
+[... 60 lines of buildkit progress elided ...]
+#14 naming to docker.io/library/netpol-guard:localtest done
+(exit code: 0)
+
+$ docker run --rm netpol-guard:localtest --help
+Usage of /usr/local/bin/netpol-guard:
+  -interval duration
+    	time between scans (default 30s)
+  -kubeconfig string
+    	path to a kubeconfig; when empty, in-cluster config is used
+  -namespace string
+    	namespace whose pods must all be NetworkPolicy-isolated (default "demo")
+  -once
+    	run a single scan and exit; exits 1 on a violation in detect-only mode
+  -remediate
+    	restore the baseline default-deny NetworkPolicy when the invariant is violated; detect-only when false
+(exit code: 0)
+
+$ docker inspect -f 'User={{.Config.User}} Entrypoint={{.Config.Entrypoint}} Cmd={{.Config.Cmd}}' netpol-guard:localtest
+User=65532:65532 Entrypoint=[/usr/local/bin/netpol-guard] Cmd=[--namespace=demo --remediate=false --interval=30s]
+(exit code: 0 — distroless nonroot uid, detect-only by default)
+
+=> The local tag was removed again after this check. NO image was pushed, no
+   registry credential was used, and no `docker login` was performed. Section
+   5b explains why that matters more than it sounds.
+
+============================================================
+3) STAGE 1 — DETECT ONLY. THE INVARIANT BREAKS AND NOTHING FIXES IT
+============================================================
+
+3a. CALIBRATING THE PROBE — one source works, one does not. NetworkPolicy is
+an API-level statement; whether the CNI enforces it is a separate question and
+this phase answers it with real TCP. With all four policies in place:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:000 time=5.002037
+(exit code: 28 — curl timeout; the connection is dropped, not refused)
+
+$ docker exec seclab-worker2 curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:200 time=0.005990
+(exit code: 0)
+
+=> `signed-app` runs on seclab-worker2 (10.244.1.7). From seclab-worker — a
+   DIFFERENT node — it is unreachable. From seclab-worker2 — the pod's OWN
+   node — it answers in 6 ms. kindnet does not police traffic from a pod's own
+   node, which is expected (kubelet probes have to work). So:
+     PROBE SOURCE   = seclab-worker, the remote node. Its source address is
+                      not a pod in `demo`, so no `demo` egress policy applies
+                      to it, and what it hits is purely `signed-app`'s INGRESS
+                      isolation. This is the discriminator.
+     LIVENESS CHECK = seclab-worker2, the local node. Its HTTP 200 proves the
+                      app is up and serving, so a timeout from the remote node
+                      is a policy decision and not a dead process.
+
+   A phase-2c-style attacker POD inside `demo` was considered and rejected on
+   the evidence of section 1d: `allow-dns` keeps every `demo` pod
+   Egress-isolated with only DNS allowed, so that probe stays blocked in both
+   states and cannot discriminate. This is a deviation from the phase-2c
+   method, made because the phase-2c method cannot see this particular
+   regression.
+
+3b. A differential control on the same command, aimed at nginx:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.14:8080/
+HTTP:000 time=5.002455
+(exit code: 28 — curl timeout)
+
+=> nginx (10.244.1.14, also on seclab-worker2) is blocked from the same source
+   right now. Section 3c re-runs this AFTER the deletion; if the prediction in
+   1c is right it must STILL be blocked, because
+   `allow-nginx-ingress-from-client` survives.
+
+3c. THE RUN. The controller is started detect-only at a 15-second interval,
+allowed three clean scans, and then `default-deny` is deleted underneath it.
+The log is continuous and unedited:
+
+$ netpol-guard --kubeconfig=C:/Users/josep/.kube/config --namespace=demo --remediate=false --interval=15s
+2026-08-07T17:00:25.219-05:00 netpol-guard start namespace=demo remediate=false interval=15s once=false auth=kubeconfig C:/Users/josep/.kube/config apiserver=https://127.0.0.1:60625
+2026-08-07T17:00:25.219-05:00 invariant: every pod in namespace demo must be selected by a NetworkPolicy for BOTH Ingress and Egress
+2026-08-07T17:00:25.238-05:00 scan=1 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:00:40.225-05:00 scan=2 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:00:55.225-05:00 scan=3 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:01:10.225-05:00 VIOLATION scan=4 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:01:10.225-05:00 scan=4 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:01:25.225-05:00 VIOLATION scan=5 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:01:25.225-05:00 scan=5 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:01:40.225-05:00 VIOLATION scan=6 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:01:40.225-05:00 scan=6 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:01:55.225-05:00 VIOLATION scan=7 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:01:55.225-05:00 scan=7 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:02:10.225-05:00 VIOLATION scan=8 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:02:10.225-05:00 scan=8 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:02:25.225-05:00 VIOLATION scan=9 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:02:25.225-05:00 scan=9 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:02:40.225-05:00 VIOLATION scan=10 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:02:40.225-05:00 scan=10 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+(the process was stopped by the harness at 2026-08-07T17:02:49.641-05:00)
+
+The deletion, issued at 2026-08-07T17:01:03.275-05:00 while the above was
+running:
+
+$ kubectl delete networkpolicy default-deny -n demo
+networkpolicy.networking.k8s.io "default-deny" deleted from demo namespace
+(exit code: 0 — nothing objected; see 3d)
+
+$ kubectl get networkpolicy -n demo
+NAME                              POD-SELECTOR   AGE
+allow-client-egress-to-nginx      access=nginx   8d
+allow-dns                         <none>         8d
+allow-nginx-ingress-from-client   app=nginx      8d
+(exit code: 0 — three policies remain, exactly as section 1c assumed)
+
+=> The controller's own numbers narrate it: `networkpolicies=4` on scans 1-3,
+   `networkpolicies=3` from scan 4. It names the pod
+   (`signed-app-d9c5dfcbb-8mzkm`), the missing direction (`missing=Ingress`),
+   and — the part that proves it is reasoning and not pattern-matching — the
+   policy still providing the OTHER direction
+   (`isolated-for-egress-by=[allow-dns]`). Exactly one pod, exactly one
+   direction. The prediction in 1c holds.
+=> DETECTION LATENCY: deleted 17:01:03.275, first reported 17:01:10.225 =
+   6.950 seconds, with a 15-second scan interval. That is a mid-interval
+   arrival, not a best case.
+=> The violation was then reported on SEVEN consecutive scans spanning
+   17:01:10.225 to 17:02:40.225 — 96.950 seconds after the delete — with
+   nothing correcting it, because `--remediate=false`.
+
+THE SECURITY REGRESSION, AT THE NETWORK LEVEL. The two probes below bracket
+the delete. The first pair was taken at 17:00:19.485 and 17:00:24.856, in the
+same run, seconds before the controller was started:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:000 time=5.002004
+(exit code: 28 — curl timeout; blocked, with all four policies in place)
+
+$ docker exec seclab-worker2 curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:200 time=0.001311
+(exit code: 0 — from its own node the app is serving in 1.3 ms)
+
+Then, 226 milliseconds after the delete was issued, from the same node that
+had just been timed out for 5 full seconds:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:200 time=0.001430
+(exit code: 0 — the app answered in 1.43 ms)
+
+And the differential control from 3b, run 326 ms later, unchanged command:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.14:8080/
+HTTP:000 time=5.002590
+(exit code: 28 — curl timeout; nginx is still isolated)
+
+=> THIS IS THE PHASE. Same source, same command, two targets, one deleted
+   object between them:
+     signed-app  5.002 s timeout  ->  HTTP 200 in 1.43 ms   REGRESSED
+     nginx       5.002 s timeout  ->  5.003 s timeout       UNCHANGED
+   The pod that lost its only Ingress policy became reachable. The pod that
+   kept one did not. This is not the controller's opinion about the API; it is
+   TCP.
+
+3d. WHO ELSE NOTICED? NOBODY. Start with admission, since that is the claim.
+The five Kyverno policies, printed as their own matchConstraints:
+
+$ kubectl get validatingpolicy -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.matchConstraints.resourceRules}{"\n"}{end}'
+disallow-latest-and-bare-tag	[{"apiGroups":[""],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["pods","pods/ephemeralcontainers"]},{"apiGroups":["apps"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["deployments","statefulsets","daemonsets","replicasets"]},{"apiGroups":["batch"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["jobs","cronjobs"]}]
+disallow-privileged-containers	[{"apiGroups":[""],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["pods","pods/ephemeralcontainers"]},{"apiGroups":["apps"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["deployments","statefulsets","daemonsets","replicasets"]},{"apiGroups":["batch"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["jobs","cronjobs"]}]
+require-drop-all-capabilities	[{"apiGroups":[""],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["pods","pods/ephemeralcontainers"]},{"apiGroups":["apps"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["deployments","statefulsets","daemonsets","replicasets"]},{"apiGroups":["batch"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["jobs","cronjobs"]}]
+restrict-registries	[{"apiGroups":[""],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["pods","pods/ephemeralcontainers"]},{"apiGroups":["apps"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["deployments","statefulsets","daemonsets","replicasets"]},{"apiGroups":["batch"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["jobs","cronjobs"]}]
+(exit code: 0)
+
+$ kubectl get imagevalidatingpolicy require-keyless-signed-ghcr -o jsonpath='{.spec.matchConstraints.resourceRules}'
+[{"apiGroups":[""],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["pods","pods/ephemeralcontainers"]},{"apiGroups":["apps"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["deployments","statefulsets","daemonsets","replicasets"]},{"apiGroups":["batch"],"apiVersions":["v1"],"operations":["CREATE","UPDATE"],"resources":["jobs","cronjobs"]}]
+(exit code: 0)
+
+=> Read the two axes. RESOURCES: pods, ephemeralcontainers, deployments,
+   statefulsets, daemonsets, replicasets, jobs, cronjobs. `networkpolicies`
+   appears ZERO times across all five policies. OPERATIONS: `CREATE, UPDATE`.
+   `DELETE` appears ZERO times. Even a policy that DID match networkpolicies
+   would not be consulted on this verb as written.
+=> And this is the deeper point, the one that survives someone "fixing" the
+   policies: even a policy matching networkpolicies on DELETE could only ever
+   guard the deletion of THAT object by THAT request. It could not tell you
+   whether some OTHER pod, elsewhere in the namespace, still has coverage —
+   because admission sees one object, not the namespace. The invariant is a
+   property of the SET.
+
+No events were emitted in the namespace at any point:
+
+$ kubectl get events -n demo --sort-by=.lastTimestamp
+No resources found in demo namespace.
+(exit code: 0 — no PSA warning, no Kyverno denial, no anything)
+
+3e. ArgoCD, asked while the pod was unprotected:
+
+$ kubectl -n argocd get application demo-workloads
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   Synced        Healthy
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.sync.status}{"\t"}{.status.health.status}{"\t"}{.status.operationState.phase}{"\n"}'
+Synced	Healthy	Succeeded
+(exit code: 0)
+
+=> `Synced`, `Healthy`, `Succeeded` — while a production pod sat with no
+   Ingress policy at all and was answering HTTP from a host that should not
+   reach it. ArgoCD is not lying: `network/` is genuinely outside its
+   Application's scope, exactly as phase 7 documented. It is reporting
+   faithfully on the 7 objects it was told to manage. That is precisely why
+   "GitOps is watching the cluster" is a dangerous shorthand.
+
+============================================================
+4) STAGE 2 — REMEDIATE. ONE FLAG, NINETEEN MILLISECONDS
+============================================================
+
+4a. Same cluster, same violation, still uncorrected going in:
+
+$ kubectl get networkpolicy -n demo
+NAME                              POD-SELECTOR   AGE
+allow-client-egress-to-nginx      access=nginx   8d
+allow-dns                         <none>         8d
+allow-nginx-ingress-from-client   app=nginx      8d
+(exit code: 0 — three policies; `default-deny` has been gone for 2m54s)
+
+The controller is restarted with the one flag changed:
+
+$ netpol-guard --kubeconfig=C:/Users/josep/.kube/config --namespace=demo --remediate=true --interval=15s
+2026-08-07T17:03:57.926-05:00 netpol-guard start namespace=demo remediate=true interval=15s once=false auth=kubeconfig C:/Users/josep/.kube/config apiserver=https://127.0.0.1:60625
+2026-08-07T17:03:57.927-05:00 invariant: every pod in namespace demo must be selected by a NetworkPolicy for BOTH Ingress and Egress
+2026-08-07T17:03:57.939-05:00 VIOLATION scan=1 pod=signed-app-d9c5dfcbb-8mzkm missing=Ingress isolated-for-ingress-by=[] isolated-for-egress-by=[allow-dns]
+2026-08-07T17:03:57.939-05:00 scan=1 namespace=demo pods=3 networkpolicies=3 violations=1 verdict=VIOLATED
+2026-08-07T17:03:57.941-05:00 REMEDIATE baseline networkpolicy/default-deny is ABSENT in demo — creating it
+2026-08-07T17:03:57.945-05:00 REMEDIATE created networkpolicy/default-deny in demo uid=9123c527-bdea-48b6-a6c9-c8ba5b687272 resourceVersion=461137 — every pod is isolated for Ingress and Egress again
+2026-08-07T17:04:12.933-05:00 scan=2 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:04:27.932-05:00 scan=3 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:04:42.934-05:00 scan=4 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:04:57.933-05:00 scan=5 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:05:12.933-05:00 scan=6 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+2026-08-07T17:05:27.932-05:00 scan=7 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+(the process was stopped by the harness at 2026-08-07T17:05:39.793-05:00)
+
+=> It detected the same violation with the same wording, and this time acted:
+   start 17:03:57.926 -> created 17:03:57.945 = 19 milliseconds. The
+   detection-to-create step alone was 6 ms (17:03:57.939 -> 17:03:57.945).
+=> NO CHURN. Exactly ONE `REMEDIATE created` line exists in the whole log
+   (mechanically counted: `grep -c "REMEDIATE created"` = 1). Scans 2 through 7
+   report `HOLDS` for 74.999 continuous seconds and emit no further REMEDIATE
+   line at all, because the controller's first action on a violation is a GET,
+   and a present baseline means it does nothing.
+
+4b. DOES THE RESTORED OBJECT MATCH THE COMMITTED BASELINE? Method: print the
+live `.spec` and the file's `.spec` through the SAME kubectl jsonpath printer
+(which emits map keys in sorted order), so a byte comparison is meaningful,
+and compare with `cmp`. The file side goes through `--dry-run=client`, which
+touches nothing on the cluster:
+
+$ kubectl get networkpolicy default-deny -n demo -o jsonpath='{.spec}'
+{"podSelector":{},"policyTypes":["Ingress","Egress"]}
+(exit code: 0)
+
+$ kubectl apply -f network/00-default-deny.yaml --dry-run=client -o jsonpath='{.spec}'
+{"podSelector":{},"policyTypes":["Ingress","Egress"]}
+(exit code: 0)
+
+$ cmp live-spec.json file-spec.json      # the two stdouts redirected above
+(exit code: 0 — no output; the two specs are BYTE-IDENTICAL)
+
+Metadata, and the proof of authorship:
+
+$ kubectl get networkpolicy default-deny -n demo -o jsonpath='labels={.metadata.labels} annotations={.metadata.annotations} managers={range .metadata.managedFields[*]}{.manager}{" "}{end}{"\n"}'
+labels= annotations= managers=netpol-guard 
+(exit code: 0)
+
+=> No labels, no annotations, one field manager: `netpol-guard`. The
+   controller stamps nothing of its own onto the object, deliberately — what
+   it restores must be the repo's baseline, not a controller-flavoured variant
+   of it. The authorship is recorded where authorship belongs, in
+   managedFields.
+=> One honest difference, visible on stderr when the file side was rendered:
+     Warning: resource networkpolicies/default-deny is missing the
+     kubectl.kubernetes.io/last-applied-configuration annotation which is
+     required by kubectl apply. [...]
+   The controller does not write kubectl's client-side-apply annotation,
+   because it is not kubectl. The SPEC is identical; that annotation is
+   kubectl bookkeeping. Section 6 re-applies `network/` so the object ends the
+   phase indistinguishable from one a human applied.
+
+4c. THE NETWORK AGREES. The same probe from the same node, 1.091 seconds after
+the create line:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:000 time=5.002314
+(exit code: 28 — curl timeout; blocked again)
+
+And again 15 seconds later, to rule out a lucky first sample:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:000 time=5.001861
+(exit code: 28 — curl timeout)
+
+=> The connection that succeeded in 1.43 ms during stage 1 is refused again.
+   The remediation is real at the packet level, not just in the API. kindnet
+   had the new policy programmed within ~1.1 s of the object being created —
+   fast enough that the first probe never saw an open port.
+
+4d. THE ARITHMETIC OF THE WINDOW, STATED HONESTLY.
+
+  Delete issued                17:01:03.275
+  Reachable (HTTP 200)         17:01:03.501    +0.226 s
+  Controller reports it        17:01:10.225    +6.950 s   (interval 15 s)
+  Baseline recreated           17:03:57.945  +174.670 s
+  Blocked again (probe)        17:03:59.036  +175.761 s
+
+  TOTAL UNPROTECTED: 174.670 seconds = 2 min 54.670 s.
+
+  That number is an artefact of the two-stage demo, not the controller's
+  performance, and saying otherwise would be dishonest: 96.950 s of it is
+  stage 1 deliberately doing nothing, and ~68 s is the gap between stopping
+  the detect-only process and starting the remediating one by hand.
+
+  THE CONTROLLER'S OWN NUMBER is the detection latency: 6.950 s at a 15-second
+  interval, bounded above by one full interval plus an API round trip. At the
+  shipped default of 30 s the bound is ~30 s. A single-replica controller that
+  is restarting, throttled, or wedged has no bound at all.
+
+  AND IT IS NEVER ZERO. Stage 2's 19 ms is the reaction time once the scan
+  fires; it is not the exposure. Between the delete and the next scan the pod
+  really was reachable — measured, at 226 ms, by a host that had been timed
+  out moments earlier. Only admission control can make an exposure window
+  zero, and admission control cannot see this event at all. That is the whole
+  shape of phase 8: the layer that could make it zero cannot see it, and the
+  layer that can see it cannot make it zero.
+
+============================================================
+5) LIMITS — EACH ONE PROVEN OR EXPLICITLY REASONED
+============================================================
+
+5a. IT RAN OUT OF CLUSTER. Every run above used
+`--kubeconfig=C:/Users/josep/.kube/config` from the Windows host, with the
+operator's own credentials, not a ServiceAccount token. Nothing was deployed:
+
+$ kubectl -n demo get serviceaccount,role,rolebinding,deployment
+NAME                           AGE
+serviceaccount/default         8d
+serviceaccount/developer-sa    8d
+serviceaccount/nginx-sa        8d
+serviceaccount/signed-app-sa   8d
+
+NAME                                       CREATED AT
+role.rbac.authorization.k8s.io/developer   2026-07-30T13:53:56Z
+
+NAME                                                      ROLE             AGE
+rolebinding.rbac.authorization.k8s.io/developer-binding   Role/developer   8d
+
+NAME                         READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nginx        2/2     2            2           8d
+deployment.apps/signed-app   1/1     1            1           8d
+(exit code: 0 — no netpol-guard ServiceAccount, Role, RoleBinding or
+Deployment anywhere in the namespace)
+
+$ kubectl -n demo get deployment netpol-guard
+Error from server (NotFound): deployments.apps "netpol-guard" not found
+(exit code: 1 — the phase-8 Deployment does not exist on this cluster)
+
+5b. WHAT IN-CLUSTER WOULD REQUIRE — three gates, none of which an agent may
+open. This is a finding about the lab, not an excuse:
+
+  1. A CI CHANGE. `.github/workflows/supply-chain.yml` builds exactly one
+     context, `app/signed-app`, and pushes on `push: branches: [main]`. A
+     second image needs a second build/push job.
+  2. A MERGE TO `main`. The publish step is gated on that branch, so a feature
+     branch cannot produce the image.
+  3. A COSIGN SIGNATURE. `require-keyless-signed-ghcr` Denies any
+     `ghcr.io/joesevv/k8s-security-lab/*` image in `demo` that lacks a
+     Sigstore keyless signature from the pinned workflow identity. CI would
+     have to sign this image exactly as it signs `signed-app`.
+
+  AND `kind load` CANNOT ROUTE AROUND IT. Phase 5b enabled
+  `--enable-admission-plugins=NodeRestriction,AlwaysPullImages`, which forces
+  the kubelet to pull from a registry, so side-loading a locally-built image
+  no longer works. That is the lab's own hardening closing the door — a real
+  trade-off, worth recording rather than apologising for: AlwaysPullImages
+  removes a genuine attack path (a node-local image masquerading as a trusted
+  tag) and in exchange makes local iteration require a full publish pipeline.
+
+  A FOURTH GATE, FOUND WHILE WRITING THE MANIFEST. A netpol-guard pod in
+  `demo` could not reach the apiserver. Under `default-deny` every pod is
+  Egress-isolated and the only carve-out is `allow-dns` (53/UDP+TCP to
+  CoreDNS). The apiserver is Service `kubernetes.default`:
+
+$ kubectl get svc kubernetes -n default
+NAME         TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
+kubernetes   ClusterIP   10.96.0.1    <none>        443/TCP   8d
+(exit code: 0)
+
+$ kubectl get endpointslice -n default -o wide
+NAME         ADDRESSTYPE   PORTS   ENDPOINTS    AGE
+kubernetes   IPv4          6443    172.18.0.2   8d
+(exit code: 0)
+
+  172.18.0.2:6443 is a HOST-NETWORK endpoint — no podSelector can select it —
+  so a fifth NetworkPolicy with an `ipBlock` for the control-plane address
+  would be required. It was deliberately NOT added: `network/` is the baseline
+  this invariant is defined against, and widening it to host the watchdog
+  would weaken the thing being watched. The controller that guards a namespace
+  is subject to that namespace's rules. That is the honest cost of not
+  exempting it.
+
+  The manifests are committed and were validated client-side only:
+
+$ kubectl apply --dry-run=client -f docs/evidence/phase-8-netpol-guard/rbac.yaml
+serviceaccount/netpol-guard created (dry run)
+role.rbac.authorization.k8s.io/netpol-guard created (dry run)
+rolebinding.rbac.authorization.k8s.io/netpol-guard created (dry run)
+(exit code: 0 — schema valid; NOTHING was written)
+
+$ kubectl apply --dry-run=client -f docs/evidence/phase-8-netpol-guard/deployment.yaml
+deployment.apps/netpol-guard created (dry run)
+(exit code: 0 — schema valid; NOTHING was written)
+
+  NOT VERIFIED: that the Deployment would actually be DENIED by
+  `require-keyless-signed-ghcr`. That claim is read off the policy's own
+  matchConstraints and scope, not observed — a server-side dry-run was not run,
+  because it would have exercised the admission path against the live cluster.
+  Treat it as reasoned, not measured.
+
+5c. IT RECONCILES ON A TIMER. Quantified in 4d from this phase's own
+timestamps: 6.950 s to notice at `--interval=15s`; up to ~30 s at the shipped
+default. During that window the pod is not protected — and 3c proves that is
+not a theoretical statement.
+
+5d. IT ONLY CHECKS THAT ISOLATION EXISTS, NOT THAT IT IS CORRECT. This is the
+limit most likely to be over-read by a reader who wants good news. A policy
+like this one:
+
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: [{}]        # allow from everywhere
+  egress:  [{}]        # allow to everywhere
+
+satisfies this invariant COMPLETELY. Every pod would be "isolated" in both
+directions and every scan would print `verdict=HOLDS`, while the namespace
+was wide open. netpol-guard checks COVERAGE. It does not read rules, it does
+not evaluate reachability, and nothing in this phase should be read as saying
+`demo` is correctly segmented — phase 2c makes that argument, and this phase
+only keeps its foundation from silently vanishing.
+
+5e. SCOPE. One namespace per process (`demo` by default). NetworkPolicies
+versus Pods, and nothing else — not Services, not Ingress objects, not CNI
+enforcement, not other namespaces. Pods in `Succeeded`/`Failed` are skipped
+(no running container to protect); that filter is in the cluster-facing scan
+path and is NOT covered by a unit test.
+
+5f. LEAST-PRIVILEGE RBAC, AND THE CONTRAST NOBODY SHOULD MISS. The committed
+Role grants `list` on pods and `get, list, create` on networkpolicies, in ONE
+namespace, via a namespaced Role and RoleBinding. It grants no `update`, no
+`patch`, no `delete`, nothing cluster-scoped, no secrets. So "it will never
+modify or delete a policy it did not create" is enforced by the APISERVER, not
+by the code's good intentions. `watch` is deliberately absent because the
+controller polls and never opens a watch — granting it would be unused
+privilege.
+
+  For contrast, in this same cluster: phase 7 section 2c found the
+  `argocd-application-controller` ClusterRole byte-identical to the built-in
+  `cluster-admin`. The remediation surface here is ONE object name in ONE
+  namespace with no delete verb; the remediation surface there is `*/*/*`.
+  Both are "a controller that fixes drift". They are not remotely the same
+  security proposition.
+
+5g. WHAT THE UNIT TESTS DO NOT COVER. They cover the pure isolation model:
+selector semantics including the empty selector, policyTypes defaulting,
+per-direction verdicts, policy attribution by name, and the shape of the
+baseline object. They do NOT cover: the client-go call path, the scan loop,
+the ticker, signal handling, the terminal-pod filter, the remediation function
+against a real or fake apiserver (no envtest, no fake clientset), error and
+retry behaviour, or RBAC-denied responses. Everything cluster-facing was
+verified by RUNNING it against the live cluster, which is what sections 3 and
+4 are — not by a test.
+
+5h. SINGLE REPLICA, NO LEADER ELECTION. The committed Deployment sets
+`replicas: 1`. Two replicas would both scan and both attempt the create; the
+loser gets `AlreadyExists`, which the code handles by logging and moving on,
+so it is safe rather than correct. It has not been tested with two.
+
+============================================================
+6) FINAL STATE — THE CLUSTER AS IT WAS FOUND
+============================================================
+
+6a. `network/` re-applied so the restored object also carries the
+last-applied annotation a human `kubectl apply` would have written:
+
+$ kubectl apply -f network/
+Warning: resource networkpolicies/default-deny is missing the kubectl.kubernetes.io/last-applied-configuration annotation which is required by kubectl apply. kubectl apply should only be used on resources created declaratively by either kubectl create --save-config or kubectl apply. The missing annotation will be patched automatically.
+networkpolicy.networking.k8s.io/default-deny configured
+networkpolicy.networking.k8s.io/allow-dns unchanged
+networkpolicy.networking.k8s.io/allow-nginx-ingress-from-client unchanged
+networkpolicy.networking.k8s.io/allow-client-egress-to-nginx unchanged
+(exit code: 0 — the warning is the section-4b annotation difference, patched)
+
+$ kubectl get networkpolicy default-deny -n demo -o jsonpath='managers={range .metadata.managedFields[*]}{.manager}{" "}{end}{"\n"}has-last-applied={.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}{"\n"}'
+managers=netpol-guard kubectl-client-side-apply 
+has-last-applied={"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"annotations":{},"name":"default-deny","namespace":"demo"},"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"]}}
+(exit code: 0 — two field managers now: the controller that created it, and
+the kubectl apply that added the annotation. Both facts are true and the
+object records both.)
+
+6b. Live versus committed, checked rather than asserted:
+
+$ kubectl diff -f network/
+(exit code: 0 — no output and exit 0: live matches every file in network/)
+
+$ kubectl get networkpolicy -n demo
+NAME                              POD-SELECTOR   AGE
+allow-client-egress-to-nginx      access=nginx   8d
+allow-dns                         <none>         8d
+allow-nginx-ingress-from-client   app=nginx      8d
+default-deny                      <none>         2m46s
+(exit code: 0 — four policies. `default-deny` is 2m46s old because it is the
+object the controller recreated; the other three were never touched.)
+
+6c. The invariant, re-checked by the controller itself:
+
+$ netpol-guard --kubeconfig=C:/Users/josep/.kube/config --namespace=demo --remediate=false --once
+2026-08-07T17:06:58.257-05:00 netpol-guard start namespace=demo remediate=false interval=30s once=true auth=kubeconfig C:/Users/josep/.kube/config apiserver=https://127.0.0.1:60625
+2026-08-07T17:06:58.258-05:00 invariant: every pod in namespace demo must be selected by a NetworkPolicy for BOTH Ingress and Egress
+2026-08-07T17:06:58.270-05:00 scan=1 namespace=demo pods=3 networkpolicies=4 violations=0 verdict=HOLDS
+(exit code: 0 — `--once` exits 0 on HOLDS and would exit 1 on a violation)
+
+6d. The network posture, re-probed one last time:
+
+$ docker exec seclab-worker curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:000 time=5.002432
+(exit code: 28 — curl timeout; signed-app is unreachable from the remote node)
+
+$ docker exec seclab-worker2 curl -m 5 -s -o /dev/null -w "HTTP:%{http_code} time=%{time_total}\n" http://10.244.1.7:8080/
+HTTP:200 time=0.001126
+(exit code: 0 — and still serving, so the block above is policy, not a corpse)
+
+6e. Workloads and the other controls, untouched:
+
+$ kubectl get pods -n demo
+NAME                         READY   STATUS    RESTARTS        AGE
+nginx-78c88678f4-gxqtl       1/1     Running   0               3h50m
+nginx-78c88678f4-jfhzk       1/1     Running   0               3h50m
+signed-app-d9c5dfcbb-8mzkm   1/1     Running   3 (5h37m ago)   8d
+(exit code: 0 — same three pods, same restart counts as section 1b; nothing
+was restarted or rescheduled by any of this)
+
+$ kubectl -n argocd get application demo-workloads
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   Synced        Healthy
+(exit code: 0)
+
+$ kubectl get events -n demo
+No resources found in demo namespace.
+(exit code: 0)
+
+=> The cluster ends this phase in the state it started it: four
+   NetworkPolicies matching `network/`, three pods running, ArgoCD `Synced`,
+   no events. The only object that changed identity is `default-deny`, which
+   was deleted, recreated by the controller, and then re-applied from the
+   file — and `kubectl diff -f network/` at exit 0 is the check on that claim.
+   Nothing from `docs/evidence/phase-8-netpol-guard/` was applied.
