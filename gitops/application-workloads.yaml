@@ -1,0 +1,70 @@
+# ArgoCD Application — the demo workloads, and ONLY the demo workloads.
+#
+# Scope is the whole point. This Application syncs `workloads/` (7 objects: the
+# demo Namespace, 2 ServiceAccounts, 2 Deployments, 2 Services) and nothing
+# else. The `demo` namespace also holds objects this repo deliberately keeps
+# OUT of `workloads/` — the developer Role and RoleBinding (rbac/), the
+# NetworkPolicies (network/), the SealedSecret (secrets/). Those are NOT
+# managed here and ArgoCD will not touch them. Phase 7's evidence demonstrates
+# that boundary rather than asserting it.
+#
+# This file does NOT live in `workloads/`, on purpose. `workloads/` is the path
+# this Application syncs; an Application CR sitting there would make ArgoCD try
+# to apply its own definition into namespace `demo`, where the controller does
+# not read Application CRs. The self-reference would be a bug, not a layout
+# preference.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-workloads
+  # Application CRs are only read by the controller in its own namespace.
+  namespace: argocd
+  # NOTE: no `resources-finalizer.argocd.argoproj.io` finalizer, deliberately.
+  # With the finalizer, deleting this Application cascades a delete to all 7
+  # managed objects — including the demo Namespace. Teardown should remove the
+  # GitOps controller, not the workloads it happened to be watching.
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/joesevv/k8s-security-lab.git
+    # The repo is public, so the clone is anonymous — no credential, no Secret.
+    path: workloads
+    # `main`, not this feature branch: `workloads/` is unchanged on main, so the
+    # demo runs against merged code and the sync is not chasing an in-flight PR.
+    targetRevision: main
+    directory:
+      # REQUIRED, and the failure mode if you omit it is nasty. The 7 manifests
+      # live one level down (workloads/nginx/, workloads/signed-app/); a plain
+      # directory source does NOT recurse by default. Applied without this,
+      # ArgoCD found zero manifests and reported "Synced / Healthy" with an
+      # empty .status.resources — a green Application managing nothing at all.
+      # Observed in phase 7 on the first apply; see the evidence transcript.
+      recurse: true
+  destination:
+    # In-cluster. ArgoCD's own kubeconfig, not an external cluster Secret.
+    server: https://kubernetes.default.svc
+    namespace: demo
+  syncPolicy:
+    automated:
+      # prune: false — a drift demo never needs deletion, and a mis-scoped
+      # Application with prune ON could delete the RBAC / NetworkPolicy /
+      # SealedSecret objects that live in `demo` but are not in `workloads/`.
+      # The blast radius of a scoping mistake is capped at "does nothing".
+      prune: false
+      # selfHeal: true is the SHIPPED posture and this lab's chosen end state:
+      # ArgoCD writes `workloads/` back over any hand edit to the 7 objects it
+      # manages, without waiting for an operator. It REVERTS, it does not
+      # PREVENT — in phase 7 the weakened pod was still created, still pulled
+      # its image and still RAN for about a second before the revert killed it
+      # (runbook section 4c). Objects outside `workloads/` get nothing at all.
+      #
+      # Applying this file lands the posture the cluster is actually in, so a
+      # replay does not need a follow-up patch. To reproduce phase 7's STAGE 1
+      # (detect-only) observation, patch the LIVE Application down instead of
+      # editing this value — detect-only is the weaker posture and does not
+      # belong in git:
+      #   kubectl -n argocd patch application demo-workloads --type=merge \
+      #     -p '{"spec":{"syncPolicy":{"automated":{"selfHeal":false}}}}'
+      # Restore by patching back to true or re-applying this file; see
+      # runbooks/phase-7-argocd.md sections 3 and 4.
+      selfHeal: true

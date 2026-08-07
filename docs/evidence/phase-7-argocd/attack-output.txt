@@ -1,0 +1,1226 @@
+Phase 7 — ArgoCD GitOps: drift detection, then drift correction (captured
+2026-08-07)
+Cluster: kind seclab (context kind-seclab), Kubernetes v1.35.5, 3 nodes
+(seclab-control-plane, seclab-worker, seclab-worker2).
+Installed: ArgoCD v3.5.0 into namespace `argocd`, from a version-pinned
+upstream manifest. Scope: ONE Application, `demo-workloads`, syncing ONLY the
+repo's `workloads/` path (7 objects) into namespace `demo`.
+  argocd  quay.io/argoproj/argocd:v3.5.0
+         @sha256:c298cedbaeb31532ba8d4e9904eba9e4987e067293fbd86400c5194e78f743d5
+  dex     ghcr.io/dexidp/dex:v2.45.0
+         @sha256:b8469881d3cb3a73001506f0d3aaefecb9c45d2311c1e0f405d8ac538316c59d
+  redis   public.ecr.aws/docker/library/redis:8.2.3-alpine
+         @sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
+Those three digests are what the upstream TAGS resolved to on this date. They
+are NOT a pin this repo controls — see section 2b.
+
+============================================================
+0) WHAT GITOPS IS, WHAT IT IS NOT, AND THE TWO-STAGE STRUCTURE
+============================================================
+
+GITOPS IS NOT ADMISSION CONTROL. It does not sit in the request path. It
+cannot refuse a write. Everything phase 7 demonstrates happens AFTER the
+apiserver has already accepted a change and AFTER the kubelet has already
+started the resulting pod. That ordering is the whole subject of this phase
+and it is measured, not asserted, in sections 4 and 5.
+
+THE PHASE IS DELIBERATELY RUN TWICE, WITH ONE FLAG CHANGED.
+  STAGE 1 (section 4): syncPolicy.automated.selfHeal = FALSE. A real security
+  regression is applied to the live nginx Deployment. ArgoCD NOTICES — the
+  Application flips to OutOfSync and names the exact resource. And then it
+  does nothing at all. The weakened pod keeps serving for 10 min 8 s of
+  continuous observation.
+  STAGE 2 (section 5): selfHeal = TRUE. The SAME regression is applied. It is
+  reverted automatically within 1.29 s.
+The contrast between those two numbers is the deliverable. "Detection" and
+"prevention" are different products and the flag between them is one boolean.
+
+EVEN IN STAGE 2 IT IS NOT PREVENTION. Section 5c is the uncomfortable part:
+when the drift was re-applied with selfHeal ON, the Kubernetes ReplicaSet
+controller still created a weakened pod, the kubelet still pulled its image,
+and the container still STARTED — with a writable root filesystem — before
+ArgoCD's revert killed it. A container ran without the control for roughly
+one second. GitOps closes the window; it does not remove it.
+
+THE REGRESSION CHOSEN IS ONE THE ADMISSION LAYER PERMITS. The drift removes
+`readOnlyRootFilesystem: true` from the nginx container. PSA `restricted`
+does NOT require that field, and none of this repo's 5 Kyverno policies check
+it either. Section 4b proves the weakened pod was ADMITTED — every event is
+Normal, there is no denial. So this is not a straw man: it is a genuine
+weakening that phases 2b and 4 cannot see, which is precisely the gap a
+GitOps controller is supposed to cover.
+
+ARGOCD GRANTED ITSELF CLUSTER-ADMIN. Section 2c shows the application
+controller's ClusterRole is byte-identical to the built-in `cluster-admin`.
+The threat model's A2 "compromised GitOps controller" is no longer
+hypothetical in this cluster; it is a ServiceAccount with `*/*/*`.
+
+THE `argocd` NAMESPACE IS UNGATED. It carries no Pod Security labels at all,
+and all 5 Kyverno policies select only `demo` and `demo-kyverno-only`. That
+is three unenforced namespaces in this lab now: `cis-benchmark`, `falco`,
+`argocd`. Section 7 states it with the evidence.
+
+NOTHING HERE VERIFIES THE GIT CONTENT. Commit signature verification is NOT
+configured (section 7). ArgoCD applies whatever is on `main`, faithfully. A
+malicious commit to `main` would be synced with exactly the same diligence as
+a good one — and with selfHeal ON it would be re-applied every time an
+operator tried to remove it by hand.
+
+NO CREDENTIAL WAS RETRIEVED IN THIS PHASE. `argocd-initial-admin-secret` was
+created by the install and never read, decoded or used. The UI was never
+logged into. Every observation below comes from `kubectl` against the
+Application CR and the live objects.
+
+============================================================
+1) THE PRE-STATE, BEFORE ANYTHING IS INSTALLED
+============================================================
+
+1a. NO `argocd` NAMESPACE EXISTS:
+
+$ kubectl get ns
+NAME                 STATUS   AGE
+cis-benchmark        Active   8d
+default              Active   8d
+demo                 Active   8d
+demo-kyverno-only    Active   8d
+falco                Active   8d
+kube-node-lease      Active   8d
+kube-public          Active   8d
+kube-system          Active   8d
+kyverno              Active   8d
+local-path-storage   Active   8d
+(exit code: 0)
+
+=> ten namespaces, none of them `argocd`.
+
+1b. THE WORKLOADS THAT ARE ABOUT TO BE PUT UNDER GITOPS CONTROL:
+
+$ kubectl -n demo get deploy,svc,sa
+NAME                         READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nginx        2/2     2            2           8d
+deployment.apps/signed-app   1/1     1            1           8d
+
+NAME                 TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+service/nginx        ClusterIP   10.96.180.134   <none>        80/TCP    8d
+service/signed-app   ClusterIP   10.96.245.29    <none>        80/TCP    8d
+
+NAME                           AGE
+serviceaccount/default         8d
+serviceaccount/developer-sa    8d
+serviceaccount/nginx-sa        8d
+serviceaccount/signed-app-sa   8d
+(exit code: 0)
+
+=> note `serviceaccount/developer-sa`. It lives in `demo` but it is NOT in
+   `workloads/` — it belongs to the phase-2a RBAC work. It is one of the
+   objects section 6 uses to prove the scope boundary is real.
+
+1c. THE FIELD THAT WILL BE DRIFTED, AS IT STANDS NOW:
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}
+(exit code: 0)
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}'
+true
+(exit code: 0)
+
+1d. LIVE IMAGES MATCH GIT FOR BOTH DEPLOYMENTS — so a first sync should have
+nothing to correct, and any OutOfSync later in this transcript is drift this
+phase caused rather than drift that was already there:
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].image}'
+nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+$ kubectl -n demo get deploy signed-app -o jsonpath='{.spec.template.spec.containers[0].image}'
+ghcr.io/joesevv/k8s-security-lab/signed-app:b8483c5892a16afb16c1a15aaaa35b3c8436dd65@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
+$ grep -o 'image: .*' workloads/nginx/deployment.yaml
+image: nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+$ grep -o 'image: .*' workloads/signed-app/deployment.yaml
+image: ghcr.io/joesevv/k8s-security-lab/signed-app:b8483c5892a16afb16c1a15aaaa35b3c8436dd65@sha256:7fd13d22d934f4202edc164e525436e190498590b62c41e348b1a4092eb3337b
+(exit code: 0)
+
+=> live digest == git digest for both. NO PRE-EXISTING DRIFT.
+
+1e. CAPACITY BEFORE THE INSTALL — 29 pods across 3 nodes:
+
+$ kubectl get pods -A -o=custom-columns='NODE:.spec.nodeName' --no-headers | sort | uniq -c
+     10 seclab-control-plane
+     10 seclab-worker
+      9 seclab-worker2
+(exit code: 0)
+
+=> `metrics-server` is NOT installed in this lab, so `kubectl top` does not
+   work and NO measured CPU/memory utilisation is claimed anywhere in this
+   transcript. Pod count is the only capacity number offered.
+
+1f. THE WRITE PROBE, CALIBRATED BEFORE THE DRIFT. This matters: the nginx pod
+mounts an emptyDir at /tmp, and an emptyDir is writable NO MATTER WHAT
+readOnlyRootFilesystem says. A write test aimed at /tmp would prove nothing.
+Run against the pre-state pod, the two candidate paths behave differently:
+
+$ kubectl -n demo exec nginx-78c88678f4-8k5lb -- touch /var/cache/nginx/p7-probe
+touch: /var/cache/nginx/p7-probe: Read-only file system
+command terminated with exit code 1
+(exit code: 1 — the control is enforced, as phase 2b left it)
+
+$ kubectl -n demo exec nginx-78c88678f4-8k5lb -- touch /tmp/p7-probe
+(exit code: 0 — the emptyDir control path, writable regardless; this is why
+ /tmp is NOT the probe. This file was deleted immediately afterwards.)
+
+=> the probe DISCRIMINATES. Same command, same pod, same instant: EROFS on
+   the root fs, success on the emptyDir. Every write test later in this
+   transcript uses /var/cache/nginx for that reason.
+
+WHY THAT PATH, IN DETAIL. The supporting calibration below was RE-CAPTURED at
+2026-08-07T18:35:21Z, after the demo, against pod nginx-78c88678f4-gxqtl. The
+original pre-state pod nginx-78c88678f4-8k5lb was destroyed by the stage-1
+rollout and its `id` / `/proc/mounts` / `ls -ld` output had not been saved to
+a file at the time. The cluster is restored to the identical posture
+(`readOnlyRootFilesystem: true`) when this was re-run, so the calibration
+still holds — but it is a re-capture and is labelled as one rather than
+presented as part of the original pre-state:
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- id
+uid=101(nginx) gid=101(nginx) groups=101(nginx)
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- sh -c 'cat /proc/mounts | grep -E " / | /tmp "'
+overlay / overlay ro,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/22/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/21/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/20/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/19/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/18/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/17/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/16/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/15/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/14/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/245/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/245/work,uuid=on 0 0
+/dev/sdd /tmp ext4 rw,relatime 0 0
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- sh -c 'ls -ld / /var/cache/nginx /var/tmp /home'
+drwxr-xr-x    1 root     root          4096 Aug  7 18:16 /
+drwxr-xr-x    2 root     root          4096 Apr 15 04:51 /home
+drwxrwxr-x    1 nginx    root          4096 May 11 00:52 /var/cache/nginx
+drwxrwxrwt    2 root     root          4096 Apr 15 04:51 /var/tmp
+(exit code: 0)
+
+=> `/` is mounted `overlay ... ro` and `/tmp` is a SEPARATE `ext4 ... rw`
+   device — the emptyDir. `/var/cache/nginx` is on the root overlay AND is
+   owned by uid 101, the user the container runs as. That is the correct
+   probe path: writable by this user if and only if the root filesystem
+   itself is writable. A probe against `/` would have been useless, since a
+   non-root user cannot write there either way.
+
+============================================================
+2) THE INSTALL, AND WHAT IT GRANTS ITSELF
+============================================================
+
+2a. RESOLVING A VERSION TO PIN. The spec for this phase suggested a
+`releases/download/vX.Y.Z/install.yaml` URL. THAT ASSET DOES NOT EXIST for
+argo-cd — the release publishes only a checksums file and an SBOM:
+
+$ curl -sS -H 'Accept: application/vnd.github+json' 'https://api.github.com/repos/argoproj/argo-cd/releases/tags/v3.5.0' | tr '{' '\n' | grep -oE '"name": *"[^"]*\.(yaml|gz|txt|json)"' | sort -u
+"name": "cli_checksums.txt"
+"name": "sbom.tar.gz"
+(exit code: 0)
+
+=> so the canonical manifest path is used instead:
+   raw.githubusercontent.com/argoproj/argo-cd/<ref>/manifests/install.yaml
+   with <ref> pinned to the TAG rather than to `stable`.
+
+Which tag IS `stable` today? Both refs are resolved rather than assumed:
+
+$ git ls-remote https://github.com/argoproj/argo-cd.git 'refs/tags/stable*' 'refs/tags/v3.5.0*'
+f8a2c4798f39c36175580f97266ad7ec64d48344	refs/tags/stable
+e95e1be88a2da6c06bff5c2fe1791e4d233ed810	refs/tags/stable^{}
+f8a2c4798f39c36175580f97266ad7ec64d48344	refs/tags/v3.5.0
+e95e1be88a2da6c06bff5c2fe1791e4d233ed810	refs/tags/v3.5.0^{}
+5ad8d8e92a97e801bdf2421a9a772857b206f4e5	refs/tags/v3.5.0-rc1
+ddea9e7128ecce09318352de8fd9b9ab88afaf47	refs/tags/v3.5.0-rc1^{}
+df8569884951ee89d2a5ce42daedfc71c08c76ae	refs/tags/v3.5.0-rc2
+d02494e657d09bc916aafe710081c4e0b44bb53d	refs/tags/v3.5.0-rc3
+7660efb23b2d56bf01b0189ba5e2c2ab12badf71	refs/tags/v3.5.0-rc3^{}
+(exit code: 0)
+
+=> `refs/tags/stable` and `refs/tags/v3.5.0` point at the SAME annotated tag
+   object f8a2c479, which peels (`^{}`) to the SAME commit e95e1be8. So
+   `stable` IS v3.5.0 right now. Pinning to `v3.5.0` therefore installs
+   exactly what `stable` would have installed today — and unlike `stable`, it
+   will still mean the same thing next month.
+
+The bytes are fetched once and hashed, and the tag URL is checked against the
+commit URL to prove the tag had not been moved between the two reads:
+
+(s2-03-install.yaml is the copy fetched from the v3.5.0 TAG url;
+ s2-03-install-bysha.yaml is the copy fetched from the e95e1be8 COMMIT url)
+
+$ sha256sum s2-03-install.yaml s2-03-install-bysha.yaml
+a32bf36a437071a1f563ebf9e81c8a39fba9057c17db7d5d041afb7b6e3f4afe *s2-03-install.yaml
+a32bf36a437071a1f563ebf9e81c8a39fba9057c17db7d5d041afb7b6e3f4afe *s2-03-install-bysha.yaml
+(exit code: 0)
+
+$ cmp s2-03-install.yaml s2-03-install-bysha.yaml
+(exit code: 0 — cmp prints nothing when the files are identical)
+
+=> 1917766 bytes, 34050 lines, sha256 a32bf36a4370...b6e3f4afe. THAT HASH IS
+   WHAT MAKES THIS REPLAYABLE. The manifest is deliberately NOT committed to
+   this repo: 34050 lines of vendored upstream YAML would be unreviewable and
+   would rot. URL + sha256 + the resolved digests below are the record.
+
+2b. THE INSTALL ITSELF:
+
+$ kubectl create namespace argocd
+namespace/argocd created
+(exit code: 0)
+
+$ kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.0/manifests/install.yaml
+customresourcedefinition.apiextensions.k8s.io/applications.argoproj.io serverside-applied
+customresourcedefinition.apiextensions.k8s.io/applicationsets.argoproj.io serverside-applied
+customresourcedefinition.apiextensions.k8s.io/appprojects.argoproj.io serverside-applied
+serviceaccount/argocd-application-controller serverside-applied
+serviceaccount/argocd-applicationset-controller serverside-applied
+serviceaccount/argocd-dex-server serverside-applied
+serviceaccount/argocd-notifications-controller serverside-applied
+serviceaccount/argocd-redis serverside-applied
+serviceaccount/argocd-repo-server serverside-applied
+serviceaccount/argocd-server serverside-applied
+role.rbac.authorization.k8s.io/argocd-application-controller serverside-applied
+role.rbac.authorization.k8s.io/argocd-applicationset-controller serverside-applied
+role.rbac.authorization.k8s.io/argocd-dex-server serverside-applied
+role.rbac.authorization.k8s.io/argocd-notifications-controller serverside-applied
+role.rbac.authorization.k8s.io/argocd-redis serverside-applied
+role.rbac.authorization.k8s.io/argocd-server serverside-applied
+clusterrole.rbac.authorization.k8s.io/argocd-application-controller serverside-applied
+clusterrole.rbac.authorization.k8s.io/argocd-applicationset-controller serverside-applied
+clusterrole.rbac.authorization.k8s.io/argocd-server serverside-applied
+rolebinding.rbac.authorization.k8s.io/argocd-application-controller serverside-applied
+rolebinding.rbac.authorization.k8s.io/argocd-applicationset-controller serverside-applied
+rolebinding.rbac.authorization.k8s.io/argocd-dex-server serverside-applied
+rolebinding.rbac.authorization.k8s.io/argocd-notifications-controller serverside-applied
+rolebinding.rbac.authorization.k8s.io/argocd-redis serverside-applied
+rolebinding.rbac.authorization.k8s.io/argocd-server serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/argocd-application-controller serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/argocd-applicationset-controller serverside-applied
+clusterrolebinding.rbac.authorization.k8s.io/argocd-server serverside-applied
+configmap/argocd-cm serverside-applied
+configmap/argocd-cmd-params-cm serverside-applied
+configmap/argocd-gpg-keys-cm serverside-applied
+configmap/argocd-notifications-cm serverside-applied
+configmap/argocd-rbac-cm serverside-applied
+configmap/argocd-ssh-known-hosts-cm serverside-applied
+configmap/argocd-tls-certs-cm serverside-applied
+secret/argocd-notifications-secret serverside-applied
+secret/argocd-secret serverside-applied
+service/argocd-applicationset-controller serverside-applied
+service/argocd-dex-server serverside-applied
+service/argocd-metrics serverside-applied
+service/argocd-notifications-controller-metrics serverside-applied
+service/argocd-redis serverside-applied
+service/argocd-repo-server serverside-applied
+service/argocd-server serverside-applied
+service/argocd-server-metrics serverside-applied
+deployment.apps/argocd-applicationset-controller serverside-applied
+deployment.apps/argocd-dex-server serverside-applied
+deployment.apps/argocd-notifications-controller serverside-applied
+deployment.apps/argocd-redis serverside-applied
+deployment.apps/argocd-repo-server serverside-applied
+deployment.apps/argocd-server serverside-applied
+statefulset.apps/argocd-application-controller serverside-applied
+networkpolicy.networking.k8s.io/argocd-application-controller-network-policy serverside-applied
+networkpolicy.networking.k8s.io/argocd-applicationset-controller-network-policy serverside-applied
+networkpolicy.networking.k8s.io/argocd-dex-server-network-policy serverside-applied
+networkpolicy.networking.k8s.io/argocd-notifications-controller-network-policy serverside-applied
+networkpolicy.networking.k8s.io/argocd-redis-network-policy serverside-applied
+networkpolicy.networking.k8s.io/argocd-repo-server-network-policy serverside-applied
+networkpolicy.networking.k8s.io/argocd-server-network-policy serverside-applied
+(exit code: 0 — first attempt, no retry)
+
+=> 59 objects (counted, not estimated: 3 CRDs + 7 ServiceAccounts + 6 Roles
+   + 3 ClusterRoles + 6 RoleBindings + 3 ClusterRoleBindings + 7 ConfigMaps
+   + 2 Secrets + 8 Services + 6 Deployments + 1 StatefulSet
+   + 7 NetworkPolicies = 59). `--server-side` is used
+   because a client-side apply of a 1.9 MB manifest stores the whole thing in
+   a `last-applied-configuration` annotation and blows the 262144-byte
+   annotation limit on the CRDs.
+
+All 7 workloads rolled out on the first attempt, 17:59:33Z -> 18:00:06Z = 33 s:
+
+$ kubectl -n argocd get pods -o wide
+NAME                                                READY   STATUS    RESTARTS   AGE   IP            NODE             NOMINATED NODE   READINESS GATES
+argocd-application-controller-0                     1/1     Running   0          51s   10.244.2.12   seclab-worker    <none>           <none>
+argocd-applicationset-controller-568dfdf75b-dwlxl   1/1     Running   0          51s   10.244.2.10   seclab-worker    <none>           <none>
+argocd-dex-server-856bcdf9ff-hf8b2                  1/1     Running   0          51s   10.244.1.9    seclab-worker2   <none>           <none>
+argocd-notifications-controller-6b4fd8f59-hhx56     1/1     Running   0          51s   10.244.1.10   seclab-worker2   <none>           <none>
+argocd-redis-54c57dd6ff-7gwfr                       1/1     Running   0          51s   10.244.1.11   seclab-worker2   <none>           <none>
+argocd-repo-server-fd55df7c-vhzvj                   1/1     Running   0          51s   10.244.2.11   seclab-worker    <none>           <none>
+argocd-server-6cd5f98457-pksbx                      1/1     Running   0          51s   10.244.1.12   seclab-worker2   <none>           <none>
+(exit code: 0)
+
+THE DIGESTS THOSE TAGS ACTUALLY RESOLVED TO. The apiserver runs with
+`AlwaysPullImages`, so every one of these pods really pulled:
+
+$ kubectl -n argocd get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.containerStatuses[*]}  image:   {.image}{"\n"}  imageID: {.imageID}{"\n"}{end}{end}'
+argocd-application-controller-0
+  image:   quay.io/argoproj/argocd:v3.5.0
+  imageID: quay.io/argoproj/argocd@sha256:c298cedbaeb31532ba8d4e9904eba9e4987e067293fbd86400c5194e78f743d5
+argocd-applicationset-controller-568dfdf75b-dwlxl
+  image:   quay.io/argoproj/argocd:v3.5.0
+  imageID: quay.io/argoproj/argocd@sha256:c298cedbaeb31532ba8d4e9904eba9e4987e067293fbd86400c5194e78f743d5
+argocd-dex-server-856bcdf9ff-hf8b2
+  image:   ghcr.io/dexidp/dex:v2.45.0
+  imageID: ghcr.io/dexidp/dex@sha256:b8469881d3cb3a73001506f0d3aaefecb9c45d2311c1e0f405d8ac538316c59d
+argocd-notifications-controller-6b4fd8f59-hhx56
+  image:   quay.io/argoproj/argocd:v3.5.0
+  imageID: quay.io/argoproj/argocd@sha256:c298cedbaeb31532ba8d4e9904eba9e4987e067293fbd86400c5194e78f743d5
+argocd-redis-54c57dd6ff-7gwfr
+  image:   public.ecr.aws/docker/library/redis:8.2.3-alpine
+  imageID: public.ecr.aws/docker/library/redis@sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
+argocd-repo-server-fd55df7c-vhzvj
+  image:   quay.io/argoproj/argocd:v3.5.0
+  imageID: quay.io/argoproj/argocd@sha256:c298cedbaeb31532ba8d4e9904eba9e4987e067293fbd86400c5194e78f743d5
+argocd-server-6cd5f98457-pksbx
+  image:   quay.io/argoproj/argocd:v3.5.0
+  imageID: quay.io/argoproj/argocd@sha256:c298cedbaeb31532ba8d4e9904eba9e4987e067293fbd86400c5194e78f743d5
+(exit code: 0)
+
+=> READ THE `image:` LINES, NOT JUST THE `imageID:` LINES. Upstream pins by
+   TAG — `:v3.5.0`, `:v2.45.0`, `:8.2.3-alpine`. The digests above are what
+   those tags resolved to on 2026-08-07 in THIS cluster. They are a RECORD,
+   not a CONTROL. Nothing stops the upstream tags being repointed, and this
+   repo does not mirror or re-pin them. Contrast phase 4, where the repo's
+   own workloads are pinned by digest in git and `restrict-registries` +
+   `require-keyless-signed-ghcr` enforce it. ArgoCD gets none of that,
+   because — see 2d — it is installed outside every guardrail this lab has.
+
+2c. WHAT THE INSTALL GRANTS ITSELF. THIS IS THE PART THAT MATTERS.
+
+$ kubectl get clusterrole,clusterrolebinding | grep -i argocd
+clusterrole.rbac.authorization.k8s.io/argocd-application-controller                                          2026-08-07T17:59:22Z
+clusterrole.rbac.authorization.k8s.io/argocd-applicationset-controller                                       2026-08-07T17:59:22Z
+clusterrole.rbac.authorization.k8s.io/argocd-server                                                          2026-08-07T17:59:22Z
+clusterrolebinding.rbac.authorization.k8s.io/argocd-application-controller                                   ClusterRole/argocd-application-controller                                          66s
+clusterrolebinding.rbac.authorization.k8s.io/argocd-applicationset-controller                                ClusterRole/argocd-applicationset-controller                                       66s
+clusterrolebinding.rbac.authorization.k8s.io/argocd-server                                                   ClusterRole/argocd-server                                                          66s
+(exit code: 0)
+
+$ kubectl get clusterrole argocd-application-controller -o yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: "2026-08-07T17:59:22Z"
+  labels:
+    app.kubernetes.io/component: application-controller
+    app.kubernetes.io/name: argocd-application-controller
+    app.kubernetes.io/part-of: argocd
+  name: argocd-application-controller
+  resourceVersion: "407607"
+  uid: 8d66e499-fc12-4151-a70c-dfbd7a4e25c4
+rules:
+- apiGroups:
+  - '*'
+  resources:
+  - '*'
+  verbs:
+  - '*'
+- nonResourceURLs:
+  - '*'
+  verbs:
+  - '*'
+(exit code: 0)
+
+That is not summarised, it is compared, byte for byte, against the built-in:
+
+$ kubectl get clusterrole argocd-application-controller -o jsonpath='{.rules}'
+[{"apiGroups":["*"],"resources":["*"],"verbs":["*"]},{"nonResourceURLs":["*"],"verbs":["*"]}]
+$ kubectl get clusterrole cluster-admin -o jsonpath='{.rules}'
+[{"apiGroups":["*"],"resources":["*"],"verbs":["*"]},{"nonResourceURLs":["*"],"verbs":["*"]}]
+$ diff <argocd rules> <cluster-admin rules>
+RULES ARE BYTE-IDENTICAL (diff exit 0)
+(exit code: 0)
+
+$ kubectl get clusterrolebinding argocd-application-controller -o jsonpath='{.roleRef}{"\n"}{.subjects}{"\n"}'
+{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"argocd-application-controller"}
+[{"kind":"ServiceAccount","name":"argocd-application-controller","namespace":"argocd"}]
+(exit code: 0)
+
+=> THE VERDICT, PLAINLY: the ServiceAccount `argocd-application-controller`
+   in namespace `argocd` is CLUSTER-ADMIN. Not "close to", not "broad" —
+   its ClusterRole's rules are byte-identical to the built-in `cluster-admin`
+   ClusterRole. It can read every Secret in every namespace, including the
+   sealed-secrets controller's private key and every ServiceAccount token.
+   An Application in this cluster is scoped by CONVENTION (its source.path),
+   never by CAPABILITY.
+
+And the API server is not the only thing it can reach:
+
+$ kubectl get clusterrole argocd-server -o yaml | sed -n '/^rules:/,$p'
+rules:
+- apiGroups:
+  - '*'
+  resources:
+  - '*'
+  verbs:
+  - delete
+  - get
+  - patch
+[... 5 further rules elided: events/list, pods+pods/log/get, argoproj.io
+     applications+applicationsets/get,list,watch, batch jobs/create,
+     argoproj.io workflows/create ...]
+(exit code: 0)
+
+=> the API SERVER component — the one behind the web UI — can `delete`, `get`
+   and `patch` ANY resource of ANY kind cluster-wide. Whoever holds the admin
+   password holds that. This phase never retrieved it (section 7e), but that
+   is a choice made here, not a limit imposed by the install.
+
+2d. NOTHING GATES WHAT ARGOCD INSTALLED. The `argocd` namespace carries no
+Pod Security labels at all, so it gets the built-in `privileged` default —
+the apiserver has no `--admission-control-config-file` to change that:
+
+$ kubectl get ns argocd demo cis-benchmark falco kyverno -o custom-columns='NAME:.metadata.name,ENFORCE:.metadata.labels.pod-security\.kubernetes\.io/enforce'
+NAME            ENFORCE
+argocd          <none>
+demo            restricted
+cis-benchmark   privileged
+falco           privileged
+kyverno         <none>
+(exit code: 0)
+
+$ kubectl get ns argocd -o jsonpath='{.metadata.labels}'
+{"kubernetes.io/metadata.name":"argocd"}
+(exit code: 0)
+
+And Kyverno does not look at it either. All 5 policies select two namespaces
+by name, and `argocd` is not one of them:
+
+$ kubectl get validatingpolicies.policies.kyverno.io -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.matchConstraints.namespaceSelector}{"\n"}{end}'
+disallow-latest-and-bare-tag -> {"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":["demo","demo-kyverno-only"]}]}
+disallow-privileged-containers -> {"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":["demo","demo-kyverno-only"]}]}
+require-drop-all-capabilities -> {"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":["demo","demo-kyverno-only"]}]}
+restrict-registries -> {"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":["demo","demo-kyverno-only"]}]}
+(exit code: 0)
+
+$ kubectl get imagevalidatingpolicies.policies.kyverno.io -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.matchConstraints.namespaceSelector}{"\n"}{end}'
+require-keyless-signed-ghcr -> {"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":["demo","demo-kyverno-only"]}]}
+(exit code: 0)
+
+=> ArgoCD's 7 pods were admitted with NO Pod Security check and NO Kyverno
+   check. Any pinning applied to ArgoCD in this repo is SELF-IMPOSED and
+   unenforced — exactly the phase-6b position on Falco, restated for a
+   controller that, unlike Falco, can write.
+
+============================================================
+3) THE APPLICATION, SCOPED — AND A GREEN STATUS THAT MEANT NOTHING
+============================================================
+
+3a. THE FIRST APPLY WAS A TRAP, AND IT IS LEFT IN THIS TRANSCRIPT ON PURPOSE.
+The Application was created with `source.path: workloads` and nothing else.
+Six seconds later:
+
+$ kubectl -n argocd get application
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   Synced        Healthy
+(exit code: 0)
+
+Synced. Healthy. Both green. Now count what it was actually managing:
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.resources}'
+(exit code: 0 — the command printed NOTHING. .status.resources is empty.)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.sourceType}'
+Directory
+(exit code: 0)
+
+$ find workloads -maxdepth 1 -type f
+(exit code: 0 — no output: workloads/ has NO files at its top level)
+
+$ find workloads -type f | sort
+workloads/nginx/00-namespace.yaml
+workloads/nginx/01-serviceaccount.yaml
+workloads/nginx/deployment.yaml
+workloads/nginx/service.yaml
+workloads/signed-app/01-serviceaccount.yaml
+workloads/signed-app/deployment.yaml
+workloads/signed-app/service.yaml
+(exit code: 0)
+
+=> A `Directory` source DOES NOT RECURSE BY DEFAULT. All 7 manifests live one
+   level down. ArgoCD found zero manifests, had zero desired state, compared
+   it against zero tracked resources, and correctly concluded there was no
+   difference — reporting **Synced / Healthy while managing nothing at all**.
+   A green Application that is protecting NOTHING looks exactly like a green
+   Application that is protecting everything. `.status.resources` is the
+   field that tells them apart, and the ONLY reason this was caught is that
+   it was counted rather than eyeballed. This is recorded as a finding, not
+   hidden as a fumble.
+
+3b. THE FIX, AND WHAT SCOPED CONTROL ACTUALLY LOOKS LIKE. `directory.recurse:
+true` was added to the committed manifest and it was re-applied:
+
+$ kubectl apply -f gitops/application-workloads.yaml
+application.argoproj.io/demo-workloads configured
+(exit code: 0)
+
+$ kubectl -n argocd get application
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   Synced        Healthy
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{range .status.resources[*]}{.kind}{"/"}{.name}{" -> "}{.status}{"\n"}{end}'
+Namespace/demo -> Synced
+Service/nginx -> Synced
+Service/signed-app -> Synced
+ServiceAccount/nginx-sa -> Synced
+ServiceAccount/signed-app-sa -> Synced
+Deployment/nginx -> Synced
+Deployment/signed-app -> Synced
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.resources[*].name}' | wc -w
+7
+(exit code: 0)
+
+=> SEVEN. Exactly the 7 objects in `workloads/`. NOT `developer-sa`, NOT the
+   `developer` Role, NOT the 4 NetworkPolicies, NOT the SealedSecret — all of
+   which are in the SAME namespace and none of which appear in that list.
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.sync}'
+{"comparedTo":{"destination":{"namespace":"demo","server":"https://kubernetes.default.svc"},"source":{"directory":{"recurse":true},"path":"workloads","repoURL":"https://github.com/joesevv/k8s-security-lab.git","targetRevision":"main"}},"revision":"e2bc1d5c15d110cbbf676c13b2ce8e441ae596a0","status":"Synced"}
+(exit code: 0 — one line as printed; `directory.recurse: true` is the 3b fix,
+ visible in what the controller says it compared)
+
+$ git ls-remote https://github.com/joesevv/k8s-security-lab.git refs/heads/main
+e2bc1d5c15d110cbbf676c13b2ce8e441ae596a0	refs/heads/main
+(exit code: 0)
+
+=> the revision ArgoCD synced IS the tip of `main`, fetched anonymously over
+   HTTPS — the repo is public, so there is no credential and no Secret in
+   this path at all. (The feature branch this work sits on happens to be at
+   the same commit as `main`, because `workloads/` was already merged; that
+   is why targeting `main` was safe.)
+
+3c. THE SYNC DID NOT TOUCH THE SECURITY POSTURE. Before the sync the nginx
+Deployment was at generation 3 with labels {"app":"nginx"}. After:
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.metadata.generation}{" "}{.metadata.resourceVersion}{" "}{.metadata.labels}'
+4 408841 {"app":"nginx"}
+(exit code: 0)
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}
+(exit code: 0)
+
+$ kubectl -n demo get pods -l app=nginx --no-headers
+nginx-78c88678f4-8k5lb   1/1   Running   3 (94m ago)   8d
+nginx-78c88678f4-xm7qh   1/1   Running   3 (94m ago)   8d
+(exit code: 0)
+
+=> the securityContext is character-for-character what it was in 1c. The pods
+   are the SAME two pods, same names, still 8 days old, NOT restarted.
+
+What DID change is metadata. Diffing the live object against the git manifest
+right after the sync shows exactly one substantive line — the tracking
+annotation ArgoCD added to mark the object as its own:
+
+$ kubectl diff -f workloads/nginx/deployment.yaml
+diff -u -N "C:\\Users\\josep\\AppData\\Local\\Temp\\LIVE-441842081/apps.v1.Deployment.demo.nginx" "C:\\Users\\josep\\AppData\\Local\\Temp\\MERGED-85480340/apps.v1.Deployment.demo.nginx"
+@@ -2,13 +2,12 @@
+ kind: Deployment
+ metadata:
+   annotations:
+-    argocd.argoproj.io/tracking-id: demo-workloads:apps/Deployment:demo/nginx
+     deployment.kubernetes.io/revision: "3"
+     kubectl.kubernetes.io/last-applied-configuration: |
+[... 1 line elided: the last-applied-configuration value, a single 1025-char
+     JSON line, unchanged by the sync ...]
+     kyverno.io/image-verification-outcomes: '{"require-keyless-signed-ghcr":{"name":"require-keyless-signed-ghcr","ruleType":"ImageVerify","message":"success","status":"pass"}}'
+   creationTimestamp: "2026-07-30T13:52:49Z"
+-  generation: 4
++  generation: 5
+   labels:
+     app: nginx
+   name: nginx
+(exit code: 1 — kubectl diff exits 1 when any difference exists)
+
+=> the ONLY real difference between the live object and git is the
+   `argocd.argoproj.io/tracking-id` annotation, which is ArgoCD's ownership
+   marker rather than a change to the workload. Nothing under
+   `.spec.template` differs. Adoption of the 7 pre-existing objects was
+   non-destructive. (The `generation: 4 -> 5` pair in that hunk is an
+   artifact of the server-side dry run kubectl uses to build the diff, not a
+   change that was applied.)
+   HONEST LOOSE END: `.metadata.generation` really did go 3 -> 4 at the sync
+   itself, and generation is supposed to track `.spec` changes. The cause was
+   not identified. What IS established is that the securityContext is
+   unchanged, no new ReplicaSet was created and no pod restarted — so
+   whatever caused the increment had no effect on the running workload. It is
+   written down rather than smoothed over.
+
+============================================================
+4) STAGE 1 — DETECTION ONLY. selfHeal IS FALSE.
+============================================================
+
+4a. THE POSTURE UNDER TEST, AND THE PATCH TARGET, BOTH VERIFIED FIRST:
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.spec.syncPolicy.automated}'
+{"prune":false,"selfHeal":false}
+(exit code: 0)
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[*].name}'
+nginx
+(exit code: 0 — ONE container, so containers/0 is the right JSON-Patch index)
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}'
+true
+(exit code: 0)
+
+THE DRIFT — APPLIED TO THE LIVE OBJECT ONLY. `workloads/nginx/deployment.yaml`
+is NEVER edited in this phase; section 8c proves it is untouched in git. This
+is what a human "just fixing it in prod" looks like:
+
+DRIFT APPLIED AT 2026-08-07T18:05:59Z
+
+$ kubectl -n demo patch deploy nginx --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/securityContext/readOnlyRootFilesystem"}]'
+deployment.apps/nginx patched
+(exit code: 0)
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}
+(exit code: 0)
+
+=> `readOnlyRootFilesystem` is GONE. Everything else in the securityContext
+   survives, which is what makes this a realistic regression rather than a
+   demolition: the pod still drops ALL capabilities, still runs as non-root,
+   still forbids privilege escalation. It just got a writable root fs.
+
+4b. THE WEAKENED POD WAS ADMITTED. THIS IS THE POINT OF CHOOSING THIS FIELD.
+
+$ kubectl -n demo rollout status deploy/nginx --timeout=120s
+deployment "nginx" successfully rolled out
+(exit code: 0)
+ROLLOUT COMPLETE AT 2026-08-07T18:06:06Z
+
+$ kubectl -n demo get pods -l app=nginx -o wide
+NAME                     READY   STATUS    RESTARTS   AGE   IP            NODE             NOMINATED NODE   READINESS GATES
+nginx-6758c84c75-kstz4   1/1     Running   0          8s    10.244.1.13   seclab-worker2   <none>           <none>
+nginx-6758c84c75-qqff2   1/1     Running   0          7s    10.244.2.13   seclab-worker    <none>           <none>
+(exit code: 0)
+
+$ kubectl -n demo get events --sort-by=.lastTimestamp | tail -15
+32s         Normal   Killing             pod/nginx-78c88678f4-xm7qh    Stopping container nginx
+32s         Normal   Started             pod/nginx-6758c84c75-kstz4    Container started
+32s         Normal   Pulled              pod/nginx-6758c84c75-kstz4    Successfully pulled image "nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6" in 464ms (464ms including waiting). Image size: 23098099 bytes.
+32s         Normal   ScalingReplicaSet   deployment/nginx              Scaled up replica set nginx-6758c84c75 from 1 to 2
+32s         Normal   Created             pod/nginx-6758c84c75-kstz4    Container created
+32s         Normal   ScalingReplicaSet   deployment/nginx              Scaled down replica set nginx-78c88678f4 from 2 to 1
+32s         Normal   SuccessfulCreate    replicaset/nginx-6758c84c75   Created pod: nginx-6758c84c75-qqff2
+32s         Normal   SuccessfulDelete    replicaset/nginx-78c88678f4   Deleted pod: nginx-78c88678f4-xm7qh
+31s         Normal   Pulled              pod/nginx-6758c84c75-qqff2    Successfully pulled image "nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6" in 415ms (415ms including waiting). Image size: 23098099 bytes.
+31s         Normal   Started             pod/nginx-6758c84c75-qqff2    Container started
+31s         Normal   Created             pod/nginx-6758c84c75-qqff2    Container created
+31s         Normal   Pulling             pod/nginx-6758c84c75-qqff2    Pulling image "nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6"
+30s         Normal   Killing             pod/nginx-78c88678f4-8k5lb    Stopping container nginx
+30s         Normal   SuccessfulDelete    replicaset/nginx-78c88678f4   Deleted pod: nginx-78c88678f4-8k5lb
+30s         Normal   ScalingReplicaSet   deployment/nginx              Scaled down replica set nginx-78c88678f4 from 1 to 0
+(exit code: 0)
+
+=> EVERY EVENT IS `Normal`. No `Warning`, no `FailedCreate`, no PSA denial, no
+   Kyverno block. The `demo` namespace enforces Pod Security `restricted` and
+   5 Kyverno policies, and the weakened pod sailed through all of them —
+   because `restricted` simply does not require `readOnlyRootFilesystem` and
+   no Kyverno policy in this repo checks it. THE ADMISSION LAYER IS NOT THE
+   CONTROL THAT CATCHES THIS. That is why the phase exists.
+
+4c. THE POD REALLY IS WEAKER — PROVEN FROM THE RUNNING CONTAINER, NOT THE SPEC:
+
+$ kubectl -n demo get pod nginx-6758c84c75-kstz4 -o jsonpath='{.spec.containers[0].securityContext}'
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-6758c84c75-kstz4 -- sh -c 'grep " / " /proc/mounts' | cut -c1-80
+overlay / overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapsho
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-6758c84c75-kstz4 -- touch /var/cache/nginx/p7-probe
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-6758c84c75-kstz4 -- ls -l /var/cache/nginx/p7-probe
+-rw-r--r--    1 nginx    nginx            0 Aug  7 18:06 /var/cache/nginx/p7-probe
+(exit code: 0)
+
+=> COMPARE WITH 1f, SAME COMMAND, SAME PATH. Before: `overlay / overlay ro`
+   and EROFS. Now: `overlay / overlay rw` and a file on disk. The kernel
+   mount flag flipped. This is not a spec reading — the container's root
+   filesystem is genuinely writable, which is what an attacker who lands RCE
+   in this container gets to use for persistence.
+
+4d. ARGOCD NOTICES, AND NAMES THE RESOURCE:
+
+$ kubectl -n argocd get application
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   OutOfSync     Healthy
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{range .status.resources[*]}{.kind}{"/"}{.name}{" -> "}{.status}{"\n"}{end}'
+Namespace/demo -> Synced
+Service/nginx -> Synced
+Service/signed-app -> Synced
+ServiceAccount/nginx-sa -> Synced
+ServiceAccount/signed-app-sa -> Synced
+Deployment/nginx -> OutOfSync
+Deployment/signed-app -> Synced
+(exit code: 0)
+
+=> ONE of seven resources is named as the drifted one, correctly. Detection
+   latency: drift at 18:05:59Z, first observation of `OutOfSync` at
+   18:06:42Z, so detection took AT MOST 43 s. That is an upper bound from a
+   polling loop, not a measured latency — the first poll already showed
+   OutOfSync, so the true value is somewhere in (0, 43] s.
+
+NOTE THE SECOND COLUMN: `Healthy`. Health and Sync are different questions.
+The Deployment is perfectly healthy — 2/2 replicas, serving traffic. It is
+just not what git says it should be. A dashboard filtered on health alone
+would show this cluster as fine.
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.operationState.phase}{" / "}{.status.operationState.message}'
+Succeeded / successfully synced (all tasks run)
+(exit code: 0)
+
+=> and this is the trap in reading operationState: it says "Succeeded". That
+   is the LAST sync operation — the initial one from section 3b. NO NEW SYNC
+   WAS TRIGGERED by the drift. A stale success is sitting next to a live
+   OutOfSync.
+
+4e. THE LOAD-BEARING OBSERVATION: THE DRIFT PERSISTS. ArgoCD's default
+reconcile interval is 180 s. This watch spans more than three of them, and
+`readOnlyRootFilesystem` is polled on the LIVE object at every step:
+
+$ (loop) date -u '+%H:%M:%SZ'; kubectl -n argocd get application demo-workloads -o jsonpath='{.status.sync.status}'; kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}'
+18:07:15Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:07:45Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:08:15Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:08:45Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:09:16Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:09:46Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:10:16Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:10:46Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:11:17Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:11:47Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:12:17Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:12:48Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:13:18Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:13:48Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:14:18Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:14:49Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+18:15:19Z  sync=OutOfSync  live-readOnlyRootFilesystem=ABSENT
+(exit code: 0 — 17 consecutive samples, no gaps, nothing elided)
+
+And at the end of it, the pod is still writable — the same probe, ten minutes
+on:
+
+$ kubectl -n demo exec nginx-6758c84c75-kstz4 -- sh -c 'grep " / " /proc/mounts' | cut -c1-40
+overlay / overlay rw,relatime,lowerdir=/
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-6758c84c75-kstz4 -- touch /var/cache/nginx/p7-still-writable
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-6758c84c75-kstz4 -- ls -l /var/cache/nginx/
+total 0
+-rw-r--r--    1 nginx    nginx            0 Aug  7 18:06 p7-probe
+-rw-r--r--    1 nginx    nginx            0 Aug  7 18:16 p7-still-writable
+(exit code: 0)
+
+$ kubectl -n demo get pods -l app=nginx --no-headers
+nginx-6758c84c75-kstz4   1/1   Running   0     10m
+nginx-6758c84c75-qqff2   1/1   Running   0     10m
+(exit code: 0)
+
+=> READ THE TWO FILE TIMESTAMPS: 18:06 and 18:16. Ten minutes apart, both
+   written into a root filesystem that git says must be read-only, by a pod
+   that ArgoCD had been reporting as OutOfSync for that entire period.
+   TOTAL TIME DRIFTED AND UNCORRECTED: 18:05:59Z -> 18:16:07Z = 10 min 8 s,
+   and it was ended by an operator flipping a flag, not by ArgoCD.
+
+=> THIS IS WHAT "DETECTION IS NOT PREVENTION" MEANS, MEASURED. ArgoCD knew.
+   It knew within 43 seconds. It named the exact resource. It wrote the
+   finding into its own status where any dashboard could read it. And the
+   weakened container served traffic for ten minutes anyway, because nothing
+   was configured to act on what it knew. Falco (phase 6) has the same shape:
+   a correct alert and no hand on the lever.
+
+============================================================
+5) STAGE 2 — PREVENTION. ONE BOOLEAN CHANGES.
+============================================================
+
+5a. THE FLAG, AND THE EXISTING DRIFT DISAPPEARING ON ITS OWN. Nothing about
+the Deployment is touched here — only the Application:
+
+SELFHEAL ENABLED AT 2026-08-07T18:16:44Z
+
+$ kubectl -n argocd patch application demo-workloads --type=merge -p '{"spec":{"syncPolicy":{"automated":{"selfHeal":true}}}}'
+application.argoproj.io/demo-workloads patched
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.spec.syncPolicy.automated}'
+{"prune":false,"selfHeal":true}
+(exit code: 0)
+
+$ (poll loop, 2 s interval, started immediately after the patch)
+18:16:44.765  sync=Synced  live-readOnlyRootFilesystem=true
+(exit code: 0 — the FIRST sample already showed the drift gone)
+
+=> THE VERY FIRST POLL, at 18:16:44.765Z, in the SAME WALL-CLOCK SECOND as
+   the patch, already showed `readOnlyRootFilesystem=true` restored and the
+   Application back to `Synced`. The 10-minute-old drift from section 4 was
+   corrected in UNDER ONE SECOND, with no further human action. The exact
+   latency is BELOW THE SAMPLING RESOLUTION and is not claimed as a figure.
+
+ArgoCD says it did this itself — the sync was not operator-initiated:
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.operationState.operation.initiatedBy}{"\n"}{.status.operationState.phase}{"\n"}{.status.operationState.startedAt}{"\n"}{.status.operationState.finishedAt}{"\n"}{.status.operationState.message}'
+{"automated":true}
+Succeeded
+2026-08-07T18:16:44Z
+2026-08-07T18:16:44Z
+successfully synced (all tasks run)
+(exit code: 0)
+
+=> `initiatedBy: {"automated":true}` — not a user, not the CLI, not the UI.
+   `startedAt` == `finishedAt` == 18:16:44Z: the whole operation began and
+   ended inside one second.
+
+5b. THE POD IS ENFORCING AGAIN — SAME PROBE AS 4c, EXPECTED TO FAIL NOW:
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- sh -c 'grep " / " /proc/mounts' | cut -c1-40
+overlay / overlay ro,relatime,lowerdir=/
+(exit code: 0)
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- touch /var/cache/nginx/p7-probe
+touch: /var/cache/nginx/p7-probe: Read-only file system
+command terminated with exit code 1
+(exit code: 1 — the control is back, enforced by the kernel again)
+
+$ kubectl -n demo get pods -l app=nginx --no-headers
+nginx-78c88678f4-gxqtl   1/1   Running   0     37s
+nginx-78c88678f4-jfhzk   1/1   Running   0     39s
+(exit code: 0)
+
+=> the mount flag is `ro` again and the write gets EROFS again. Note the pod
+   names: ReplicaSet `78c88678f4` — the ORIGINAL one from section 1. ArgoCD
+   restored the exact pod template git specifies, so Kubernetes reused the
+   pre-existing ReplicaSet rather than creating a new one.
+
+5c. THE SAME DRIFT, RE-RUN — AND THE HONEST PART OF STAGE 2.
+
+DRIFT #2 ISSUED AT 2026-08-07T18:17:40.2784Z
+
+$ kubectl -n demo patch deploy nginx --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/securityContext/readOnlyRootFilesystem"}]'
+deployment.apps/nginx patched
+(exit code: 0)
+PATCH RETURNED AT 2026-08-07T18:17:40.4242Z
+
+$ (poll loop, 1 s interval)
+18:17:40.502  live-readOnlyRootFilesystem=ABSENT
+18:17:41.710  live-readOnlyRootFilesystem=true
+(exit code: 0)
+
+=> THE DRIFT LANDED — it is observed ABSENT at 18:17:40.502Z, so this is not
+   a patch that failed. Then it came back on its own.
+   REVERT LATENCY: 18:17:41.710 - 18:17:40.4242 = 1.29 s (upper bound; the
+   1-second poll interval is the resolution, and the true revert happened
+   somewhere inside the interval 18:17:40.502 -> 18:17:41.710).
+   Stage 1: 10 min 8 s and counting. Stage 2: 1.29 s. Same drift, same
+   cluster, one boolean.
+
+AND YET A WEAKENED CONTAINER STILL RAN. The ReplicaSet controller does not
+wait for ArgoCD:
+
+$ kubectl -n demo get events -o custom-columns='FIRST:.firstTimestamp,LAST:.lastTimestamp,OBJ:.involvedObject.name,REASON:.reason,MSG:.message' --sort-by=.firstTimestamp | grep t6v8w
+<nil>                  <nil>                  nginx-6758c84c75-t6v8w   Scheduled           Successfully assigned demo/nginx-6758c84c75-t6v8w to seclab-worker2
+2026-08-07T18:17:40Z   2026-08-07T18:17:40Z   nginx-6758c84c75-t6v8w   Pulling             Pulling image "nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6"
+2026-08-07T18:17:40Z   2026-08-07T18:17:40Z   nginx-6758c84c75         SuccessfulCreate    Created pod: nginx-6758c84c75-t6v8w
+2026-08-07T18:17:40Z   2026-08-07T18:17:40Z   nginx-6758c84c75         SuccessfulDelete    Deleted pod: nginx-6758c84c75-t6v8w
+2026-08-07T18:17:41Z   2026-08-07T18:17:41Z   nginx-6758c84c75-t6v8w   Started             Container started
+2026-08-07T18:17:41Z   2026-08-07T18:17:41Z   nginx-6758c84c75-t6v8w   Pulled              Successfully pulled image "nginxinc/nginx-unprivileged:1.29.8-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6" in 425ms (425ms including waiting). Image size: 23098099 bytes.
+2026-08-07T18:17:41Z   2026-08-07T18:17:41Z   nginx-6758c84c75-t6v8w   Created             Container created
+2026-08-07T18:17:42Z   2026-08-07T18:17:42Z   nginx-6758c84c75-t6v8w   Killing             Stopping container nginx
+(exit code: 0)
+
+=> READ THAT SEQUENCE. Pod `nginx-6758c84c75-t6v8w` — from the DRIFTED
+   ReplicaSet, the one with no `readOnlyRootFilesystem` — was CREATED at
+   18:17:40Z, its image was PULLED, its container was CREATED and STARTED at
+   18:17:41Z, and it was killed at 18:17:42Z. A container with a writable
+   root filesystem RAN, on a worker node, for approximately 1 second.
+   (Event timestamps have 1-second resolution, so "approximately" is doing
+   real work in that sentence; the bound is roughly 0-2 s.)
+   SELFHEAL SHRANK THE WINDOW FROM 608 SECONDS TO ABOUT ONE. IT DID NOT
+   CLOSE IT. Admission control is the only layer that can refuse a change
+   before it exists; GitOps arrives afterwards, always.
+
+$ kubectl -n argocd get application
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   Synced        Healthy
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.status.operationState.operation.initiatedBy}{" "}{.status.operationState.phase}{" started="}{.status.operationState.startedAt}{" finished="}{.status.operationState.finishedAt}'
+{"automated":true} Succeeded started=2026-08-07T18:17:40Z finished=2026-08-07T18:17:40Z
+(exit code: 0)
+
+=> back to `Synced`, by an `automated` operation that started and finished in
+   the same second the drift was applied.
+
+============================================================
+6) THE SCOPE BOUNDARY, MADE CONCRETE
+============================================================
+
+The `demo` namespace contains objects this repo deliberately keeps OUT of
+`workloads/`. ArgoCD manages none of them:
+
+$ kubectl -n demo get role,rolebinding,networkpolicy,sealedsecret --no-headers
+role.rbac.authorization.k8s.io/developer   2026-07-30T13:53:56Z
+rolebinding.rbac.authorization.k8s.io/developer-binding   Role/developer   8d
+networkpolicy.networking.k8s.io/allow-client-egress-to-nginx      access=nginx   8d
+networkpolicy.networking.k8s.io/allow-dns                         <none>         8d
+networkpolicy.networking.k8s.io/allow-nginx-ingress-from-client   app=nginx      8d
+networkpolicy.networking.k8s.io/default-deny                      <none>         8d
+sealedsecret.bitnami.com/demo-app-secret         True   8d
+(exit code: 0)
+
+=> seven objects in the same namespace, NONE of them in the Application's
+   7-resource list from section 3b. THIS is why `prune: false` matters: a
+   mis-scoped Application with pruning ON is pointed at exactly these.
+
+THE TEST. selfHeal is TRUE for all of what follows — the same setting that
+reverted the nginx drift in 1.29 s:
+
+$ kubectl -n demo get role developer -o jsonpath='{.metadata.labels}'
+{"app.kubernetes.io/part-of":"k8s-security-lab"}
+(exit code: 0)
+
+OUT-OF-SCOPE DRIFT APPLIED AT 2026-08-07T18:19:13Z
+
+$ kubectl -n demo label role developer p7-scope-probe=applied
+role.rbac.authorization.k8s.io/developer labeled
+(exit code: 0)
+
+$ kubectl -n demo get role developer -o jsonpath='{.metadata.labels}'
+{"app.kubernetes.io/part-of":"k8s-security-lab","p7-scope-probe":"applied"}
+(exit code: 0)
+
+$ (loop) app sync status, the injected label, and nginx's in-scope field
+18:19:24Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:19:45Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:20:05Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:20:26Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:20:46Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:21:06Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:21:27Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:21:47Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:22:07Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:22:28Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:22:48Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:23:09Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:23:29Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:23:49Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+18:24:10Z  app-sync=Synced  role-label=applied  nginx-rorfs=true
+(exit code: 0 — 15 consecutive samples, no gaps, nothing elided)
+
+=> FOR 4 MIN 57 S (18:19:13Z -> 18:24:10Z), spanning more than one 180 s
+   reconcile cycle, with selfHeal ON:
+     - the Application never left `Synced`. It did not report the drift as a
+       problem because the drift is not in its world at all.
+     - the injected label was never removed.
+     - meanwhile the in-scope field stayed correct, proving the controller
+       was alive and reconciling throughout.
+   The same controller that reverted an in-scope change in 1.29 s ignored an
+   out-of-scope change for five minutes. SCOPE IS NOT A SUGGESTION — an
+   object outside `source.path` has NO GitOps protection whatsoever, and a
+   green Application says nothing about it.
+
+$ kubectl -n demo label role developer p7-scope-probe-
+role.rbac.authorization.k8s.io/developer unlabeled
+(exit code: 0 — reverted BY HAND at 2026-08-07T18:24:44Z; ArgoCD was never
+ going to do it)
+
+$ kubectl -n demo get role developer -o jsonpath='{.metadata.labels}'
+{"app.kubernetes.io/part-of":"k8s-security-lab"}
+(exit code: 0)
+
+=> identical to the pre-drift value at the top of this section.
+
+============================================================
+7) LIMITS
+============================================================
+
+7a. IT REVERTS; IT DOES NOT PREVENT. Quantified in 5c: with selfHeal ON, a
+weakened container was still created, started and run for ~1 s before being
+killed. With selfHeal OFF it ran for 10 min 8 s. Neither number is zero. The
+only layer in this lab that can make it zero is admission control, and
+admission control does not check this field (4b).
+
+7b. IT ONLY SEES `workloads/`. Demonstrated for 4 min 57 s in section 6.
+Everything else in `demo` — the RBAC, the 4 NetworkPolicies, the SealedSecret
+— is unmanaged and unprotected. This is a deliberate scoping choice, not an
+oversight, but the consequence is real and is now measured rather than
+assumed.
+
+7c. ARGOCD IS CLUSTER-ADMIN AND SITS IN AN UNGATED NAMESPACE. Section 2c
+proves the application controller's ClusterRole is byte-identical to
+`cluster-admin`; section 2d proves the `argocd` namespace has no PSA label
+and is outside all 5 Kyverno policies. THREE UNENFORCED NAMESPACES NOW:
+`cis-benchmark`, `falco`, `argocd`. The lab's controls are concentrated in
+`demo`, and each new operational component has been installed outside them.
+
+7d. NOTHING VERIFIES THE GIT CONTENT ITSELF. ArgoCD syncs whatever is on
+`main`. Commit signature verification is NOT configured:
+
+$ kubectl -n argocd get appproject default -o jsonpath='{.spec}'
+{"clusterResourceWhitelist":[{"group":"*","kind":"*"}],"destinations":[{"namespace":"*","server":"*"}],"sourceRepos":["*"]}
+(exit code: 0)
+
+$ kubectl -n argocd get appproject default -o jsonpath='{.spec.signatureKeys}'
+(exit code: 0 — printed nothing: no required signature keys)
+
+$ kubectl -n argocd get cm argocd-gpg-keys-cm -o jsonpath='{.data}'
+(exit code: 0 — printed nothing: no trusted GPG keys loaded)
+
+=> two separate failures of containment in one output. There are no
+   signatureKeys and no GPG keys, so ANY commit that reaches `main` is
+   applied, signed or not. AND the `default` AppProject is wide open —
+   `sourceRepos: ["*"]`, `destinations: [{namespace:"*",server:"*"}]`,
+   `clusterResourceWhitelist: [{group:"*",kind:"*"}]`. The scoping in this
+   phase comes ENTIRELY from one Application's `source.path` field. The
+   project — the object whose actual job is to constrain what Applications
+   may do — constrains nothing. A second Application, or an edit to this one,
+   could target any namespace and any cluster-scoped kind without tripping a
+   single guard.
+   Worse in stage 2 than in stage 1: with selfHeal ON, a malicious commit to
+   `main` is not merely applied once, it is RE-APPLIED automatically every
+   time an operator tries to remove it by hand.
+
+7e. NO CREDENTIAL WAS RETRIEVED. The install created an initial admin
+password and it was left alone:
+
+$ kubectl -n argocd get secret --no-headers -o custom-columns='NAME:.metadata.name,TYPE:.type'
+argocd-initial-admin-secret   Opaque
+argocd-notifications-secret   Opaque
+argocd-redis                  Opaque
+argocd-secret                 Opaque
+(exit code: 0 — names and types only; no value was read, decoded or used)
+
+=> the UI was never logged into and the `argocd` CLI was never installed.
+   Every observation in this transcript came from `kubectl` against the
+   Application CR and the live objects. Section 2c is the reason this
+   matters: the account behind that password is backed by a component that
+   can delete, get and patch anything in the cluster.
+
+7f. NO UTILISATION FIGURES. `metrics-server` is not installed, so `kubectl
+top` does not work here and no CPU or memory measurement for ArgoCD's 7 pods
+is offered anywhere above. Pod counts only.
+
+7g. THIS TRANSCRIPT'S TIMINGS ARE POLL-BOUNDED. The 43 s detection figure,
+the sub-second stage-2 revert and the 1.29 s drift-#2 revert are all UPPER
+BOUNDS derived from polling loops at 10 s, 2 s and 1 s intervals
+respectively. They are not instrumented latencies and are not presented as
+such.
+
+============================================================
+8) THE FINAL STATE
+============================================================
+
+8a. THE CLUSTER, AS THIS PHASE LEAVES IT:
+
+$ kubectl -n argocd get application
+NAME             SYNC STATUS   HEALTH STATUS
+demo-workloads   Synced        Healthy
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{.spec.syncPolicy.automated}'
+{"prune":false,"selfHeal":true}
+(exit code: 0)
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}
+(exit code: 0)
+
+$ kubectl -n argocd get application demo-workloads -o jsonpath='{range .status.resources[*]}{.kind}{"/"}{.name}{" -> "}{.status}{"\n"}{end}'
+Namespace/demo -> Synced
+Service/nginx -> Synced
+Service/signed-app -> Synced
+ServiceAccount/nginx-sa -> Synced
+ServiceAccount/signed-app-sa -> Synced
+Deployment/nginx -> Synced
+Deployment/signed-app -> Synced
+(exit code: 0)
+
+$ kubectl -n demo get deploy,svc,sa,pods --no-headers
+deployment.apps/nginx        2/2   2     2     8d
+deployment.apps/signed-app   1/1   1     1     8d
+service/nginx        ClusterIP   10.96.180.134   <none>   80/TCP   8d
+service/signed-app   ClusterIP   10.96.245.29    <none>   80/TCP   8d
+serviceaccount/default         8d
+serviceaccount/developer-sa    8d
+serviceaccount/nginx-sa        8d
+serviceaccount/signed-app-sa   8d
+pod/nginx-78c88678f4-gxqtl       1/1   Running   0              8m14s
+pod/nginx-78c88678f4-jfhzk       1/1   Running   0              8m16s
+pod/signed-app-d9c5dfcbb-8mzkm   1/1   Running   3 (115m ago)   8d
+(exit code: 0)
+
+=> securityContext restored to the git value from 1c, all 7 resources Synced,
+   `selfHeal: true` is the posture left running.
+
+8b. NO LEFTOVER PROBE ARTEFACTS. The two probe files from section 4 lived in
+pods that were destroyed by the stage-2 revert. The surviving pods are clean:
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- ls -A /var/cache/nginx/
+(exit code: 0 — empty listing)
+$ kubectl -n demo exec nginx-78c88678f4-jfhzk -- ls -A /var/cache/nginx/
+(exit code: 0 — empty listing)
+
+$ kubectl -n demo exec nginx-78c88678f4-gxqtl -- ls -A /tmp
+client_temp
+fastcgi_temp
+nginx.pid
+proxy_temp
+scgi_temp
+uwsgi_temp
+(exit code: 0 — nginx's own runtime directories only; the /tmp/p7-probe from
+ 1f is gone, along with the pod that held it)
+
+=> and the out-of-scope label from section 6 was reverted there, verified
+   against its pre-drift value.
+
+8c. SELF-HEALING CHANGED WHO OWNS THE FIELD. After the initial adoption in 3c
+ArgoCD owned only metadata. After stage 2 wrote the field back, it owns the
+security control itself:
+
+$ kubectl -n demo get deploy nginx -o jsonpath='{range .metadata.managedFields[?(@.manager=="argocd-controller")]}{.fieldsV1}{"\n"}{end}'
+{"f:metadata":{"f:annotations":{"f:argocd.argoproj.io/tracking-id":{},"f:kubectl.kubernetes.io/last-applied-configuration":{}}},"f:spec":{"f:template":{"f:spec":{"f:containers":{"k:{\"name\":\"nginx\"}":{"f:securityContext":{"f:readOnlyRootFilesystem":{}}}}}}}}
+(exit code: 0)
+
+=> `argocd-controller` is now a declared field manager for
+   `readOnlyRootFilesystem` on the nginx container. That is the mechanical
+   residue of stage 2: the controller did not merely observe the field, it
+   took ownership of it. This is what "GitOps owns the cluster" means at the
+   API level, and it is also why the ClusterRole in 2c is not academic.
+
+8d. `workloads/` WAS NEVER EDITED. The drift in this phase was applied to
+LIVE objects with `kubectl patch`, never to the files. Git agrees:
+
+$ git status --short --branch
+## feat/argocd-gitops
+?? gitops/
+(exit code: 0)
+
+$ git diff --stat HEAD -- workloads/
+(exit code: 0 — no output: zero changes to workloads/)
+
+$ git status --short -- workloads/
+(exit code: 0 — no output: clean, not even untracked files)
+
+$ git rev-parse HEAD
+e2bc1d5c15d110cbbf676c13b2ce8e441ae596a0
+(exit code: 0 — unchanged; this phase made no commit)
+
+=> the ONLY worktree change is the new untracked `gitops/` directory holding
+   the Application manifest. `workloads/` is byte-identical to HEAD, which is
+   what makes every "ArgoCD restored it" claim above meaningful: the desired
+   state it restored to was never quietly edited to match.
