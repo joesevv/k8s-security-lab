@@ -1,5 +1,6 @@
 # ==============================================================================
-# Dependabot - keeps the SHA-pinned GitHub Actions current.
+# Dependabot - keeps the SHA-pinned GitHub Actions current, and the Go module's
+# hash-pinned dependencies with them.
 # ------------------------------------------------------------------------------
 # .github/workflows/supply-chain.yml pins every action to an immutable 40-char
 # commit SHA so a retagged upstream release cannot silently change what runs in
@@ -7,11 +8,40 @@
 # freezes on a known-vulnerable version forever. This is that something:
 # Dependabot opens a weekly PR that bumps the pinned SHA and rewrites the
 # trailing `# vX.Y.Z` comment, so the pin stays both immutable and patched.
+#
+# app/netpol-guard/go.sum is the same shape of promise and carries the same
+# failure mode. A module recorded by hash is frozen on exactly the bytes that
+# were current the day the entry was written - vulnerabilities included - unless
+# something bumps it.
+#
+# Be precise about what the gomod entry below does and does not add. SECURITY
+# updates already arrive WITHOUT it: Dependabot raises advisory-driven bumps for
+# any manifest it can see, which is how 72e01c8 (golang.org/x/net 0.47.0 ->
+# 0.55.0 in /app/netpol-guard) appeared while this file configured github-actions
+# and nothing else. What the entry adds is ROUTINE version updates - the ordinary
+# weekly bumps for dependencies with no advisory filed yet - so the module moves
+# in small reviewable steps instead of jumping several versions at once on the
+# day an advisory finally does land.
+#
+# Both entries now open onto a real gate. .github/workflows/go-checks.yml builds,
+# vets, tests and `go mod verify`s app/netpol-guard on every pull_request that
+# touches it, so a gomod PR is checked BEFORE merge. 72e01c8 merged with no such
+# check existing.
 # ==============================================================================
 
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # "gomod" is Dependabot's ecosystem key for Go modules (not "go" or "golang").
+  # `directory` is the repo-root-relative path to the directory HOLDING go.mod:
+  # this module does not live at the repo root, and Dependabot's own PR title on
+  # 72e01c8 already reads "in /app/netpol-guard", which is this path.
+  # Weekly, to match the sibling entry above.
+  - package-ecosystem: "gomod"
+    directory: "/app/netpol-guard"
     schedule:
       interval: "weekly"
