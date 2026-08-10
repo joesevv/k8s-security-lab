@@ -487,6 +487,25 @@ for roughly a second before the revert killed it (§6.14) — so even a defensib
 ID would need a marking this table does not have. The measured effect is
 recorded in §6.14 and in the README's attack → control table instead.
 
+Phase 8 takes **no row here either**, and it misses this table's bar twice
+over. The first miss settles it on its own: every row above is a mitigation
+enforced on this cluster, and netpol-guard is not deployed — it ran as a
+process on the operator's host and its in-cluster manifests are committed
+unapplied (§6.15) — so whatever it can do, it mitigates nothing here. The
+second would still block a row if the first were fixed. What it answers is the
+deletion of a NetworkPolicy, which is a security control being removed and
+therefore a better fit for T1562.001 Impair Defenses: Disable or Modify Tools
+than phase 7's `securityContext` edit ever was; but this document is not sure
+enough of that sub-technique's standing in the ATT&CK for Containers matrix to
+cite it, and the alternatives are worse — T1046 Network Service Discovery is
+already claimed above by the NetworkPolicy that does the blocking, and a
+watchdog over that policy is not the same claim. The standing rule decides it:
+**a wrong technique ID is worse than a missing row.** The care phase 7 needed
+applies here too — this controller detects and repairs after the fact, so even
+a defensible ID would need a marking this table does not have. What phase 8
+measured is recorded in §6.15 and in the README's attack → control table
+instead.
+
 ---
 
 ## 6. Residual risk and what is deliberately out of scope
@@ -676,7 +695,14 @@ kind, so it falls to the built-in `privileged` default — the apiserver has no
 third is a difference in kind rather than degree: the components in the first
 two namespaces are a scanner and a sensor, and the one in the third is a
 controller whose job is to write, holding `verbs ['*']` on `resources ['*']` to
-do it with. Phase 5b does not
+do it with. A fourth instance was avoided rather than added, and how is
+instructive: phase 8's controller is written for `demo` itself — inside both
+enforcement layers rather than beside them, with a namespaced `Role` in place
+of a ClusterRole — and the consequence of that choice is that it is not
+running at all, because `require-keyless-signed-ghcr` would refuse its
+unsigned image there (reasoned from the policy's `matchConstraints`, not
+tested; §6.15). Stated in one line: on this cluster, the operational
+components that run are the ones nothing evaluates. Phase 5b does not
 bear on this item, and it is worth saying so rather than letting a reader infer
 otherwise: `seccompDefault` and `podPidsLimit` are set on every node rather than
 in one namespace, but they are kubelet settings and not policies — no namespace
@@ -1248,7 +1274,16 @@ Five things, none of them remediated.
    throughout, which is what proves the controller was alive rather than stuck.
    A human removed the label, because ArgoCD was never going to. A green
    Application says nothing about anything outside its `source.path` — and what
-   sits there is exactly what phases 2a, 2c and 3 built.
+   sits there is exactly what phases 2a, 2c and 3 built. Phase 8 (2026-08-07)
+   changes what is *possible* here without changing what is true:
+   [`app/netpol-guard`](../app/netpol-guard/) can watch the NetworkPolicies
+   this item names, and did — it caught `default-deny`'s deletion **6.950 s**
+   after the fact and put a byte-identical object back **19 ms** after being
+   started with `--remediate=true`. It is **not deployed** (§6.15), so nothing
+   is watching them today; and even deployed it would cover the
+   NetworkPolicies alone, and only the coverage they provide rather than their
+   content, leaving the `developer` Role, its RoleBinding and the SealedSecret
+   with no drift control of any kind.
 
 **Consequence, stated plainly:** this cluster can now put back a change it had
 no way to refuse, in about a second instead of ten minutes, for 7 objects in
@@ -1262,6 +1297,118 @@ never zero. What would close the remainder is not more GitOps: it is an
 admission policy requiring the field this drift removed, a one-policy change
 this lab has not made, together with a ClusterRole narrower than the one the
 upstream manifest ships.
+
+**6.15 The one control written for an event admission cannot see is the one
+control that is not deployed.** Phase 8 (2026-08-07) added
+[`app/netpol-guard`](../app/netpol-guard/), a Go controller
+(`k8s.io/client-go` v0.35.5 against this cluster's v1.35.5) holding one
+invariant in one namespace: **every pod in `demo` must be selected by a
+NetworkPolicy for both `Ingress` and `Egress`**. The invariant was chosen
+because admission structurally cannot hold it — the violation is caused by
+*deleting* an unrelated object, so at the moment a pod loses its protection
+there is no AdmissionReview about that pod to refuse. That was read off the
+cluster rather than argued: all five Kyverno policies' `matchConstraints` were
+printed, `networkpolicies` appears zero times and `DELETE` zero times, and
+matching both would still not be enough, because admission sees one object per
+request while this invariant is a property of the whole *set* of pods and
+policies. The regression is real rather than notional — with `default-deny`
+deleted, curl from a kind node that is not the pod's own went from `HTTP:000`
+after a 5 s timeout (exit code: 28) to `HTTP:200 time=0.001430`
+(exit code: 0) **226 ms** later, while nginx from that same source stayed
+blocked throughout as the differential control. What that establishes and what
+it costs are different sentences, and this item is the second. Six things,
+none of them remediated.
+
+1. **It ran out of cluster, and nothing in this phase changes that.** Every
+   observation came from a binary on the operator's Windows host, run against
+   `C:/Users/josep/.kube/config` with the operator's own credentials rather
+   than a ServiceAccount token. The in-cluster `Deployment`, `ServiceAccount`,
+   `Role` and `RoleBinding` are committed under
+   [`evidence/phase-8-netpol-guard/`](evidence/phase-8-netpol-guard/) and are
+   **unapplied** — validated client-side by dry run only, with
+   `kubectl -n demo get deployment netpol-guard` answering
+   `Error from server (NotFound)` (exit code: 1) as the check on that rather
+   than a sentence promising it. So the invariant is now *checkable* and
+   nothing on this cluster *checks* it. A reader who takes one thing from this
+   item should take that sentence.
+2. **The lab's own hardening is what keeps it out, and that is a finding
+   rather than an excuse.** Phase 5b's `AlwaysPullImages` (§6.12) forces the
+   kubelet to pull from a registry, so side-loading a locally built image with
+   `kind load` no longer works; `.github/workflows/supply-chain.yml` builds
+   exactly one context, `app/signed-app`, and publishes only on `push` to
+   `main`; and `require-keyless-signed-ghcr` would then have to admit the
+   image in `demo`, which needs a cosign signature from the pinned workflow
+   identity. A CI change, a merge and a signature — three gates, none openable
+   without a human. The trade-off runs both ways and is worth stating in one
+   breath: `AlwaysPullImages` removes a genuine attack path, a node-local
+   image masquerading as a trusted tag, and in exchange it makes local
+   iteration require a full publish pipeline. **The third gate is reasoned,
+   not measured** — read off the policy's own `matchConstraints` and scope,
+   with a server-side dry run deliberately not run.
+3. **A fourth gate is §3.5 turned on its author.** A netpol-guard pod in
+   `demo` could not reach the API server at all: `default-deny` isolates
+   egress and the only carve-out is `allow-dns` (53/UDP+TCP to CoreDNS), while
+   the `kubernetes` Service resolves to the host-network endpoint
+   `172.18.0.2:6443`, which no `podSelector` can select. A fifth NetworkPolicy
+   with an `ipBlock` would be required, and it was deliberately not written:
+   widening `network/` to host the watchdog would weaken the thing being
+   watched. The controller that guards a namespace is subject to that
+   namespace's rules, and that is the honest cost of not exempting it.
+4. **It checks that isolation exists, not that the rules are sensible.** A
+   policy with `podSelector: {}`, both `policyTypes`, and `ingress: [{}]` /
+   `egress: [{}]` — allow everything from everywhere — satisfies this
+   invariant completely, and every scan would print `verdict=HOLDS` while the
+   namespace stood wide open. What is checked is coverage. Rules are not read
+   and reachability is not evaluated, so nothing in phase 8 says `demo` is
+   correctly segmented: §3.5 and phase 2c make that argument, and this only
+   keeps its foundation from vanishing unnoticed.
+5. **It reconciles on a timer, so the unprotected window is real and was
+   measured.** `default-deny` was deleted at 17:01:03.275, the pod answered
+   `HTTP:200` at 17:01:03.501 — 226 ms — and the first VIOLATION line arrived
+   at 17:01:10.225, **6.950 s** after the delete, at `--interval=15s`. That is
+   the controller's own number, bounded above by one interval plus an API
+   round trip, so the shipped `30s` default roughly doubles it and a single
+   replica that is wedged or restarting has no bound at all — `replicas: 1`,
+   no leader election, never tested with two. **The 174.670 s total in the
+   transcript is not a latency figure and must not be quoted as one:**
+   96.950 s of it is stage 1 deliberately doing nothing under
+   `--remediate=false`, and roughly 68 s is a human gap between stopping one
+   process and starting the next.
+6. **Scope, and what no test covers.** One namespace per process (`demo` by
+   default), NetworkPolicies against Pods and nothing else — not Services, not
+   Ingress objects, not CNI enforcement, not another namespace — with
+   `Succeeded`/`Failed` pods skipped by a filter that is itself untested. The
+   17 subtests cover the pure isolation model: selector semantics including
+   the empty selector, `policyTypes` defaulting, per-direction verdicts,
+   policy attribution by name and the shape of the baseline object. They do
+   **not** cover the client-go call path, the scan loop, remediation against
+   any apiserver real or fake, error and retry behaviour, or RBAC-denied
+   responses. Everything cluster-facing was proven by running it against the
+   live cluster, which is a different kind of evidence from a test and not one
+   CI can repeat.
+
+**Consequence, stated plainly:** this cluster still has no watchdog on the
+NetworkPolicies that §3.5's entire argument rests on. Deleting `default-deny`
+remains an ordinary, successful, unremarkable command that no admission policy
+can refuse, that raises no event — `kubectl get events -n demo` returned
+`No resources found in demo namespace` while a pod was reachable — and that
+ArgoCD reports as `Synced / Healthy`, correctly, because `network/` is outside
+its Application. Every one of those was observed here rather than assumed.
+What phase 8 adds is the code that would close the gap, sitting in the
+repository unapplied behind three gates this lab put there on purpose, and two
+separately measured halves of the close: the violation was detected 6.950 s
+after the delete at `--interval=15s`, and a create the API server accepted
+landed 19 ms after a remediating process was started against the standing
+violation. Those halves were two processes and were never timed end to end, so
+no single detect-and-repair figure is claimed here. One thing it would get
+cheaply is worth naming beside §6.14 item 2: the `Role` it would run under
+grants `list` on pods and `get, list, create` on networkpolicies in a single
+namespace, with no `update`, no `patch`, no `delete` and nothing
+cluster-scoped, so "it will never modify or delete a policy it did not create"
+would be enforced by the API server rather than by the code's good intentions.
+ArgoCD, doing a comparable job on this same cluster, holds a ClusterRole
+byte-identical to `cluster-admin`. The narrow controller is the one that is
+not running.
 
 ---
 

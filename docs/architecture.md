@@ -100,7 +100,11 @@ Rekor transparency log.
 
 **After admission — NetworkPolicy.** Everything in `demo` is default-deny on
 both ingress and egress, with a CoreDNS carve-out and a single label-gated
-allow pair on TCP 8080.
+allow pair on TCP 8080. Nothing in the diagram above keeps that line true once
+it is drawn: every gate evaluates the object being written, and a NetworkPolicy
+that is *deleted* passes through none of them. Phase 8 measured what that costs
+and wrote a controller for it; the last section of this page says why that
+controller still gets no box.
 
 ---
 
@@ -164,7 +168,8 @@ Runbooks with the full command logs, all in [`../runbooks/`](../runbooks/):
 [`phase-5b-cis-remediation.md`](../runbooks/phase-5b-cis-remediation.md),
 [`phase-6-falco.md`](../runbooks/phase-6-falco.md),
 [`phase-6b-falcosidekick.md`](../runbooks/phase-6b-falcosidekick.md),
-[`phase-7-argocd.md`](../runbooks/phase-7-argocd.md).
+[`phase-7-argocd.md`](../runbooks/phase-7-argocd.md),
+[`phase-8-netpol-guard.md`](../runbooks/phase-8-netpol-guard.md).
 
 What is **not** in these diagrams — no encryption at rest, no audit log, no
 CVE gate, and policies that stop at the `demo` namespace boundary — is
@@ -217,3 +222,35 @@ of the pods running it**. Both are in
 [§6.14 of the threat model](threat-model.md#6-residual-risk-and-what-is-deliberately-out-of-scope),
 with the transcript in [`evidence/phase-7-argocd/`](evidence/phase-7-argocd/)
 and the replay in [`../runbooks/phase-7-argocd.md`](../runbooks/phase-7-argocd.md).
+
+**The third omission is not a gap either, and it is the only one that is not
+running.** Phase 8 (2026-08-07) added
+[`app/netpol-guard`](../app/netpol-guard/), a Go controller holding one
+invariant over namespace `demo` — every pod selected by a NetworkPolicy for
+both `Ingress` and `Egress` — chosen precisely because the diagram at the top
+of this page cannot express it: the violation is produced by *deleting* a
+NetworkPolicy, so there is no request about the pod that loses its protection
+for any of the three gates to refuse, and all five Kyverno policies'
+`matchConstraints` name `networkpolicies` zero times and `DELETE` zero times.
+It gets no box, for two separate reasons, either of which would be enough. The
+grammar first: this page's admission diagram is "gate → REJECTED" and this
+controller refuses nothing — the delete succeeds, the pod is reachable 226 ms
+later, and the earliest the controller says anything is 6.950 s after the
+delete at the interval used. And unlike Falco and ArgoCD, **it is not on this
+cluster at all.** It ran as a process on the operator's host against the
+kubeconfig; the `Deployment`, `ServiceAccount`, `Role` and `RoleBinding`
+committed with the phase are unapplied, and `kubectl -n demo get deployment
+netpol-guard` answers `Error from server (NotFound)`. A box for an undeployed
+component beside PSA and Kyverno would be the most misleading thing this page
+could carry. One fact belongs here even so, because it is about the first
+diagram rather than about the controller: nothing on this page keeps the
+NetworkPolicy line under it true after admission, and phase 8 is the
+measurement of what that costs — seven consecutive scans of a live violation
+while `kubectl get events -n demo` returned `No resources found` and ArgoCD sat
+`Synced / Healthy`, correctly, because `network/` is outside its Application.
+It is written up as
+[§6.15 of the threat model](threat-model.md#6-residual-risk-and-what-is-deliberately-out-of-scope),
+with the transcript in
+[`evidence/phase-8-netpol-guard/`](evidence/phase-8-netpol-guard/) and the
+replay in
+[`../runbooks/phase-8-netpol-guard.md`](../runbooks/phase-8-netpol-guard.md).
