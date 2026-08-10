@@ -1,0 +1,163 @@
+# ==============================================================================
+# go-checks (phase-8 netpol-guard) - build | vet | test | verify the module pins
+# ------------------------------------------------------------------------------
+# The gate app/netpol-guard/ did not have. Before this file, NOTHING in CI ever
+# compiled the controller: supply-chain.yml filters on app/signed-app/** plus its
+# own path, so a commit touching app/netpol-guard/** triggered zero workflows.
+# That is not hypothetical - 72e01c8 ("chore(deps): bump golang.org/x/net in
+# /app/netpol-guard", dependabot[bot], 0.47.0 -> 0.55.0) rewrote go.mod and
+# go.sum and reached main with no automated check that the controller still
+# built. It did build; a human confirmed that afterwards. A human is not a gate.
+#
+#   netpol-guard   (contents: read - NO packages, NO id-token)   7 steps:
+#     Checkout             - persist-credentials: false, same as the sibling
+#                            workflow; nothing after it needs the git credential
+#                            (the tidy step's `git diff` is purely local).
+#     Set up Go            - version read from app/netpol-guard/go.mod itself,
+#                            never duplicated here. See the step comment.
+#     go build ./...       - does it still compile. The check 72e01c8 never got.
+#     go vet ./...         - the standard suspicious-construct pass.
+#     go test ./...        - the isolation-model unit tests, with -count=1.
+#     go mod verify        - re-hash every downloaded module against go.sum.
+#     go.mod/go.sum tidy   - `go mod tidy` must be a no-op on a committed tree.
+#
+# WHY A SEPARATE WORKFLOW rather than another job inside supply-chain.yml:
+#   TRIGGER      - supply-chain.yml is the trusted image producer and must keep
+#                  firing only on `push` to main. These checks have to run on
+#                  `pull_request` so they gate a merge BEFORE it lands. That is
+#                  the whole point: a bad dependency PR must go red while it is
+#                  still a PR.
+#   COST         - adding app/netpol-guard/** to supply-chain.yml's paths would
+#                  make a go.mod bump rebuild, re-push, re-sign and re-attest
+#                  signed-app: roughly 19 minutes and a brand-new published
+#                  digest, for a change that touches no image.
+#   BLAST RADIUS - supply-chain.yml's sign job holds `id-token: write`, the scope
+#                  that mints the OIDC identity Kyverno admits on. This workflow
+#                  runs `go build`/`go test` over pull-request contents, i.e.
+#                  code an outside contributor can propose, so it MUST NEVER
+#                  request id-token. Two separate files keep that scope exactly
+#                  where it already is instead of one `if:` away from untrusted
+#                  code.
+#
+# WHAT THE PATH FILTER DELIBERATELY EXCLUDES: everything except
+# app/netpol-guard/** and this file. app/signed-app/** stays supply-chain.yml's
+# business; manifests, Kyverno policies, docs, runbooks and evidence hold no Go
+# and cannot break a Go build. The symmetry is intentional and worth saying out
+# loud: a change under app/netpol-guard/** builds and signs no image, and a
+# change anywhere else does not run these checks.
+#
+# Runbook: runbooks/phase-8-netpol-guard.md
+# ==============================================================================
+
+name: go-checks
+
+on:
+  # The trigger that closes the gap: run on the PR, in front of the merge button.
+  pull_request:
+    paths:
+      - app/netpol-guard/**
+      - .github/workflows/go-checks.yml
+  # And again on main after the merge, so the branch itself stays known-good even
+  # when a PR was merged while out of date with main.
+  push:
+    branches: [main]
+    paths:
+      - app/netpol-guard/**
+      - .github/workflows/go-checks.yml
+  workflow_dispatch:
+
+# Deny by default, same as supply-chain.yml. The single job below grants the one
+# scope it actually needs.
+permissions: {}
+
+jobs:
+  # Job id is the module, not the workflow, so the PR check reads
+  # "go-checks / netpol-guard" rather than repeating itself.
+  netpol-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # check out the repo. That is the entire list.
+      # NO packages - this job publishes nothing.
+      # NO id-token  - see BLAST RADIUS above. Never add it here.
+    defaults:
+      run:
+        # Applies to the `run` steps below (build/vet/test/verify/tidy) so each
+        # is the bare command a developer would type inside the module. It does
+        # NOT apply to `uses:` steps - see the setup-go comment.
+        working-directory: app/netpol-guard
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after checkout needs the git credential, so don't leave it
+          # in .git/config where a later action could read it. Same reasoning,
+          # same setting, as supply-chain.yml.
+          persist-credentials: false
+
+      # go-version-file, never a literal `go-version:`, so the Go version lives
+      # in exactly ONE place - app/netpol-guard/go.mod's own `go` directive
+      # (1.26.5 today). A version string copied into CI is a version string that
+      # drifts from the module it is supposed to be testing, and a bump of that
+      # directive is itself a change these checks should be running against.
+      #
+      # BOTH PATHS BELOW ARE REPO-ROOT-RELATIVE and must stay that way despite
+      # this job's working-directory default. `defaults.run.working-directory`
+      # only sets the cwd of the generated `run` shell scripts; it does not touch
+      # a JavaScript action, which the runner starts with cwd = GITHUB_WORKSPACE.
+      # setup-go passes go-version-file straight to fs.existsSync/readFileSync,
+      # and cache-dependency-path to @actions/glob hashFiles (rooted at
+      # GITHUB_WORKSPACE), so a bare `go.mod` here would fail the run with
+      # "The specified go version file at: go.mod does not exist".
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: app/netpol-guard/go.mod
+          cache-dependency-path: app/netpol-guard/go.sum
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # -count=1 defeats Go's test cache. setup-go restores GOCACHE as well as
+      # GOMODCACHE between runs, so without it a run can print "ok ... (cached)"
+      # - which is exactly what the local dry run of this sequence printed on
+      # 2026-08-10. A gate that can report green without executing a test is not
+      # a gate.
+      # -race is deliberately NOT used. The package contains no goroutine,
+      # channel or sync usage at all, so the detector has nothing to detect here,
+      # and it would roughly double the build. It also could not be dry-run
+      # before shipping: this repo's development machine has CGO_ENABLED=0 and
+      # `go test -race` refuses to run there, so adding it would mean shipping an
+      # unproven flag. Revisit if a concurrent test ever lands.
+      - name: go test
+        run: go test -count=1 ./...
+
+      # The step that earns its place in THIS repo. go.sum is the Go equivalent
+      # of the image digest the rest of the lab pins: a cryptographic hash of
+      # exactly the bytes a dependency is allowed to be. `go mod verify` re-hashes
+      # every module in the local cache and fails if any one of them does not
+      # match the hash this commit ships - the pin, actually checked, which
+      # nothing else in this pipeline does.
+      # Honest limit: it proves the modules used here match the recorded hashes.
+      # It does not prove the recorded hashes are the ones anyone intended; the
+      # checksum database (GOSUMDB=sum.golang.org, the default) is what vouches
+      # for an entry the first time it is written.
+      - name: go mod verify
+        run: go mod verify
+
+      # A committed go.mod/go.sum should already be tidy, so `go mod tidy` on a
+      # clean checkout must change nothing. Runs LAST on purpose: every step
+      # above sees the files exactly as committed, and this one is free to
+      # rewrite them because nothing follows it.
+      # Confirmed a no-op on 2026-08-10 against Go 1.26.5 - the version
+      # go-version-file selects - so this ships green rather than red, and the
+      # version-skew hazard that usually makes this check flaky is contained:
+      # the toolchain can only change when go.mod's own `go` directive changes.
+      # If it ever fails, run `go mod tidy` in app/netpol-guard and commit the
+      # result. Do not delete the step.
+      - name: Check go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
