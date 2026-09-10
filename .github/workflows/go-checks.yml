@@ -53,12 +53,33 @@ name: go-checks
 
 on:
   # The trigger that closes the gap: run on the PR, in front of the merge button.
+  #
+  # DELIBERATELY UNFILTERED, and the asymmetry with `push` below is the point.
+  # `netpol-guard` is a REQUIRED status check on main (ruleset protect-main,
+  # no bypass actors). A required check that never reports does not pass and
+  # does not fail - it blocks, forever, waiting for a status no run will ever
+  # send. So a path filter here would wedge every PR that happens not to touch
+  # Go: a docs edit, a policy change, a threat-model paragraph, a Dependabot
+  # action bump. That is not hypothetical - PR #27 (.github/dependabot.yml,
+  # one file) went MERGEABLE/BLOCKED the moment the check became required, and
+  # with no bypass actor there is no way to force past it.
+  #
+  # The cost of running unconditionally is one to two minutes of build, vet,
+  # test and `go mod verify` on a PR that changed no Go. That is the cheaper
+  # side of the trade by a wide margin.
+  #
+  # The two alternatives were considered and rejected. GitHub's documented
+  # workaround is a second workflow with an identically-named job on the
+  # inverse paths that exits 0; it works, and it is two files plus a name that
+  # must match exactly or the block comes back silently. Gating the expensive
+  # steps behind a changed-files action pulls a third-party dependency into a
+  # repo whose whole discipline is pinning and minimizing those, to save
+  # ninety seconds.
   pull_request:
-    paths:
-      - app/netpol-guard/**
-      - .github/workflows/go-checks.yml
-  # And again on main after the merge, so the branch itself stays known-good even
-  # when a PR was merged while out of date with main.
+  # And again on main after the merge, so the branch itself stays known-good
+  # even when a PR was merged while out of date with main. This one KEEPS the
+  # filter: nothing on main requires a status from it, so there is nothing to
+  # wedge, and re-running the Go suite because a runbook changed is waste.
   push:
     branches: [main]
     paths:
