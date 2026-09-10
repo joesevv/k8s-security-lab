@@ -45,3 +45,32 @@ updates:
     directory: "/app/netpol-guard"
     schedule:
       interval: "weekly"
+    # client-go and apimachinery are NOT ordinary dependencies here - they are
+    # pinned to the cluster's own version. runbooks/phase-8-netpol-guard.md:109:
+    # "client-go v0.35.5 is chosen to match the SERVER's minor and patch", and
+    # README.md and docs/threat-model.md repeat that claim. Kubernetes supports
+    # a client only within one minor of the apiserver, and THIS cluster cannot
+    # move: k8s is held at v1.35.5 because Kyverno 1.18 supports 1.33-1.35 only.
+    # So the client tracks the server, and the server is standing still.
+    #
+    # Dependabot proposed 0.37.0 for both on 2026-09-05 (PRs #25, #26). Those
+    # were tested rather than assumed - 0.37.0 builds, passes go test, and runs
+    # correctly against the live v1.35.5 apiserver - and closed anyway, because
+    # passing is not the same as being the version this repo says it runs.
+    #
+    # Patch updates stay ALLOWED on purpose: 0.35.6 would still be proposed, so
+    # a fix inside the pinned minor is not blocked by this.
+    #
+    # This is a version-update rule. Do not read it as a guarantee about
+    # security advisories - if one ever lands that is only fixed in a later
+    # minor, the pin has to be reopened deliberately, together with the cluster
+    # version and the five committed claims that describe the match.
+    ignore:
+      - dependency-name: "k8s.io/client-go"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      - dependency-name: "k8s.io/apimachinery"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
